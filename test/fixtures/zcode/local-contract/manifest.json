@@ -1,0 +1,41 @@
+{
+  "scope": "local-fixture-model-and-mcp-only",
+  "checkedAt": "2026-10-12T11:47:47.320Z",
+  "checks": {
+    "personalProviderLocalExecution": true,
+    "twoSessionMcpIsolation": true,
+    "historyRowsRangeCursor": true,
+    "durableColdHistory": true,
+    "mcpCallerColdResume": true,
+    "multiSelectQuestionAnswer": true,
+    "permissionDeniedNoWrite": true,
+    "permissionApprovedWrite": true,
+    "stopInterruptedNativeTurn": true,
+    "physicalFragmentAssembly": true,
+    "realAuthProbeLocalSelfCheck": true
+  },
+  "unverified": [
+    "real-zhipu-auth",
+    "real-model-quality",
+    "real-model-tool-choice"
+  ],
+  "runtime": {
+    "nodeVersion": "v24.14.0",
+    "bundleSha256": "f78a9144825414853caf3aac2f6913f72def33a808aae7885d50230c289c60ee"
+  },
+  "result": "local-contract-passed",
+  "fixtures": [
+    {
+      "name": "physical-frames.json",
+      "sha256": "797b228e4077f42314beff73b1e059db5773d40b2bfe726111579408a92bc87d"
+    },
+    {
+      "name": "command-acks.json",
+      "sha256": "8e4666b7827843fce6e714967adf730268740a18c571cf41b4aa46af489607f7"
+    },
+    {
+      "name": "model-calls.json",
+      "sha256": "0c84af58763b20065e502e63ac98e132ec9adf970ee8ecbbecbd45a08d58b3be"
+    }
+  ]
+}

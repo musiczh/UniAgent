@@ -1,0 +1,20 @@
+{
+  "results": [
+    {
+      "key": {
+        "sessionId": null,
+        "commandId": "01a12fe7-8d53-7303-97c7-226f7509b644"
+      },
+      "result": {
+        "memoryEnabled": false,
+        "commandId": "01a12fe7-8d53-7303-97c7-226f7509b644",
+        "status": "accepted",
+        "revisionAtDecision": 0,
+        "result": {
+          "type": "createSession",
+          "sessionId": "sess_9937527a-8809-4b36-96bd-9720b253c485"
+        }
+      }
+    }
+  ]
+}

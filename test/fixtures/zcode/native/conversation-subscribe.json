@@ -1,0 +1,13 @@
+{
+  "ack": {
+    "subscriptionId": "sub-mv56h21i-ketz9gcp-1",
+    "mode": "snapshot",
+    "logEpoch": "mv56h21i-ketz9gcp",
+    "openTiming": {
+      "version": 1,
+      "initialFrameEncodeMs": 0,
+      "sessionRuntimeState": "warm",
+      "snapshotRowCount": 0
+    }
+  }
+}

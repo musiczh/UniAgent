@@ -1,0 +1,9 @@
+[
+  {
+    "method": "session/requestRuntimePreferences",
+    "params": {
+      "sessionId": "sess_9937527a-8809-4b36-96bd-9720b253c485",
+      "scope": "runtime-materialization"
+    }
+  }
+]

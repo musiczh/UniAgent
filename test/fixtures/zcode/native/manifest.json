@@ -1,0 +1,93 @@
+{
+  "schemaVersion": 1,
+  "checkedAt": "2026-10-12T11:37:45.715Z",
+  "scope": "isolated-empty-draft-protocol",
+  "runtime": {
+    "source": "source-build",
+    "executable": "/private/tmp/uzc-node24/node-v24.14.0-darwin-arm64/bin/node",
+    "bundleName": "zcode.cjs",
+    "bundleSha256": "f78a9144825414853caf3aac2f6913f72def33a808aae7885d50230c289c60ee"
+  },
+  "checks": {
+    "storageReady": true,
+    "independentPlanState": true,
+    "workspaceConfigSnapshot": true,
+    "createWithoutFirstInput": true,
+    "conversationSnapshot": true,
+    "wireVersion": 3,
+    "commandQuery": true,
+    "resyncAckAndFrame": true,
+    "sessionRead": true
+  },
+  "unverified": [
+    "real-authentication",
+    "two-model-turns",
+    "file-edit-permission-stop",
+    "durable-cold-resume",
+    "mcp-caller-cold-resume",
+    "complete-model-catalog"
+  ],
+  "fixtures": [
+    {
+      "name": "startup.json",
+      "sha256": "aa6a6ab46d5f1c7b7c0d40a885f9321bd2382edcb3aa4f08d04e8ba21f540470"
+    },
+    {
+      "name": "capabilities.json",
+      "sha256": "7a262e13298e375fe123f4cc28f4e4e8c380620a00065dc911f85346d8ffeb99"
+    },
+    {
+      "name": "workspace-subscribe.json",
+      "sha256": "c50c6cc7695adbb521dc17fdaec6219c34ef20fd913eef6b329bba970e97d583"
+    },
+    {
+      "name": "workspace.logical.json",
+      "sha256": "fcb8c9cd14933b2315ebeff6542c2499a6a90003294ede7e8a72d60f0d496198"
+    },
+    {
+      "name": "create-ack.json",
+      "sha256": "ed4613732dcd663f372c6dc72657e75439363bda11fbc83067d9c8063efbcc12"
+    },
+    {
+      "name": "conversation-subscribe.json",
+      "sha256": "8a4cbd1178d2e168be9f6e4cd038e8a379389924d37cf96458c67c433cafd8bf"
+    },
+    {
+      "name": "snapshot.logical.json",
+      "sha256": "be5e1028e15d4ca0adb7fad913b7f1e9c2df0e0a5a56b965600170dbd0bc82e6"
+    },
+    {
+      "name": "create-query.json",
+      "sha256": "4c3451a9226d1ed62b0cb3f7c988ab204c468a01f95891814b0810b7eb88a6ba"
+    },
+    {
+      "name": "resync-ack.json",
+      "sha256": "47b795e852472928389394025f1ef632f5d8fddc5f64ac0d60816be7e7a9a652"
+    },
+    {
+      "name": "recovery.logical.json",
+      "sha256": "03ef91bf7e6589a2b194a9b3b71f23cad9b9a04ed42512570bc019e89ec2ba6c"
+    },
+    {
+      "name": "session-read.json",
+      "sha256": "64f60032597fb386787af4f2367e42639f10dc884d50a8be232a184421c7068f"
+    },
+    {
+      "name": "host-callbacks.json",
+      "sha256": "dcc74d7c9817c8155768690f5b361ece8824121bb66424110c28b2d7f07c71f3"
+    },
+    {
+      "name": "rpc-incoming.json",
+      "sha256": "ac3e23134bc338d8a16aef33ba49e049bd15a9d5471851e7759d84075569ea36"
+    },
+    {
+      "name": "stderr.json",
+      "sha256": "bd85bcdb8d4e613a79cb62d0903946ad10c83e63dc75f67614c159c0dbf4d184"
+    }
+  ],
+  "result": "protocol-checks-passed",
+  "cleanup": {
+    "exited": true,
+    "via": "stdin-eof"
+  }
+}

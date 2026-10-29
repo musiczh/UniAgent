@@ -1,0 +1,24 @@
+.requirement-picker .project-picker-trigger { color: var(--purple); }
+.requirement-hint { font-size: 12px; line-height: 1.6; color: var(--text-dim); margin: 0; }
+.requirement-error { color: var(--red); font-size: 12px; padding: 8px 0; overflow-wrap: anywhere; }
+.requirement-empty { padding: 16px; }
+.requirement-menu-name { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.requirement-summary { width: 100%; border: 0; text-align: left; background: none; cursor: pointer; border-radius: 6px; }
+.requirement-summary:hover { background: var(--bg-hover); }
+.requirement-summary .lbl { color: var(--purple); }
+.requirement-summary .requirement-status { color: var(--text-faint); font-size: 11px; flex: none; }
+
+.requirement-picker .project-picker-trigger > .ui-icon:first-child { transform: none; color: var(--purple); }
+
+/* Requirement groups use the same drawer appearance as archived sessions. */
+.sl-body .sl-archive > .sl-archive-head {
+  width: 100%;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  text-align: left;
+}
+.sl-body .sl-archive > .sl-archive-head.is-open {
+  background: var(--bg-elev2);
+  color: var(--text-dim);
+}

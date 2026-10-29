@@ -1,0 +1,86 @@
+{
+  "messages": [],
+  "projection": {
+    "activeToolCalls": [],
+    "backgroundJobs": [],
+    "contextUsed": 0,
+    "contextWindow": 200000,
+    "mode": "build",
+    "pendingPermissions": [],
+    "sessionId": "unknown",
+    "status": "idle",
+    "target": null,
+    "totalTokenCount": 0,
+    "turnCount": 0
+  },
+  "protocol": {
+    "name": "ZCode Protocol",
+    "version": 1
+  },
+  "runtime": {
+    "deliveryKind": "desktop-continuous",
+    "eventSeq": 0,
+    "pendingRequestIds": [],
+    "goalVerifications": [],
+    "goalVerificationTimeline": [],
+    "stateRevision": 0
+  },
+  "session": {
+    "createdAt": 1791805066897,
+    "mode": "build",
+    "traceId": "2f7fb522-5967-4f44-b58e-dc328099cf9f",
+    "sessionId": "sess_9937527a-8809-4b36-96bd-9720b253c485",
+    "sessionKind": "interactive",
+    "status": "idle",
+    "target": null,
+    "title": "",
+    "updatedAt": 1791805066897,
+    "workspace": {
+      "workspacePath": "/ZCODE_PROBE_ROOT/workspace",
+      "workspaceKey": "/ZCODE_PROBE_ROOT/workspace"
+    }
+  },
+  "settings": {
+    "mode": {
+      "current": "build"
+    },
+    "model": {
+      "available": []
+    },
+    "permission": {
+      "mode": "build"
+    },
+    "thoughtLevel": {
+      "available": [],
+      "enabled": false
+    }
+  },
+  "slashCommands": [
+    {
+      "description": "Show or set the current session goal.",
+      "inputHint": "/goal [pause|resume|clear|replace <objective>|<objective>]",
+      "name": "goal",
+      "source": "builtin"
+    },
+    {
+      "description": "Compact the current conversation with optional instructions.",
+      "inputHint": "/compact [instructions]",
+      "name": "compact",
+      "source": "builtin"
+    },
+    {
+      "description": "Create or update workspace AGENTS.md instructions.",
+      "inputHint": "/init [notes]",
+      "name": "init",
+      "source": "builtin"
+    },
+    {
+      "description": "Switch to Plan mode and optionally send a task.",
+      "inputHint": "/plan [task]",
+      "name": "plan",
+      "source": "builtin"
+    }
+  ],
+  "todos": [],
+  "todoGroups": []
+}

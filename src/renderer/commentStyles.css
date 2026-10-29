@@ -1,0 +1,54 @@
+.main:has(> .ai-comments) { flex-direction: row; }
+.main:has(> .ai-comments) > .session-view { flex: 1; min-width: 0; }
+.ai-comments { position: relative; min-width: 260px; flex: 0 0 auto; height: 100%; display: flex; flex-direction: column; background: var(--bg-elev); border-left: 1px solid var(--border); color: var(--text); overflow: hidden; }
+.ai-comments.embedded { min-width: 260px; }
+.ai-comments button { font: inherit; color: inherit; cursor: pointer; }
+.ai-comments-head { display: flex; align-items: center; justify-content: space-between; padding: 18px 20px 12px; }
+.ai-comments-head strong { font-size: 14px; font-weight: 600; }
+.ai-comments-head strong span { margin-left: 5px; color: var(--text-dim); }
+.ai-comments-head > button { border: 0; background: transparent; color: var(--text-dim); display: grid; place-items: center; width: 28px; height: 28px; border-radius: 6px; }
+.ai-comments-head > button:hover { background: var(--bg-hover); }
+.ai-comments-tabs { display: flex; margin: 0 16px 12px; padding: 4px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); }
+.ai-comments-tabs button { flex: 1; padding: 8px 4px; border: 0; background: transparent; border-radius: 7px; font-size: 12px; color: var(--text-faint); }
+.ai-comments-tabs button[aria-selected=true] { background: var(--bg-elev2); color: var(--text); }
+.ai-comments-list { flex: 1; overflow: auto; padding: 0 16px 20px; min-height: 0; }
+.ai-comment-card { border: 1px solid var(--border); border-radius: 14px; margin-bottom: 12px; background: var(--bg-elev1); overflow: visible; }
+.ai-comment-card.active { border-color: var(--blue); background: var(--bg-elev2); }
+.ai-comment-source { display: flex; align-items: center; gap: 8px; width: 100%; padding: 14px 14px 10px; background: none; border: 0; text-align: left; font-size: 11px !important; color: var(--text-faint) !important; }
+.ai-comment-source time { margin-left: auto; }
+.ai-comment-number { background: var(--blue); color: var(--bg); width: 22px; height: 22px; border-radius: 50%; display: inline-grid; place-items: center; font-weight: 600; }
+mark.ua-annotation-hl.ai-comment-highlight { background: var(--blue-soft); border-bottom-color: var(--blue); }
+.ua-anno-badge.ai-comment-badge { background: var(--blue); }
+.ai-comment-quote { display: flex; align-items: flex-start; gap: 8px; width: 100%; padding: 0 14px 14px; border: 0; background: transparent; text-align: left; color: var(--text-dim) !important; }
+.ai-comment-quote blockquote, .ai-pending blockquote { flex: 1; margin: 0; border-left: 2px solid var(--blue); padding-left: 10px; font-size: 12px; line-height: 1.7; max-height: 100px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ai-comment-quote svg { flex-shrink: 0; margin-top: 4px; }
+.ai-comment-conversation { border-top: 1px solid var(--border); }
+.ai-comment-conversation .stream-area { min-height: 0; height: auto; }
+.ai-comment-conversation .event-stream { padding: 14px; overflow: visible; }
+.ai-comment-conversation .stream-inner { max-width: 100%; width: 100%; }
+.ai-comment-conversation .agent-md { font-size: 13px; line-height: 1.75; }
+.ai-comment-conversation .user-message { margin: 0 0 12px; max-width: 100%; }
+.ai-comment-conversation .reply-block { margin-bottom: 12px; }
+.ai-comment-composer { margin: 10px 14px 14px; padding: 12px; border: 1px solid var(--border); border-radius: 13px; background: var(--bg-elev); }
+.ai-comment-composer:focus-within { border-color: var(--blue); }
+.ai-comment-composer textarea { width: 100%; min-height: 68px; border: 0; outline: 0; background: transparent; color: var(--text); resize: vertical; font: inherit; font-size: 13px; line-height: 1.6; }
+.ai-comment-composer textarea::placeholder { color: var(--text-faint); }
+.ai-comment-compose-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 10px; }
+.ai-comment-compose-actions .model-picker { min-width: 0; flex: 1; }
+.ai-comment-compose-actions .mp-trigger { max-width: 100%; font-size: 11px; }
+.ai-comment-compose-actions .mp-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mp-menu.mp-menu-portal { z-index: 3000; max-width: min(310px, calc(100vw - 24px)); }
+.ai-comment-send, .ai-comment-stop { width: 34px; height: 34px; border: 0; border-radius: 50%; display: grid; place-items: center; flex-shrink: 0; }
+.ai-comment-send { background: var(--blue); color: #fff !important; }
+.ai-comment-send:disabled { opacity: .35; cursor: default; }
+.ai-comment-stop { background: #ff5050; }
+.ai-comment-stop span { width: 10px; height: 10px; border-radius: 2px; background: white; }
+.ai-comment-state, .ai-comment-empty { color: var(--text-faint); font-size: 12px; padding: 10px 14px; }
+.ai-comment-error { color: var(--red); font-size: 12px; padding: 10px 14px; overflow-wrap: anywhere; }
+.ai-comment-error button { margin-left: 8px; border: 0; background: none; color: var(--blue); }
+.ai-pending { width: 100%; text-align: left; border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px; padding: 12px; background: var(--bg-elev1); }
+.ai-pending p { font-size: 13px; line-height: 1.6; }
+.detached-detail, .detached-detail #root { width: 100%; height: 100%; margin: 0; background: transparent; overflow: hidden; }
+.detached-detail .detail-pop { top: 0; right: 0; width: 100%; height: 100%; box-sizing: border-box; animation: none; }
+.detached-detail .detail-head { -webkit-app-region: drag; }
+.detached-detail .detail-head button { -webkit-app-region: no-drag; }

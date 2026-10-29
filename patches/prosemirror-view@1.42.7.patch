@@ -1,0 +1,39 @@
+diff --git a/dist/index.cjs b/dist/index.cjs
+index a746f3df58f832784eea9fd06fcf15ddad023d91..65927a2b3893d5eee6efc905f4fb6696ece42ec8 100644
+--- a/dist/index.cjs
++++ b/dist/index.cjs
+@@ -4953,7 +4953,7 @@ function readDOMChange(view, from, to, typeOver, addedNodes) {
+     view.input.lastIOSEnter = 0;
+     return;
+   }
+-  if (view.state.selection.anchor > change.start && (inlineChange ? change.endA > change.start && change.endB == change.start : looksLikeBlockJoin(doc, change.start, change.endA, $from, $to)) && view.someProp("handleKeyDown", function (f) {
++  if (!view.composing && view.state.selection.anchor > change.start && (inlineChange ? change.endA > change.start && change.endB == change.start : looksLikeBlockJoin(doc, change.start, change.endA, $from, $to)) && view.someProp("handleKeyDown", function (f) {
+     return f(view, keyEvent(8, "Backspace"));
+   })) {
+     if (android && chrome) view.domObserver.suppressSelectionUpdates();
+diff --git a/dist/index.js b/dist/index.js
+index ba1e1ca9011e32024aafb5ad2555d0ebc6e22689..c2b7822ed0c52f42821fd956219a8273b4dfd218 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -5269,7 +5269,7 @@ function readDOMChange(view, from, to, typeOver, addedNodes) {
+         return;
+     }
+     // Same for backspace
+-    if (view.state.selection.anchor > change.start &&
++    if (!view.composing && view.state.selection.anchor > change.start &&
+         (inlineChange ? change.endA > change.start && change.endB == change.start
+             : looksLikeBlockJoin(doc, change.start, change.endA, $from, $to)) &&
+         view.someProp("handleKeyDown", f => f(view, keyEvent(8, "Backspace")))) {
+diff --git a/src/domchange.ts b/src/domchange.ts
+index 5e441c3e9219185ad647cae11c1c85f8a3b48474..6a9e4571576df60abda7a7a7876ccce7699778ee 100644
+--- a/src/domchange.ts
++++ b/src/domchange.ts
+@@ -186,7 +186,7 @@ export function readDOMChange(view: EditorView, from: number, to: number, typeOv
+     return
+   }
+   // Same for backspace
+-  if (view.state.selection.anchor > change.start &&
++  if (!view.composing && view.state.selection.anchor > change.start &&
+       (inlineChange ? change.endA > change.start && change.endB == change.start
+         : looksLikeBlockJoin(doc, change.start, change.endA, $from, $to)) &&
+       view.someProp("handleKeyDown", f => f(view, keyEvent(8, "Backspace")))) {

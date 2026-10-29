@@ -1,0 +1,158 @@
+diff --git a/es/index.js b/es/index.js
+index b80da7a80e1a85c14fc612fe91864dcee84a0169..0c7c2a4750e21ae3cdb6dce9007f7e4c85dfc615 100644
+--- a/es/index.js
++++ b/es/index.js
+@@ -102256,6 +102256,8 @@ class WSClient {
+         if (!wsInstance) {
+             return Promise.resolve(false);
+         }
++        // Keep the pending socket reachable so close() can cancel its handshake.
++        this.wsConfig.setWSInstance(wsInstance);
+         return new Promise((resolve) => {
+             let settled = false;
+             let timer;
+@@ -102265,8 +102267,12 @@ class WSClient {
+                 settled = true;
+                 if (timer)
+                     clearTimeout(timer);
++                if (this.cancelConnect === cancel)
++                    this.cancelConnect = undefined;
+                 resolve(ok);
+             };
++            const cancel = () => settleOnce(false);
++            this.cancelConnect = cancel;
+             // Optional handshake watchdog: if neither 'open' nor 'error' fires
+             // within the configured window (stuck DNS / proxy / NAT path), abort
+             // the attempt and let tryConnect treat it as a retryable failure.
+@@ -102274,6 +102280,7 @@ class WSClient {
+                 timer = setTimeout(() => {
+                     this.logger.error('[ws]', `handshake timeout after ${this.handshakeTimeoutMs}ms`);
+                     wsInstance.removeAllListeners();
++                    wsInstance.on('error', () => {});
+                     try {
+                         wsInstance.terminate();
+                     }
+@@ -102305,9 +102312,13 @@ class WSClient {
+             const tryConnect = () => __awaiter(this, void 0, void 0, function* () {
+                 this.reconnectInfo.lastConnectTime = Date.now();
+                 const pullResult = yield this.pullConnectConfig();
++                if (currentGeneration !== this.reconnectGeneration)
++                    return { ok: false, retryable: false };
+                 if (!pullResult.ok)
+                     return pullResult;
+                 const connected = yield this.connect();
++                if (currentGeneration !== this.reconnectGeneration)
++                    return { ok: false, retryable: false };
+                 if (!connected)
+                     return { ok: false, retryable: true };
+                 this.communicate();
+@@ -102329,8 +102340,11 @@ class WSClient {
+                     result = yield tryConnect();
+                 }
+                 finally {
+-                    this.isConnecting = false;
++                    if (currentGeneration === this.reconnectGeneration)
++                        this.isConnecting = false;
+                 }
++                if (currentGeneration !== this.reconnectGeneration)
++                    return;
+                 if (result.ok) {
+                     this.hasEverConnected = true;
+                     this.safeInvoke('onReady', this.onReady);
+@@ -102579,6 +102593,8 @@ class WSClient {
+         const { force = false } = params;
+         // Invalidate any in-flight reconnect loops
+         this.reconnectGeneration++;
++        if (this.cancelConnect)
++            this.cancelConnect();
+         if (this.pingInterval) {
+             clearTimeout(this.pingInterval);
+             this.pingInterval = undefined;
+@@ -102594,6 +102610,8 @@ class WSClient {
+         const wsInstance = this.wsConfig.getWSInstance();
+         if (wsInstance) {
+             wsInstance.removeAllListeners();
++            // ws emits an error when a CONNECTING socket is terminated.
++            wsInstance.on('error', () => {});
+             if (force) {
+                 wsInstance.terminate();
+             }
+diff --git a/lib/index.js b/lib/index.js
+index 6d686995487cefeabb80a19ba038ba31ab3d6807..ed05ed91763fcd75a68f03b939a2a02cf3af0c69 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -102274,6 +102274,8 @@ class WSClient {
+         if (!wsInstance) {
+             return Promise.resolve(false);
+         }
++        // Keep the pending socket reachable so close() can cancel its handshake.
++        this.wsConfig.setWSInstance(wsInstance);
+         return new Promise((resolve) => {
+             let settled = false;
+             let timer;
+@@ -102283,8 +102285,12 @@ class WSClient {
+                 settled = true;
+                 if (timer)
+                     clearTimeout(timer);
++                if (this.cancelConnect === cancel)
++                    this.cancelConnect = undefined;
+                 resolve(ok);
+             };
++            const cancel = () => settleOnce(false);
++            this.cancelConnect = cancel;
+             // Optional handshake watchdog: if neither 'open' nor 'error' fires
+             // within the configured window (stuck DNS / proxy / NAT path), abort
+             // the attempt and let tryConnect treat it as a retryable failure.
+@@ -102292,6 +102298,7 @@ class WSClient {
+                 timer = setTimeout(() => {
+                     this.logger.error('[ws]', `handshake timeout after ${this.handshakeTimeoutMs}ms`);
+                     wsInstance.removeAllListeners();
++                    wsInstance.on('error', () => {});
+                     try {
+                         wsInstance.terminate();
+                     }
+@@ -102323,9 +102330,13 @@ class WSClient {
+             const tryConnect = () => __awaiter(this, void 0, void 0, function* () {
+                 this.reconnectInfo.lastConnectTime = Date.now();
+                 const pullResult = yield this.pullConnectConfig();
++                if (currentGeneration !== this.reconnectGeneration)
++                    return { ok: false, retryable: false };
+                 if (!pullResult.ok)
+                     return pullResult;
+                 const connected = yield this.connect();
++                if (currentGeneration !== this.reconnectGeneration)
++                    return { ok: false, retryable: false };
+                 if (!connected)
+                     return { ok: false, retryable: true };
+                 this.communicate();
+@@ -102347,8 +102358,11 @@ class WSClient {
+                     result = yield tryConnect();
+                 }
+                 finally {
+-                    this.isConnecting = false;
++                    if (currentGeneration === this.reconnectGeneration)
++                        this.isConnecting = false;
+                 }
++                if (currentGeneration !== this.reconnectGeneration)
++                    return;
+                 if (result.ok) {
+                     this.hasEverConnected = true;
+                     this.safeInvoke('onReady', this.onReady);
+@@ -102597,6 +102611,8 @@ class WSClient {
+         const { force = false } = params;
+         // Invalidate any in-flight reconnect loops
+         this.reconnectGeneration++;
++        if (this.cancelConnect)
++            this.cancelConnect();
+         if (this.pingInterval) {
+             clearTimeout(this.pingInterval);
+             this.pingInterval = undefined;
+@@ -102612,6 +102628,8 @@ class WSClient {
+         const wsInstance = this.wsConfig.getWSInstance();
+         if (wsInstance) {
+             wsInstance.removeAllListeners();
++            // ws emits an error when a CONNECTING socket is terminated.
++            wsInstance.on('error', () => {});
+             if (force) {
+                 wsInstance.terminate();
+             }

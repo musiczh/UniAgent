@@ -1,0 +1,24 @@
+{
+  "frame": {
+    "topic": "workspace-config//ZCODE_PROBE_ROOT/workspace",
+    "subscriptionId": "wcs-mv56h1ry-23094uyt-1",
+    "fromSeq": 0,
+    "toSeq": 0,
+    "sentAt": 1791805066558,
+    "payload": {
+      "kind": "snapshot",
+      "snapshot": {
+        "protocolVersion": 1,
+        "workspaceId": "/ZCODE_PROBE_ROOT/workspace",
+        "logEpoch": "mv56h1ry-23094uyt",
+        "config": {
+          "configOptions": [],
+          "slashCommands": []
+        }
+      }
+    }
+  },
+  "deliveryKind": "initial",
+  "logicalFrameId": "wcs-mv56h1ry-23094uyt-1-lf-1",
+  "logicalFrameOrdinal": 1
+}

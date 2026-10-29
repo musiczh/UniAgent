@@ -1,0 +1,32 @@
+{
+  "scope": "local-model-with-production-handoff-server-and-isolated-response-broker",
+  "checkedAt": "2026-10-12T12:08:17.274Z",
+  "checks": {
+    "personalProviderLocalExecution": true,
+    "twoSessionMcpIsolation": true,
+    "historyRowsRangeCursor": true,
+    "durableColdHistory": true,
+    "mcpCallerColdResume": true,
+    "uniagentHandoffServerCallerForwarding": true,
+    "multiSelectQuestionAnswer": true,
+    "permissionDeniedNoWrite": true,
+    "permissionApprovedWrite": true,
+    "stopInterruptedNativeTurn": true,
+    "physicalFragmentAssembly": true,
+    "realAuthProbeLocalSelfCheck": true
+  },
+  "unverified": [
+    "real-zhipu-auth",
+    "real-model-quality",
+    "real-model-tool-choice",
+    "production-requirement-main-handler"
+  ],
+  "handoffServerSha256": "8d88b2899fa6aa509660d95d255e90f127f17f31b2a6b878477d04dbaec228b9",
+  "runtime": {
+    "nodeVersion": "v24.14.0",
+    "bundleSha256": "f78a9144825414853caf3aac2f6913f72def33a808aae7885d50230c289c60ee"
+  },
+  "result": "local-contract-passed",
+  "source": "official-zcode-engine-with-current-UniAgent-handoff-stdio-source",
+  "stableRuntimeRelocationVerified": true
+}

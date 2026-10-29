@@ -1,0 +1,201 @@
+import assert from 'node:assert/strict'
+import { existsSync, readdirSync, statSync } from 'node:fs'
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
+
+// The managed runtime is no longer pinned: resolve the newest installed runtime-<version> dir.
+function resolveInstalledDeepSeekRuntime(): string {
+  const root = join(homedir(), 'Library/Application Support/UniAgent/deepseek')
+  const installed = existsSync(root) ? readdirSync(root).filter((name) => /^runtime-.+/.test(name)) : []
+  installed.sort((a, b) => statSync(join(root, b)).mtimeMs - statSync(join(root, a)).mtimeMs)
+  return join(root, installed[0] || 'runtime-0.2.1-rc.2')
+}
+
+const source = resolve('src/main/deepseekControlPlugin.mjs')
+assert.ok(existsSync(source), 'DeepSeek controls companion must exist')
+const runtime = process.env.UNIAGENT_DEEPSEEK_TEST_RUNTIME || resolveInstalledDeepSeekRuntime()
+const directory = await mkdtemp(join(tmpdir(), 'ua-dsh-controls-'))
+const sdk = (name: string) => import(pathToFileURL(join(runtime,'node_modules/@deepseek-ai',name,'lib/index.js')).href)
+const {Context} = await sdk('cordis')
+const {SessionStore} = await sdk('dsh-session')
+const {AgentRegistry,agentCarrier} = await sdk('dsh-agent')
+const {SessionProjectionRegistry} = await sdk('dsh-session-projection')
+const {GoalService} = await sdk('dsh-goal')
+const {createScope} = await sdk('dsh-scope')
+const {PluginManager} = await sdk('dsh-plugin-manager')
+const goalDriver = await sdk('dsh-goal-round-driver')
+await copyFile(source,join(directory,'controls.mjs'))
+const {createDeepSeekControls} = await import(pathToFileURL(join(directory,'controls.mjs')).href)
+const ctx = new Context()
+new SessionStore(ctx)
+new AgentRegistry(ctx)
+new SessionProjectionRegistry(ctx)
+new GoalService(ctx,{defaultMaxGoalRounds:4})
+const events:any[]=[]
+let controls:any
+let scope:any
+let driver:any
+try {
+  const session=ctx.sessions.create('root-session',{meta:{cwd:directory}})
+  const agent:any={id:session.id,session,status:'idle'}
+  scope=createScope(ctx,agent)
+  agent.ctx=scope.ctx
+  ctx.agents.enter(agent)
+  await ctx.agents.announce(agent,'new')
+  controls=createDeepSeekControls(ctx,(params:any)=>events.push(params))
+  const signal=new AbortController().signal
+  const dispatch=(method:string,params:any={})=>controls.dispatch(method,{sessionId:agent.id,...params},signal)
+  assert.equal(controls.handles('_uniagent/goal_set'),true)
+  assert.equal(controls.flags.nativeGoal,true)
+  assert.equal((await dispatch('_uniagent/goal_get')).goal,null)
+  await assert.rejects(dispatch('_uniagent/goal_set',{objective:'tokens are not rounds',tokenBudget:100}),/token.*budget/i)
+  assert.equal(ctx.goals.get(agent),undefined)
+  const created=await dispatch('_uniagent/goal_set',{objective:'finish fixture',maxRounds:3})
+  assert.equal(created.goal.maxGoalRounds,3)
+  assert.equal(created.goal.activation,'armed')
+  assert.equal(created.autonomous,true)
+  assert.equal(created.limit.kind,'rounds')
+  assert.ok(events.some(event=>event.kind==='goal'&&event.goal.activation==='armed'))
+  const paused=await dispatch('_uniagent/goal_update',{action:'pause',ref:{id:created.goal.id,revision:created.goal.revision}})
+  assert.equal(paused.goal.phase,'paused')
+  assert.equal(paused.autonomous,false)
+  await assert.rejects(dispatch('_uniagent/goal_update',{action:'resume',ref:{id:created.goal.id,revision:created.goal.revision}}),/stale.*revision/i)
+  const resumed=await dispatch('_uniagent/goal_update',{action:'resume'})
+  assert.equal(resumed.goal.phase,'active')
+  ctx.goals.disarm(agent)
+  const disarmed=await dispatch('_uniagent/goal_get')
+  assert.equal(disarmed.goal.phase,'active')
+  assert.equal(disarmed.goal.activation,'disarmed')
+  assert.equal(disarmed.autonomous,false)
+  const rearmed=await dispatch('_uniagent/goal_update',{action:'resume'})
+  ctx.sessionProjections.register({key:'tokenUsage',stateVersion:1,stateSchema:{parse:(value:any)=>value},init:()=>({uncachedInputTokens:17,outputTokens:5,cacheReadTokens:3,cacheWriteTokens:0}),apply:(value:any)=>value,wire:{viewSchema:{parse:(value:any)=>value},view:(value:any)=>value}})
+  session.append('turn/start',{turn:1})
+  session.append('user/message',{id:'round-1',role:'user',source:{kind:'goal',goalId:rearmed.goal.id,revision:rearmed.goal.revision,round:1},content:[{type:'text',text:'automatic native round'}]},{surfaceOp:'append'})
+  session.append('turn/end',{turn:1,reason:{kind:'completed'}})
+  assert.ok(events.some(event=>event.kind==='goal_turn'&&event.state==='success'&&event.round===1&&event.usage.outputTokens===5))
+  session.append('turn/start',{turn:2})
+  session.append('user/message',{id:'round-2',role:'user',source:{kind:'goal',goalId:rearmed.goal.id,revision:rearmed.goal.revision,round:2},content:[{type:'text',text:'second native round'}]},{surfaceOp:'append'})
+  ctx.emit(agentCarrier(agent),'agent/error',{agent,error:{code:'FIXTURE',message:'failed while driving'}})
+  const failed=await dispatch('_uniagent/goal_get')
+  assert.equal(failed.goal.phase,'active')
+  assert.equal(failed.goal.activation,'disarmed')
+  assert.equal(events.some(event=>event.kind==='goal_turn'&&event.state==='error'&&event.error?.code==='FIXTURE'),false,'an active round waits for its durable end before emitting terminal')
+  session.append('turn/end',{turn:2,reason:{kind:'error',error:{code:'FIXTURE',message:'failed while driving'}}})
+  const errorTerminal=events.findIndex(event=>event.kind==='goal_turn'&&event.state==='error'&&event.error?.code==='FIXTURE')
+  assert.ok(errorTerminal>=0)
+  assert.equal(events[errorTerminal-1].event.type,'turn/end','raw end precedes the error terminal')
+  const blocked=await dispatch('_uniagent/goal_update',{action:'block',reason:{code:'round-limit',message:'Native goal round limit reached'}})
+  assert.equal(blocked.goal.blockedReason.code,'round-limit')
+  assert.equal(blocked.limit.kind,'rounds')
+  assert.equal(blocked.autonomous,false)
+  await dispatch('_uniagent/goal_update',{action:'complete'})
+  await dispatch('_uniagent/goal_update',{action:'clear'})
+  assert.equal((await dispatch('_uniagent/goal_get')).goal,null)
+  await assert.rejects(controls.dispatch('_uniagent/goal_get',{sessionId:'missing'},signal),/session/i)
+  const controller=new AbortController();controller.abort()
+  await assert.rejects(controls.dispatch('_uniagent/goal_set',{sessionId:agent.id,objective:'cancelled'},controller.signal),/abort/i)
+  const continuations:any[]=[]
+  agent.inbox={nextTurn:[],nextStep:[]}
+  agent.followup=(message:any)=>{
+    continuations.push(message)
+    agent.inbox.nextTurn.push(message)
+    agent.status='running'
+    ctx.emit(agentCarrier(agent),'agent/inbox/inserted',{agent,message})
+  }
+  driver=ctx.plugin(goalDriver)
+  await driver
+  await dispatch('_uniagent/goal_set',{objective:'native driver proves autonomous rounds',maxRounds:1})
+  for(let attempt=0;attempt<100&&continuations.length===0;attempt++)await new Promise(resolve=>setImmediate(resolve))
+  assert.equal(continuations.length,1,'official goal driver queues one native followup without a client prompt')
+  const message=continuations[0]
+  ctx.emit(agentCarrier(agent),'agent/inbox/claimed',{agent,message})
+  session.append('turn/start',{turn:2})
+  session.append('user/message',message,{surfaceOp:'append'})
+  session.append('turn/end',{turn:2,reason:{kind:'completed'}})
+  agent.inbox.nextTurn=[];agent.status='idle'
+  ctx.emit(agentCarrier(agent),'agent/status',{agent,status:'idle'})
+  for(let attempt=0;attempt<100&&ctx.goals.get(agent).phase==='active';attempt++)await new Promise(resolve=>setImmediate(resolve))
+  const limited=await dispatch('_uniagent/goal_get')
+  assert.equal(limited.goal.phase,'blocked')
+  assert.equal(limited.goal.blockedReason.code,'round-limit')
+  assert.equal(limited.goal.roundsStarted,1)
+  await driver.dispose();driver=undefined
+
+  // Native manager persists only its profile patch and reports the startup-only lifecycle.
+  const profile=join(directory,'profile'), home=join(directory,'home')
+  await mkdir(profile,{recursive:true});await mkdir(home,{recursive:true})
+  await symlink(join(runtime,'node_modules'),join(directory,'node_modules'),'dir')
+  await writeFile(join(profile,'package.json'),JSON.stringify({name:'fixture-profile',private:true,dsh:{profile:{bundles:[]}}}))
+  const original=[{insert:[{id:'fixture-plugin',name:'fixture-module'}]},{id:'unrelated',disabled:true}]
+  const profilePatch=join(profile,'cordis.patch.yml'), homePatch=join(home,'cordis.patch.yml')
+  await writeFile(profilePatch,JSON.stringify(original));await writeFile(homePatch,JSON.stringify([]))
+  const anchor=join(directory,'installation.json');await writeFile(anchor,JSON.stringify({dependencies:{}}))
+  const parentTree={ctx:{fiber:{entry:{id:'include'}}}}
+  ctx.provide('loader',{*entries(){yield{id:'fixture-entry',options:{id:'fixture-plugin',name:'fixture-module'},disabled:false,parent:{tree:parentTree}}}})
+  ctx.provide('profileContext',{name:'fixture',dir:profile,patchPath:profilePatch,home,cwd:directory,installAnchor:anchor,startedBundles:[],overlays:[]})
+  const pnpmFixture=join(directory,'pnpm-fixture.cjs')
+  await writeFile(pnpmFixture,`#!/usr/bin/env node\nconst fs=require('node:fs'),path=require('node:path');const args=process.argv.slice(2);const manifestPath=path.join(process.cwd(),'package.json');const manifest=JSON.parse(fs.readFileSync(manifestPath));if(args[0]==='config'){console.log('https://registry.npmjs.org/');process.exit(0)}if(args[0]==='add'){const spec=args[1],metadata=JSON.parse(fs.readFileSync(path.join(spec,'package.json')));manifest.dependencies={...manifest.dependencies,[metadata.name]:'file:'+spec};const target=path.join(process.cwd(),'node_modules',metadata.name);fs.mkdirSync(path.dirname(target),{recursive:true});fs.cpSync(spec,target,{recursive:true});fs.writeFileSync(manifestPath,JSON.stringify(manifest));fs.writeFileSync(path.join(process.cwd(),'pnpm-lock.yaml'),'fixture changed');if(metadata.name==='slow-bundle'){console.log('installation waiting');setInterval(()=>{},1000);return}}if(args[0]==='remove'){delete manifest.dependencies[args[1]];fs.writeFileSync(manifestPath,JSON.stringify(manifest))}console.log('fixture package operation completed');\n`)
+  await chmod(pnpmFixture,0o755)
+  new PluginManager(ctx,{pnpmCommand:pnpmFixture,outputBytes:4096,lockWaitMs:1000,inspectTimeoutMs:1000,githubConnectionTimeoutMs:1000,idleTimeoutMs:1000,fallbackRegistries:[]})
+  const list=await dispatch('_uniagent/plugin_action',{action:'list'})
+  assert.equal(list.plugins[0].patchId,'fixture-plugin')
+  const disabled=await dispatch('_uniagent/plugin_action',{action:'disable',target:'entry',id:'fixture-entry'})
+  assert.equal(disabled.application,'restart-required')
+  assert.equal(disabled.restartRequired,true)
+  assert.ok(disabled.message.includes('restart'))
+  assert.equal(await readFile(homePatch,'utf8'),'[]')
+  const saved=await readFile(profilePatch,'utf8')
+  assert.ok(saved.includes('unrelated'))
+  assert.ok(saved.includes('fixture-plugin'))
+  const enabled=await dispatch('_uniagent/plugin_action',{action:'enable',target:'entry',id:'fixture-entry'})
+  assert.equal(enabled.application,'restart-required')
+  const packageDir=join(directory,'local-bundle')
+  await mkdir(packageDir)
+  await writeFile(join(packageDir,'package.json'),JSON.stringify({name:'fixture-bundle',version:'1.0.0',dsh:{bundle:{patch:'cordis.patch.yml'}}}))
+  await writeFile(join(packageDir,'cordis.patch.yml'),'[]')
+  const inspection=await dispatch('_uniagent/plugin_action',{action:'inspect',spec:packageDir})
+  assert.equal(inspection.status,'accepted')
+  assert.equal(inspection.name,'fixture-bundle')
+  const installed=await dispatch('_uniagent/plugin_action',{action:'install',spec:packageDir,options:{enabled:false}})
+  assert.equal(installed.application,'restart-required')
+  assert.equal(installed.bundle,'fixture-bundle')
+  assert.ok(JSON.parse(await readFile(join(profile,'package.json'),'utf8')).dependencies['fixture-bundle'])
+  const removed=await dispatch('_uniagent/plugin_action',{action:'remove',name:'fixture-bundle'})
+  assert.equal(removed.application,'restart-required')
+  assert.equal('fixture-bundle' in JSON.parse(await readFile(join(profile,'package.json'),'utf8')).dependencies,false)
+  const slow=join(directory,'slow-bundle');await mkdir(slow)
+  await writeFile(join(slow,'package.json'),JSON.stringify({name:'slow-bundle',version:'1.0.0',dsh:{bundle:{patch:'cordis.patch.yml'}}}))
+  await writeFile(join(slow,'cordis.patch.yml'),'[]')
+  const beforeCancel=await readFile(join(profile,'package.json'),'utf8')
+  const cancellation=new AbortController()
+  const packageProcessStarted=new Promise<void>(resolve=>{
+    const dispose=ctx.on('plugin-manager/install-log',(chunk:any)=>{if(chunk.text.includes('installation waiting')){dispose();resolve()}})
+  })
+  const installing=controls.dispatch('_uniagent/plugin_action',{sessionId:agent.id,action:'install',spec:slow,options:{enabled:false}},cancellation.signal)
+  await packageProcessStarted
+  assert.equal((await readFile(join(profile,'package.json'),'utf8')).includes('slow-bundle'),true,'cancellation covers an active native package process with modified profile files')
+  cancellation.abort()
+  const cancelled=await installing
+  assert.equal(cancelled.application,'cancelled')
+  assert.equal(await readFile(join(profile,'package.json'),'utf8'),beforeCancel,'official install cancellation restores the manifest before returning')
+  const absent=await dispatch('_uniagent/plugin_action',{action:'disable',target:'entry',id:'absent'})
+  assert.equal(absent.application,'failed')
+  assert.equal(absent.error.code,'unknown-plugin')
+  await assert.rejects(dispatch('_uniagent/plugin_action',{action:'inspect',spec:packageDir,options:{registry:'https://user:secret@example.com'}}),/registry/i)
+  const stopped=await dispatch('_uniagent/plugin_action',{action:'enable',target:'entry',id:'fixture-entry'})
+  assert.equal(stopped.restartRequired,true)
+  await assert.rejects(dispatch('_uniagent/plugin_action',{action:'enable',target:'entry',id:'fixture-entry',options:{bypass:true}}),/options|unknown/i)
+  const beforeDispose=events.length
+  controls.dispose()
+  await assert.rejects(dispatch('_uniagent/goal_get'),/disposed/)
+  ctx.goals.disarm(agent)
+  assert.equal(events.length,beforeDispose)
+} finally {
+  controls?.dispose()
+  await driver?.dispose()
+  await scope?.dispose()
+  await rm(directory,{recursive:true,force:true})
+}
+console.log('deepseek-controls: native goal CAS, activation, turns/usage, token-budget refusal and persistent plugin actions passed')

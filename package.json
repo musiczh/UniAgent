@@ -1,0 +1,195 @@
+{
+  "name": "uniagent-public",
+  "version": "1.1.0",
+  "description": "UniAgent Public — a desktop workbench for coding agents",
+  "main": "./out/main/index.js",
+  "author": "郑焕",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/musiczh/UniAgent.git"
+  },
+  "homepage": "https://musiczh.github.io/UniAgent/",
+  "keywords": [
+    "electron",
+    "react",
+    "typescript",
+    "codex",
+    "claude-code",
+    "grok",
+    "agent",
+    "desktop"
+  ],
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "electron",
+      "esbuild"
+    ],
+    "patchedDependencies": {
+      "@larksuiteoapi/node-sdk@1.73.0": "patches/@larksuiteoapi__node-sdk@1.73.0.patch",
+      "prosemirror-view@1.42.7": "patches/prosemirror-view@1.42.7.patch"
+    }
+  },
+  "scripts": {
+    "dev": "pnpm run build:capability-fs-addon && electron-vite dev",
+    "render:mockup": "electron scripts/render-mockup.mjs",
+    "build:capability-fs-addon": "node scripts/build-capability-fs-addon.mjs",
+    "build": "pnpm run build:capability-fs-addon && electron-vite build",
+    "test:req2": "node test/chain-open-controller.mjs && node test/context-compaction-lifecycle.mjs && node test/context-compaction-history.mjs && node scripts/run-ts-test.mjs test/context-compaction-renderer.tsx",
+    "test:agent-lifecycle": "node scripts/run-ts-test.mjs test/agent-lifecycle.test.mjs",
+    "test:startup": "node test/startup-bootstrap.test.mjs && node scripts/run-ts-test.mjs test/orchestrator-scoped-queue-resume.ts",
+    "test:cdp-agent-lifecycle": "node test/cdp-agent-lifecycle.mjs",
+    "test:req6": "node --experimental-strip-types test/manual-context-compaction.test.mjs && node test/context-compaction-lifecycle.mjs && node test/context-compaction-history.mjs && node test/context-compaction-occupancy.mjs",
+    "test:req5": "node test/subagent-lifecycle.mjs && node test/subagent-adapter.integration.mjs && node test/subagent-history.integration.mjs && node scripts/run-ts-test.mjs test/subagent-isolation.ts",
+    "test:sidebar-sessions": "node scripts/run-ts-test.mjs test/sidebar-session-visibility.ts",
+    "test:history-import": "node test/codex-history-import.mjs",
+    "start": "electron-vite preview",
+    "pack": "pnpm run build && electron-builder --dir",
+    "pack:debug": "node scripts/pack-debug.mjs",
+    "dist": "pnpm run build && electron-builder --mac",
+    "release": "node scripts/release-public.mjs --publish",
+    "test:release": "node scripts/run-regression.mjs",
+    "test:native-capabilities": "node scripts/run-ts-test.mjs test/native-capability-contracts.ts && node scripts/run-ts-test.mjs test/appserver-transport.ts && node scripts/run-ts-test.mjs test/appserver-ignored-events.ts && node scripts/run-ts-test.mjs test/native-capability-service.ts && node scripts/run-ts-test.mjs test/native-turn-input.ts && node scripts/run-ts-test.mjs test/native-goal-plan-review.ts && node scripts/run-ts-test.mjs test/native-mcp-status.ts && node scripts/run-ts-test.mjs test/native-capability-ui.tsx && node --experimental-strip-types test/manual-context-compaction.test.mjs",
+    "test:native-capabilities:packaged": "node test/cdp-native-capabilities.mjs \"release/mac-arm64/UniAgent Public.app/Contents/MacOS/UniAgent Public\" codex",
+    "test:capability-sync-atomic-fs": "pnpm run build:capability-fs-addon && node --experimental-strip-types --test --test-concurrency=1 test/capability-sync-atomic-fs.test.mjs",
+    "test:capability-sync": "pnpm run test:capability-sync-atomic-fs && node --experimental-strip-types test/capability-sync-provider.test.mjs && node --experimental-strip-types test/capability-sync.test.mjs",
+    "test:cdp:req2-capabilities": "node test/cdp-req2-capabilities.mjs \"release/mac-arm64/UniAgent Public.app/Contents/MacOS/UniAgent Public\"",
+    "test:packaged:token-filebrowser": "node test/cdp-packaged-token-filebrowser.mjs \"release/mac-arm64/UniAgent Public.app/Contents/MacOS/UniAgent Public\"",
+    "test:automation:packaged": "node test/cdp-automation-mutation.mjs \"release/mac-arm64/UniAgent Public.app/Contents/MacOS/UniAgent Public\"",
+    "test:grok:contract:build": "esbuild test/grok-acp-contract.ts --bundle --platform=node --format=esm --packages=external --outfile=.test-build/grok/grok-acp-contract.js",
+    "test:grok:contract": "pnpm run test:grok:contract:build && node .test-build/grok/grok-acp-contract.js",
+    "test:deepseek": "for test_file in test/acp-stability.ts test/deepseek-acp-contract.ts test/deepseek-event-store.ts test/deepseek-service.ts test/deepseek-orchestrator.ts test/deepseek-event-projection.ts test/deepseek-pricing.ts test/deepseek-usage-rendering.tsx test/deepseek-native-image.ts; do node scripts/run-ts-test.mjs \"$test_file\" || exit 1; done",
+    "test:deepseek:packaged": "node test/cdp-acp-stability.mjs \"release/mac-arm64/UniAgent Public.app/Contents/MacOS/UniAgent Public\"",
+    "test:kimi:contract": "node scripts/run-ts-test.mjs test/kimi-acp-contract.ts && node scripts/run-ts-test.mjs test/kimi-capability-gates.ts && node scripts/run-ts-test.mjs test/kimi-oauth-login.ts",
+    "test:grok": "pnpm run test:grok:contract && for test_file in test/grok-orchestrator.ts test/grok-history.ts test/grok-inventory.ts test/grok-ui-contract.tsx test/grok-native-commands.tsx; do node scripts/run-ts-test.mjs \"$test_file\" || exit 1; done",
+    "test": "node scripts/run-regression.mjs",
+    "test:list": "node scripts/run-regression.mjs --list",
+    "test:engine": "node scripts/engine-regression.mjs prepare",
+    "test:engine:check": "node scripts/engine-regression.mjs check",
+    "test:deepseek:native": "node test/cdp-acp-stability.mjs \"release/mac-arm64/UniAgent Public.app/Contents/MacOS/UniAgent Public\"",
+    "test:beta-capabilities": "for test_file in test/acp-stability.ts test/acp-event-projection.ts test/agent-roles.ts test/beta-capability-management.ts test/beta-capability-panel.tsx test/beta-session-fork.ts test/beta-queue-steer.ts test/beta-side-capabilities.ts test/beta-side-orchestrator.ts test/claude-role-orchestrator.ts test/claude-role-runtime.ts test/claude-native-reports.tsx test/claude-plugin-management.ts test/grok-ui-contract.tsx test/kimi-role-config.ts test/subagent-cancel.ts test/subagent-cancel-ui.tsx; do node scripts/run-ts-test.mjs \"$test_file\" || exit 1; done",
+    "test:beta-capabilities:packaged": "node test/cdp-acp-stability.mjs \"release/mac-arm64/UniAgent Public.app/Contents/MacOS/UniAgent Public\"",
+    "test:beta-goal": "node scripts/run-ts-test.mjs test/acp-stability.ts",
+    "test:beta-goal:packaged": "node test/cdp-acp-stability.mjs \"release/mac-arm64/UniAgent Public.app/Contents/MacOS/UniAgent Public\"",
+    "test:claude-beta:packaged": "node test/cdp-claude-beta-capabilities.mjs \"release/mac-arm64/UniAgent Public.app/Contents/MacOS/UniAgent Public\"",
+    "test:deepseek:api": "node test/cdp-deepseek-stable-api.mjs \"release/mac-arm64/UniAgent Public.app/Contents/MacOS/UniAgent Public\""
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.312",
+    "@iarna/toml": "^2.2.5",
+    "@larksuiteoapi/node-sdk": "^1.73.0",
+    "better-sqlite3": "11.10.0",
+    "dompurify": "^3.4.13",
+    "js-yaml": "^4.3.1",
+    "marked": "^18.0.10",
+    "mermaid": "^11.17.2",
+    "nanoid": "^5.0.7",
+    "qr": "0.7.2"
+  },
+  "devDependencies": {
+    "@tiptap/core": "3.32.0",
+    "@tiptap/extension-code-block": "3.32.0",
+    "@tiptap/extension-list": "3.32.0",
+    "@tiptap/extension-paragraph": "3.32.0",
+    "@tiptap/extension-table": "3.32.0",
+    "@tiptap/pm": "3.32.0",
+    "@tiptap/starter-kit": "3.32.0",
+    "@types/better-sqlite3": "9.6.0",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/ws": "^8.18.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^2.3.0",
+    "entities": "8.1.0",
+    "esbuild": "0.21.5",
+    "prosemirror-markdown": "1.13.9",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.7.2",
+    "vite": "^5.4.11",
+    "ws": "^8.21.3"
+  },
+  "build": {
+    "appId": "com.uniagent.public",
+    "productName": "UniAgent Public",
+    "beforeBuild": "./scripts/electron-sqlite.mjs",
+    "beforePack": "./scripts/package-files.mjs",
+    "afterPack": "./scripts/electron-sqlite.mjs",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/main/**/*",
+      "out/preload/**/*",
+      {
+        "from": "out/renderer",
+        "to": "out/renderer",
+        "filter": [
+          "**/*"
+        ]
+      },
+      "!node_modules/**/*.map",
+      "!node_modules/cytoscape-fcose/demo{,/**/*}",
+      "!node_modules/cytoscape-cose-bilkent/demo{,/**/*}",
+      "!node_modules/better-sqlite3/deps{,/**/*}",
+      "!node_modules/better-sqlite3/src{,/**/*}",
+      "!node_modules/better-sqlite3/build/Release/test_extension.node"
+    ],
+    "asarUnpack": [
+      "node_modules/better-sqlite3/**/*.node",
+      "out/renderer/**/*",
+      "out/.renderer-package-*/**/*",
+      "out/preload/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "native/app-restart-protocol.json",
+        "to": "app-restart-protocol.json"
+      },
+      {
+        "from": "docs/research/hermes-assistant-notices.md",
+        "to": "licenses/hermes-assistant-notices.md"
+      },
+      {
+        "from": "out/native/ua-capability-fs.node",
+        "to": "native/ua-capability-fs.node"
+      }
+    ],
+    "mac": {
+      "icon": "build/icon.icns",
+      "category": "public.app-category.developer-tools",
+      "entitlements": "native/entitlements.mac.plist",
+      "entitlementsInherit": "native/entitlements.mac.inherit.plist",
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "arm64"
+          ]
+        },
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ]
+    },
+    "dmg": {
+      "artifactName": "UniAgent-Public-${version}-${arch}.${ext}"
+    },
+    "artifactName": "UniAgent-Public-${version}-${arch}.${ext}"
+  },
+  "productName": "UniAgent Public"
+}

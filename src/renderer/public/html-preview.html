@@ -1,0 +1,80 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>HTML 预览</title>
+  <style>html, body, iframe { display: block; width: 100%; height: 100%; margin: 0; border: 0; }</style>
+</head>
+<body>
+<script>
+  // The main process supplies this file's CSP as a response header. The embedding iframe must retain an opaque
+  // origin (allow-scripts without allow-same-origin) and has no preload bridge.
+  function observePreview(id) {
+    const send = (type, data = {}) => parent.postMessage({ type, id, ...data }, '*');
+    let scheduled = false;
+    let previousHeight = 0;
+    let previousViewport = innerHeight;
+    let viewportOverflow;
+    const measure = () => {
+      scheduled = false;
+      const root = document.documentElement;
+      const body = document.body;
+      if (!body) return;
+      const rect = body.getBoundingClientRect();
+      const margin = parseFloat(getComputedStyle(body).marginBottom) || 0;
+      const height = Math.ceil(Math.max(rect.bottom + scrollY + margin, body.scrollHeight));
+      // A 100vh page with body margins must not grow its parent indefinitely.
+      const viewportGrowth = innerHeight - previousViewport;
+      const followsViewport = viewportGrowth > 0 && Math.abs(height - previousHeight - viewportGrowth) <= 1;
+      if (followsViewport) viewportOverflow = height - innerHeight;
+      const viewportBound = viewportOverflow !== undefined && Math.abs(height - innerHeight - viewportOverflow) <= 1;
+      if (!viewportBound) viewportOverflow = undefined;
+      previousViewport = innerHeight;
+      previousHeight = height;
+      send('html-preview:size', {
+        height: viewportBound ? undefined : height,
+        overflowWidth: root.scrollWidth > root.clientWidth + 1 ? root.scrollWidth : 0
+      });
+    };
+    const schedule = () => {
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(measure);
+    };
+    document.addEventListener('DOMContentLoaded', () => {
+      const observer = new ResizeObserver(schedule);
+      observer.observe(document.documentElement);
+      observer.observe(document.body);
+      new MutationObserver(schedule).observe(document.body, { subtree: true, childList: true, attributes: true, characterData: true });
+      schedule();
+    }, { once: true });
+    window.addEventListener('resize', schedule);
+    window.addEventListener('load', schedule);
+    document.addEventListener('load', schedule, true);
+    document.fonts.ready.then(schedule);
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && !event.defaultPrevented) send('html-preview:escape');
+    });
+  }
+
+  window.addEventListener('message', function initialize(event) {
+    if (event.source !== parent || event.data?.type !== 'html-preview:init' ||
+        typeof event.data.html !== 'string' || typeof event.data.id !== 'string') return;
+    window.removeEventListener('message', initialize);
+    const parsed = new DOMParser().parseFromString(event.data.html, 'text/html');
+    const observer = parsed.createElement('script');
+    observer.textContent = '(' + observePreview.toString() + ')(' + JSON.stringify(event.data.id).replace(/</g, '\\u003c') + ');';
+    parsed.head.prepend(observer);
+    const preview = document.createElement('iframe');
+    preview.setAttribute('sandbox', 'allow-scripts allow-forms');
+    preview.setAttribute('title', document.title);
+    window.addEventListener('message', (childEvent) => {
+      if (childEvent.source === preview.contentWindow) parent.postMessage(childEvent.data, '*');
+    });
+    preview.srcdoc = '<!doctype html>\n' + parsed.documentElement.outerHTML;
+    document.body.replaceChildren(preview);
+  });
+  parent.postMessage({ type: 'html-preview:ready' }, '*');
+</script>
+</body>
+</html>

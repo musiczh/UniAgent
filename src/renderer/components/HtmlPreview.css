@@ -1,0 +1,116 @@
+.html-preview {
+  position: static;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: none;
+  max-height: none;
+  min-width: 0;
+  margin: 8px 0;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+}
+
+.html-preview:modal {
+  position: fixed;
+  inset: 24px;
+  width: calc(100vw - 48px);
+  height: calc(100vh - 48px);
+  margin: auto;
+}
+
+.html-preview::backdrop {
+  background: #0009;
+}
+
+.html-preview-toolbar {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+  font-size: 12px;
+}
+
+.html-preview-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-dim);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.html-preview-actions {
+  display: flex;
+  flex: none;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.html-preview-actions button {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  cursor: pointer;
+}
+
+.html-preview-actions button:hover {
+  background: var(--bg-elev2);
+  color: var(--text);
+}
+
+.html-preview-actions button[aria-pressed='true'] {
+  background: color-mix(in srgb, var(--blue) 10%, transparent);
+  color: var(--blue);
+}
+
+.html-preview-actions button:disabled { opacity: .45; cursor: default; }
+
+.html-preview-viewport {
+  min-height: 0;
+  overflow: auto;
+  max-height: min(960px, 80vh);
+  scrollbar-color: var(--border) var(--bg);
+}
+
+.html-preview:modal .html-preview-viewport { flex: 1; max-height: none; }
+
+.html-preview-stage { position: relative; overflow: hidden; }
+
+.html-preview-frame {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: block;
+  transform-origin: top left;
+  border: 0;
+  background: var(--bg);
+}
+
+@media (pointer: coarse) {
+  .html-preview-actions button { width: 44px; height: 44px; }
+}
+
+.html-preview-status {
+  padding: 20px 12px;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.agent-md > .md-fragment:first-child > :first-child { margin-top: 0; }
+.agent-md > .md-fragment:last-child > :last-child { margin-bottom: 0; }
