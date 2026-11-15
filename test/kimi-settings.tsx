@@ -84,7 +84,7 @@ try {
   agent.incompatible = false; agent.lifecycle = { availability: 'available' }
   snapshot = { phase: 'completed', status: 'ready', cancellable: false }; changed?.(snapshot); await flush()
   assert.doesNotMatch(renderToStaticMarkup(render()), /deepseek-step|API Key|一键登录|一键安装/)
-  agent.lifecycle = { availability: 'needs-auth' }
+  agent.incompatible = true; agent.lifecycle = { availability: 'needs-auth', lastReadyAt: 1 }
   assert.match(renderToStaticMarkup(render()), /一键登录/, 'a fresh auth failure must override an old ready setup snapshot')
   console.log('Kimi settings: error copy map, zero-agent entry, explicit install, single click, progress/cancel, copy fallback, login transition and result-first failure state passed')
 } finally {

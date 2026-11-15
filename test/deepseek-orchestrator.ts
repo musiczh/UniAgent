@@ -24,26 +24,29 @@ const agent = { id:'deepseek', name:'DeepSeek Harness', adapter:'deepseek', bin,
 const orchestrator = new Orchestrator(id => id === 'deepseek' ? agent : undefined, store)
 async function waitFor(read: () => Promise<any> | any, predicate: (value: any) => boolean) {
   const deadline = Date.now() + 10000
-  while (Date.now() < deadline) { const value = await read(); if (predicate(value)) return value; await new Promise(r => setTimeout(r, 20)) }
-  throw new Error('fixture did not settle')
+  let last: any
+  while (Date.now() < deadline) { last = await read(); if (predicate(last)) return last; await new Promise(r => setTimeout(r, 20)) }
+  throw new Error('fixture did not settle: ' + JSON.stringify(last))
 }
 try {
   const planBin = join(dir, 'dsh-plan')
   await writeFile(planBin, `#!${process.execPath}
 const send=frame=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',...frame})+'\\n')
+const nativeId='native-plan-'+process.pid
 require('node:readline').createInterface({input:process.stdin}).on('line',line=>{
  const {id,method,params={}}=JSON.parse(line)
  if(method==='initialize')return send({id,result:{protocolVersion:1,_meta:{'uniagent/bridge':{version:1}},agentCapabilities:{sessionCapabilities:{resume:{},close:{}}}}})
 
- if(method==='session/new')return send({id,result:{sessionId:'native-plan',modes:{currentModeId:'default',availableModes:[{id:'default',name:'Default'},{id:'plan',name:'Plan'}]}}})
+ if(method==='session/new')return send({id,result:{sessionId:nativeId,modes:{currentModeId:'default',availableModes:[{id:'default',name:'Default'},{id:'plan',name:'Plan'}]}}})
  if(method==='session/set_mode')return send({id,result:{}})
- if(method==='session/prompt'){send({method:'session/update',params:{sessionId:'native-plan',update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'Native plan reply'}}}});return send({id,result:{stopReason:'end_turn'}})}
+ if(method==='session/prompt'){send({method:'session/update',params:{sessionId:params.sessionId,update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'Native plan reply'}}}});return send({id,result:{stopReason:'end_turn'}})}
  if(id!==undefined)send({id,result:{}})
 })
 `)
   await chmod(planBin, 0o755)
   const planAgent = { ...agent, bin: planBin }
   const planHost = new Orchestrator(id => id === 'deepseek' ? planAgent : undefined, new SessionStore(join(dir,'plan-sessions.json')))
+  planHost.on('event', event => { if (event.type === 'error') console.error('DeepSeek fixture error:', event.payload) })
   const planned = planHost.createSession({ agentId:'deepseek', workdir:dir, permissionMode:'full-access', collaborationMode:'plan' }, 'native plan first')
   await waitFor(() => planHost.getSessionById(planned.id), s => s.status === 'idle')
   await planHost.sendMessage(planned.id, 'native plan follow-up')
@@ -55,6 +58,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
   planHost.disposeAll()
   const legacy = planHost.createSession({agentId:'deepseek',workdir:dir,permissionMode:'ask'}, 'legacy goal')
   await waitFor(()=>planHost.getSessionById(legacy.id),s=>s.status==='idle')
+  assert.notEqual(legacy.nativeSessionId, planned.nativeSessionId, 'independent native session creation cannot reuse a previous live identity')
   legacy.goal = {objective:'old goal',autonomous:true,nativeActivation:'confirmed'} as any
   legacy.agentContract = {...legacy.agentContract!,nativeGoal:true,sessionFork:true,sideChat:true,crossAgentFork:true,structuredSubagents:true}
   planHost.reconcileAgentConfigs()

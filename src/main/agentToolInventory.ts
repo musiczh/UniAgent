@@ -1,18 +1,22 @@
+import { qoderOperation, qoderRegionForBin } from './qoderSdk.ts'
+import { qoderConfigRoot } from './qoderPaths.ts'
 import { createHash, randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { access, lstat, readdir, readlink, realpath, rm } from 'node:fs/promises'
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import * as TOML from '@iarna/toml'
 import { load as loadYaml, JSON_SCHEMA } from 'js-yaml'
 import type { AgentDef } from '../shared/types.ts'
 import type { CapabilityAgentId, CapabilityAgentInventory, CapabilityInventoryDetail, CapabilityInventoryItem, CapabilityInventoryResult } from '../shared/capabilitySync.ts'
-import { listCapabilityInventories, getCapabilityInventoryDetail, skillLinkDependencies } from './capability-sync/inventory.ts'
-import { discoverSkillRoot, secureManifest, secureRegularText } from './capability-sync/skillDiscovery.ts'
+import { listCapabilityInventories, getCapabilityInventoryDetail, managedInventoryId, skillLinkDependencies } from './capability-sync/inventory.ts'
+import { discoverSkillRoot, secureManifest, secureRegularText, secureRegularBytes } from './capability-sync/skillDiscovery.ts'
 import { atomicRenameExclusiveSync, helperAvailable } from './capability-sync/atomicFs.ts'
 import type { PluginCommandRunner } from './capability-sync/plugins.ts'
+import { setCodexPluginEnabled } from './codexPluginManagement.ts'
 import { grokInventoryFromOptions, readonlyGrokInventoryRunner } from './grokInventory.ts'
-import { providerPaths } from './capability-sync/provider.ts'
+import { discoverProvider, providerPaths } from './capability-sync/provider.ts'
+import { normalizeMcpCatalog, readMcpToolCatalog } from './mcpToolCatalog.ts'
 import { manageBetaCapabilityInventory } from './betaCapabilityManagement.ts'
 import { getKimiInventoryDetail, inspectKimiInventory } from './kimiInventory.ts'
 
@@ -20,6 +24,7 @@ type Source = NonNullable<CapabilityAgentInventory['readSources']>[number]
 type ToolAgent = Pick<AgentDef, 'id' | 'name' | 'bin' | 'installed' | 'adapter'>
 type NativeSkill = { name: string; path: string; description?: string; builtin?: boolean }
 export interface AgentToolInventoryOptions {
+  qoderOperation?: typeof qoderOperation
   home: string
   agents: readonly ToolAgent[]
   env?: NodeJS.ProcessEnv
@@ -29,6 +34,8 @@ export interface AgentToolInventoryOptions {
   kimiPluginRemove?: (id: string) => Promise<void>
   zcodePlugins?: () => Promise<unknown>
   zcodePluginRemove?: (id: string) => Promise<void>
+  codexPluginState?: (id: string, enabled: boolean) => Promise<void>
+  mcpCatalog?: typeof readMcpToolCatalog
   nativeSkills?: Partial<Record<'nika' | 'zcode', () => Promise<{ skills: NativeSkill[]; plugins?: string[]; tools?: string[]; mcps?: string[]; commands?: string[]; errors?: string[] }>>>
 }
 interface SkillRoot { path: string; scope: 'agent' | 'shared' | 'builtin'; depth?: number; flat?: boolean; parentName?: string; nesting?: number }
@@ -66,7 +73,7 @@ async function fileSkill(agentId: CapabilityAgentId, entry: string, scope: Skill
   const info = await lstat(entry)
   let resolved = entry, manifestPath: string | undefined, fingerprint = '', status: CapabilityInventoryItem['status'] = 'available'
   const linked = info.isSymbolicLink()
-  let name = flat ? basename(entry, '.md') : basename(entry)
+  let name = flat ? basename(entry, '.md') : basename(entry), description: string | undefined
   try {
     if (linked) resolved = resolve(dirname(entry), await readlink(entry))
     resolved = await realpath(resolved)
@@ -77,6 +84,7 @@ async function fileSkill(agentId: CapabilityAgentId, entry: string, scope: Skill
     if (metadata) {
       const parsed = loadYaml(metadata[1], { schema: JSON_SCHEMA })
       if (record(parsed) && safeName(parsed.name)) name = parsed.name
+      if (record(parsed) && typeof parsed.description === 'string') description = parsed.description.slice(0, 4000)
     }
   } catch {
     status = 'invalid'
@@ -84,7 +92,7 @@ async function fileSkill(agentId: CapabilityAgentId, entry: string, scope: Skill
     fingerprint = hash(`invalid:${resolved}`)
   }
   const manageable = scope !== 'builtin' && helperAvailable() && (linked || status === 'available')
-  return { id: identifier(agentId, 'skill', entry), agentId, kind: 'skill', name,
+  return { id: identifier(agentId, 'skill', entry), agentId, kind: 'skill', name, description,
     scope, owner: scope === 'agent' ? 'user' : scope === 'builtin' ? 'system' : 'shared', origin: dirname(entry),
     fingerprint, manageable, copyable: false, linked: linked || undefined, entryPath: entry,
     location: flat ? dirname(resolved) : resolved, manifestPath, status,
@@ -128,8 +136,8 @@ async function scanRoot(agentId: CapabilityAgentId, root: SkillRoot, sources: So
   return items
 }
 
-async function pluginSkills(plugin: CapabilityInventoryItem, sources: Source[]): Promise<CapabilityInventoryItem[]> {
-  if (!plugin.location || !plugin.manifestPath || plugin.enabled === false) return []
+async function pluginSkills(plugin: CapabilityInventoryItem, sources: Source[], includeDisabled = false): Promise<CapabilityInventoryItem[]> {
+  if (!plugin.location || !plugin.manifestPath || plugin.enabled === false && !includeDisabled) return []
   const manifest = await config(plugin.manifestPath)
   if (plugin.agentId === 'kimi' && manifest.skills == null) {
     try {
@@ -340,6 +348,49 @@ async function supplementary(agent: ToolAgent, options: AgentToolInventoryOption
 }
 
 /** The registered Agent catalog is the only source of the selectable Agent list. */
+async function augmentQoderInventory(inventory: CapabilityAgentInventory, agent: ToolAgent, options: AgentToolInventoryOptions): Promise<void> {
+  const operation = options.qoderOperation || qoderOperation
+  const root = qoderConfigRoot(qoderRegionForBin(agent.bin), options.home)
+  const settings = await config(join(root, 'settings.json'))
+  for (const [event, matchers] of Object.entries(settings.hooks || {})) if (safeName(event) && Array.isArray(matchers)) {
+    for (const [index, matcher] of matchers.entries()) if (record(matcher) && Array.isArray(matcher.hooks)) {
+      inventory.items.push({ id: identifier('qoder', 'hook', `${event}:${index}`), agentId: 'qoder', kind: 'hook', name: event,
+        description: typeof matcher.matcher === 'string' ? matcher.matcher : undefined, scope: 'agent', owner: 'user',
+        origin: join(root, 'settings.json'), fingerprint: hash(JSON.stringify(matcher)), manageable: false, copyable: false, status: 'available' })
+    }
+  }
+  for (const [folder, kind] of [['agents', 'agent-profile'], ['commands', 'command']] as const) {
+    const directory = join(root, folder)
+    const state = await source(directory, 'config'); inventory.readSources?.push(state)
+    if (state.status !== 'read') continue
+    for (const entry of await readdir(directory, { withFileTypes: true })) if (entry.isFile() && entry.name.endsWith('.md')) {
+      const item = await fileSkill('qoder', join(directory, entry.name), 'agent', true)
+      inventory.items.push({ ...item, kind, manageable: false, copyable: false, removal: undefined,
+        readOnlyReason: '在 Qoder 原生配置中管理此资源。' })
+    }
+  }
+  if (agent.installed === false) return
+  const plugins = await operation(agent.bin, 'plugins.list', undefined, options.home)
+  for (const plugin of plugins) {
+    inventory.items.push({ id: identifier('qoder', 'plugin', plugin.id), agentId: 'qoder', kind: 'plugin', name: plugin.displayName || plugin.name || plugin.id,
+      pluginId: plugin.id, scope: 'plugin', owner: plugin.canDisable === false ? 'system' : 'plugin', origin: plugin.source || 'Qoder native plugins',
+      location: plugin.path, manifestPath: plugin.path ? join(plugin.path, '.qoder-plugin/plugin.json') : undefined,
+      version: plugin.version, enabled: plugin.enabled, manageable: plugin.canDisable !== false && plugin.scope === 'user',
+      stateManageable: plugin.canDisable !== false && plugin.scope === 'user', fingerprint: hash(JSON.stringify(plugin)), copyable: false, status: 'available' })
+    for (const kind of ['commands', 'hooks', 'agents'] as const) for (const resource of plugin.resources?.[kind] || []) {
+      const name = resource.name || resource.event
+      if (typeof name !== 'string') continue
+      inventory.items.push({ id: identifier('qoder', kind, `${plugin.id}:${name}`), agentId: 'qoder', kind: kind === 'commands' ? 'command' : kind === 'hooks' ? 'hook' : 'agent-profile',
+        name, scope: 'plugin', owner: 'plugin', origin: plugin.id, fingerprint: hash(JSON.stringify(resource)), manageable: false, copyable: false, status: 'available' })
+    }
+    const owner = inventory.items.find(item => item.kind === 'plugin' && item.pluginId === plugin.id)!
+    inventory.items.push(...await pluginSkills(owner, inventory.readSources || []))
+  }
+  inventory.managementSupported = true
+  inventory.readSources ||= []
+  inventory.readSources.push({ path: `${agent.bin} plugins list`, kind: 'native', status: 'read' })
+}
+
 export async function listAgentToolInventories(options: AgentToolInventoryOptions): Promise<CapabilityInventoryResult> {
   const base = await listCapabilityInventories(options.home, options.pluginRunner, undefined, options.agents.map(agent => agent.id))
   const byAgent = new Map(base.inventories.map(inventory => [inventory.agentId, inventory]))
@@ -348,12 +399,13 @@ export async function listAgentToolInventories(options: AgentToolInventoryOption
     try {
       const existing = byAgent.get(agentId)
       if (existing) {
-        const root = join(options.home, agentId === 'codex' ? '.codex' : agentId === 'traex' ? '.trae' : '.claude')
-        const paths = agentId === 'codex' || agentId === 'traex' ? providerPaths(agentId, options.home) : undefined
+        const root = agentId === 'qoder' ? qoderConfigRoot(qoderRegionForBin(agent.bin), options.home) : join(options.home, agentId === 'codex' ? '.codex' : agentId === 'traex' ? '.trae' : '.claude')
+        const paths = agentId === 'codex' || agentId === 'traex' || agentId === 'qoder' ? providerPaths(agentId, options.home) : undefined
         existing.agentName = agent.name
         existing.readSources = await Promise.all([source(paths?.skills || join(root, 'skills'), 'skill'), source(paths?.config || join(options.home, '.claude.json'), 'config'),
           ...(agentId === 'claude' ? [] : [source(join(options.home, '.agents/skills'), 'skill')])])
         existing.readSources.push({ path: `${agent.bin} plugin list`, kind: 'native', status: existing.items.some(item => item.issueCode === 'plugin_enumeration_failed') ? 'error' : 'read' })
+        if (existing.items.some(item => item.issueCode === 'plugin_enumeration_failed')) existing.message = '插件清单读取失败，请重新扫描或在 Agent 设置中检查原生程序。其它已读取的工具仍可使用。'
         if (agentId === 'codex') existing.readSources.push(await source(join(root, 'skills/.system'), 'skill'))
         for (const item of existing.items) if (item.issueCode === 'unsafe_skill_root') {
           const path = item.scope === 'shared' ? join(options.home, '.agents/skills') : paths?.skills || join(root, 'skills')
@@ -371,6 +423,7 @@ export async function listAgentToolInventories(options: AgentToolInventoryOption
           try { existing.items.push(...await pluginSkills(plugin, existing.readSources)) }
           catch { existing.readSources.push({ path: plugin.manifestPath || plugin.origin, kind: 'plugin', status: 'error' }) }
         }
+        if (agentId === 'qoder') await augmentQoderInventory(existing, agent, options)
         existing.revision = hash(JSON.stringify(existing.items))
         return existing
       }
@@ -396,25 +449,71 @@ export async function listAgentToolInventories(options: AgentToolInventoryOption
   return { inventories, scannedAt: Date.now() }
 }
 
-async function currentItem(id: string, options: AgentToolInventoryOptions, allAgents = false): Promise<{ item: CapabilityInventoryItem; all: CapabilityInventoryItem[] }> {
+async function currentItem(id: string, options: AgentToolInventoryOptions, allAgents = false, includeDisabledSkills = false): Promise<{ item: CapabilityInventoryItem; all: CapabilityInventoryItem[] }> {
   const selected = allAgents ? options : { ...options, agents: options.agents.filter(agent => agent.id === id.split(':')[0]) }
   const all = (await listAgentToolInventories(selected)).inventories.flatMap(inventory => inventory.items)
-  const item = all.find(value => value.id === id)
+  let item = all.find(value => value.id === id)
+  if (!item && includeDisabledSkills) for (const plugin of all.filter(value => value.kind === 'plugin' && value.enabled === false)) {
+    item = (await pluginSkills(plugin, [], true)).find(value => value.id === id)
+    if (item) break
+  }
   if (!item) throw new Error('invalid_selection')
   return { item, all }
 }
 
-export async function getAgentToolDetail(id: string, options: AgentToolInventoryOptions): Promise<CapabilityInventoryDetail> {
-  const { item } = await currentItem(id, options)
+export async function getAgentToolDetail(id: string, options: AgentToolInventoryOptions, loadMcpTools = false): Promise<CapabilityInventoryDetail> {
+  const { item } = await currentItem(id, options, false, true)
   if (!item.manifestPath) {
     if (item.agentId === 'kimi' && item.kind === 'mcp') return (await getKimiInventoryDetail(id, { home: options.home, cwd: options.home, env: options.env }))
       || { id, name: item.name, kind: item.kind, openable: false }
-    if (['codex', 'traex', 'claude'].includes(item.agentId)) return getCapabilityInventoryDetail(options.home, id, options.agents.map(agent => agent.id))
+    if (['codex', 'traex', 'claude', 'qoder'].includes(item.agentId)) {
+      const detail = await getCapabilityInventoryDetail(options.home, id, options.agents.map(agent => agent.id))
+      if (item.kind === 'mcp') {
+        const supported = (item.agentId === 'codex' || item.agentId === 'traex' || item.agentId === 'qoder') && item.scope !== 'builtin'
+        detail.mcp = { catalogSupported: supported }
+        if (loadMcpTools && supported) {
+          const agentId = item.agentId as 'codex' | 'traex' | 'qoder'
+          const provider = await discoverProvider(agentId, options.home)
+          const server = provider.items.find(entry => entry.kind === 'mcp' && managedInventoryId(agentId, entry.id) === id)
+          const agent = options.agents.find(agent => agent.id === agentId)
+          if (!server?.privateKey || !agent) throw new Error('invalid_selection')
+          if (agentId === 'qoder') {
+            const native = await (options.qoderOperation || qoderOperation)(agent.bin, 'mcp', undefined, options.home)
+            const status = native.mcpServers?.find((entry: any) => entry.name === server.privateKey)
+            detail.mcp.catalog = status ? normalizeMcpCatalog({ serverInfo: status.serverInfo,
+              runtimeStatus: status.status === 'needs-auth' ? 'authenticationRequired' : status.status === 'pending' ? 'starting' : status.status,
+              authStatus: status.status === 'needs-auth' ? 'notLoggedIn' : undefined,
+              tools: Object.fromEntries((status.tools || []).map((tool: any) => [tool.name, tool])) }) : { status: 'not-found', tools: [] }
+          } else detail.mcp.catalog = await (options.mcpCatalog || readMcpToolCatalog)(agent.bin, options.home, server.privateKey, agentId)
+        }
+      }
+      return detail
+    }
     return { id, name: item.name, kind: item.kind, openable: false, manifestFile: 'capability.json',
-      manifestText: JSON.stringify({ name: item.name, origin: item.origin, version: item.version, enabled: item.enabled, components: item.components }, null, 2) }
+      manifestText: JSON.stringify({ name: item.name, origin: item.origin, version: item.version, enabled: item.enabled, components: item.components,
+        ...(item.kind === 'mcp' ? { configuration: '当前原生目录仅返回服务名称，未提供连接配置。' } : {}) }, null, 2) }
   }
   const path = await realpath(item.manifestPath), folder = item.kind === 'plugin' && item.location ? await realpath(item.location) : dirname(path)
   const value = await secureManifest(path, dirname(path))
+  if (item.kind === 'plugin') {
+    const manifest = JSON.parse(value.text)
+    const metadata = record(manifest.interface) ? manifest.interface : {}
+    const text = (value: unknown): string | undefined => typeof value === 'string' && value.trim() ? value.slice(0, 20_000) : undefined
+    let logoDataUrl: string | undefined
+    const logo = metadata.logo || metadata.logoDark
+    if (typeof logo === 'string') {
+      const logoPath = resolve(folder, logo)
+      const mime = ({ '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.svg': 'image/svg+xml', '.webp': 'image/webp' } as Record<string, string>)[extname(logoPath).toLowerCase()]
+      if (mime && inside(folder, logoPath)) try {
+        logoDataUrl = `data:${mime};base64,${(await secureRegularBytes(logoPath, folder, 512 * 1024)).toString('base64')}`
+      } catch { /* An optional logo must not hide plugin information. */ }
+    }
+    return { id, name: item.name, kind: 'plugin', openable: true, folderPath: folder, plugin: {
+      description: text(metadata.longDescription) || text(manifest.description), shortDescription: text(metadata.shortDescription),
+      author: text(metadata.developerName) || text(record(manifest.author) ? manifest.author.name : manifest.author), logoDataUrl,
+      skills: await pluginSkills(item, [], true)
+    } }
+  }
   const files = (await readdir(folder, { withFileTypes: true })).filter(entry => !entry.name.startsWith('.')).slice(0, 200)
     .map(entry => ({ relativePath: entry.name, directory: entry.isDirectory() }))
   return { id, name: item.name, kind: item.kind, openable: true, folderPath: folder, manifestText: value.text, manifestFile: basename(path), files }
@@ -479,10 +578,32 @@ export async function uninstallAgentToolPlugin(value: unknown, options: AgentToo
 }
 
 export async function manageAgentToolInventory(value: unknown, options: AgentToolInventoryOptions): Promise<CapabilityAgentInventory> {
-  if (!record(value) || !['mcode', 'deepseek', 'grok', 'kimi', 'zcode'].includes(value.agentId)) throw new Error('capability_inventory_action_unsupported')
+  if (!record(value) || !['codex', 'qoder', 'mcode', 'deepseek', 'grok', 'kimi', 'zcode'].includes(value.agentId)) throw new Error('capability_inventory_action_unsupported')
   const agent = options.agents.find(agent => agent.id === value.agentId)
   if (!agent) throw new Error('capability_inventory_unavailable')
-  if (value.agentId === 'grok' || value.agentId === 'kimi' && value.action !== 'plugin-uninstall') await manageBetaCapabilityInventory(value, { home: options.home, cwd: options.home,
+  if (value.agentId === 'qoder') {
+    const operation = options.qoderOperation || qoderOperation
+    if (value.action === 'plugin-install') {
+      if (typeof value.source !== 'string' || !value.source.trim() || value.source.startsWith('-')) throw new Error('invalid_capability_inventory_manage_request')
+      await operation(agent.bin, 'plugins.install', { source: value.source.trim(), scope: 'user' }, options.home)
+    } else {
+      const { item } = await currentItem(value.id, options)
+      if (item.agentId !== 'qoder' || item.kind !== 'plugin' || !item.pluginId || item.fingerprint !== value.expectedFingerprint) throw new Error('capability_inventory_stale')
+      const method = value.action === 'plugin-enable' ? 'plugins.enable' : value.action === 'plugin-disable' ? 'plugins.disable' : value.action === 'plugin-uninstall' ? 'plugins.uninstall' : undefined
+      if (!method || !item.manageable) throw new Error('capability_inventory_read_only')
+      await operation(agent.bin, method, { id: item.pluginId, scope: 'user' }, options.home)
+    }
+  } else if (value.agentId === 'codex') {
+    if (Object.keys(value).sort().join(',') !== 'action,agentId,expectedFingerprint,id' || !['plugin-enable', 'plugin-disable'].includes(value.action) ||
+        typeof value.id !== 'string' || typeof value.expectedFingerprint !== 'string') throw new Error('invalid_capability_inventory_manage_request')
+    const { item } = await currentItem(value.id, options)
+    if (item.agentId !== 'codex' || item.kind !== 'plugin' || !item.pluginId || !item.stateManageable) throw new Error('capability_inventory_read_only')
+    if (value.expectedFingerprint !== item.fingerprint) throw new Error('capability_inventory_stale')
+    const enabled = value.action === 'plugin-enable'
+    await (options.codexPluginState ? options.codexPluginState(item.pluginId, enabled) : setCodexPluginEnabled(agent.bin, options.home, item.pluginId, enabled))
+    const { item: updated } = await currentItem(value.id, options)
+    if (updated.enabled !== enabled) throw new Error('capability_inventory_manage_failed')
+  } else if (value.agentId === 'grok' || value.agentId === 'kimi' && value.action !== 'plugin-uninstall') await manageBetaCapabilityInventory(value, { home: options.home, cwd: options.home,
     env: options.env, grokBin: agent.bin,
     grokRunner: options.run ? async (bin, args, context) => ({ stdout: await options.run!(bin, ['--no-auto-update', ...args], context.env || {}) }) : readonlyGrokInventoryRunner })
   else await uninstallAgentToolPlugin(value, options)

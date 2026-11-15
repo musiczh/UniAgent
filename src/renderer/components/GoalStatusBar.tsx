@@ -65,7 +65,7 @@ export function GoalStatusBar({ goal, running = false, provider, onRunNativeActi
         </div>
         <span className={`goal-status goal-status-${goal.status}`} role="status" aria-live="polite">
           {statusLabel}
-          {goal.status === 'complete' && ` · ${cumulative ? '会话累计 ' : ''}${formatGoalTokens(goal.tokensUsed)} Token`}
+          {goal.status === 'complete' && (goal.tokensAvailable === false ? ' · 未提供 Token 计数' : ` · ${cumulative ? '会话累计 ' : ''}${formatGoalTokens(goal.tokensUsed)} Token`)}
         </span>
         <span className="goal-toggle-btn" aria-hidden="true">
           <Chevron open={expanded} size={12} />
@@ -95,7 +95,8 @@ export function GoalUsageRecord({ goal, now, live, provider }: { goal: GoalState
   const measured = provider === 'kimi' || provider === 'grok'
   const roundProgress = goalRoundProgress(goal)
   return <div className="goal-status-usage" aria-label="Goal 执行记录">
-    <span>{native && !measured ? '会话累计' : '已使用'} {formatGoalTokens(goal.tokensUsed)} Token</span>
+    <span>{goal.tokensAvailable === false ? '未提供 Token 计数' : `${native && !measured ? '会话累计' : '已使用'} ${formatGoalTokens(goal.tokensUsed)} Token`}</span>
+    {goal.creditsUsed !== undefined && <span>已使用 {goal.creditsUsed.toFixed(3)} Credits{goal.creditsBudget !== undefined ? ` / ${goal.creditsBudget}` : ''}</span>}
     {roundProgress && <span>{roundProgress}</span>}
     {(!native || measured) && <span>执行时间 {displayedGoalTimeSeconds(goal, now, live).toLocaleString('en-US')} 秒</span>}
   </div>

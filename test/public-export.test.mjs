@@ -16,9 +16,11 @@ for (const source of ['/* @internal:start x */', '/* @internal:end x */', '/* @i
 const privateUrl = 'https://' + 'code.byted.org/private'
 assert.throws(() => publicSource(`const url=${JSON.stringify(privateUrl)}`, 'src/main/new-private.ts'), /Private runtime dependency/)
 assert.equal(publicSource("const file='.uniagent-public/manifest.json'", 'src/main/requirementSpace.ts'), "const file='.uniagent-public/manifest.json'", 'project metadata format is shared by both editions')
+assert.equal(publicSource("renameSync(join(legacy.dir,'.uniagent-public'),join(legacy.dir,'.saved-format'))", 'test/workspace-browser-data.ts'), "renameSync(join(legacy.dir,'.uniagent-public'),join(legacy.dir,'.saved-format'))", 'workspace legacy fixtures preserve the shared requirement metadata format')
 assert.equal(publicSource("const home=resolveUserDataHome(join(homedir(), '.uniagent-public'))", 'src/main/requirementStore.ts'), "const home=resolveUserDataHome(join(homedir(), '.uniagent-public'))", 'application profiles remain isolated')
-const agents = publicSource("export const BUILTIN_AGENTS=[{id:'codex',name:'Codex'},{id:'traex',name:'private'},{id:'nika',name:'internal'},{id:'claude',name:'Claude'}]", 'src/main/agents.ts')
-assert.deepEqual(Function(agents.replace('export ', '') + ';return BUILTIN_AGENTS')().map(agent => agent.id), ['codex', 'claude'])
+const agents = publicSource("export const BUILTIN_AGENTS=[{id:'codex',name:'Codex'},{id:'traex',name:'private'},{id:'nika',name:'internal'},{id:'claude',name:'Claude'},{id:'qoder',name:'Qoder CN'}]", 'src/main/agents.ts')
+assert.deepEqual(Function(agents.replace('export ', '') + ';return BUILTIN_AGENTS')().map(agent => agent.id), ['codex', 'claude', 'qoder'])
+assert.equal(publicSource("const root=join(home,'.qoder-cn')", 'src/main/qoderPaths.ts'), "const root=join(home,'.qoder-cn')", 'Qoder native state stays shared across distributions')
 
 const root = await mkdtemp(join(tmpdir(), 'uniagent-public-export-'))
 const sourceRoot = join(root, 'source')
@@ -35,6 +37,8 @@ try {
     'src/main/nika/runner.ts': 'private runtime',
     'src/renderer/components/NikaSettings.tsx': 'private setup',
     'test/nika-runner.ts': 'private runtime regression',
+    'monitor/index.html': '<title>UniAgent 云端监控</title>',
+    'supabase/migrations/monitor.sql': 'select 1;',
     'src/main/example.ts': "export const directory='.uniagent-public'",
     'src/renderer/boot.html': '<title>UniAgent</title><h1 id="ua-startup-title">UniAgent</h1>',
     'scripts/pack-debug.mjs': await readFile(new URL('../scripts/pack-debug.mjs', import.meta.url), 'utf8'),
@@ -43,7 +47,7 @@ try {
     'docs/private.md': 'internal document',
     'untracked.txt': 'untracked file'
   })) { await mkdir(dirname(join(sourceRoot, path)), { recursive: true }); await writeFile(join(sourceRoot, path), value) }
-  git('add', 'package.json', 'src', 'docs', 'scripts', 'test')
+  git('add', 'package.json', 'src', 'docs', 'scripts', 'test', 'monitor', 'supabase')
   git('-c', 'user.name=Public Export Fixture', '-c', 'user.email=fixture@example.com', 'commit', '-m', 'fixture')
   const first = await exportPublic({ sourceRoot, destination: join(root, 'first') })
   const second = await exportPublic({ sourceRoot, destination: join(root, 'second') })
@@ -60,6 +64,8 @@ try {
   assert.equal(pkg.build.productName, 'UniAgent Public')
   assert.equal(pkg.build.dmg.artifactName, 'UniAgent-Public-${version}-${arch}.${ext}')
   assert.equal(await readFile(join(first.destination, 'src/renderer/boot.html'), 'utf8'), '<title>UniAgent Public</title><h1 id="ua-startup-title">UniAgent Public</h1>')
+  assert.equal(await readFile(join(first.destination, 'monitor/index.html'), 'utf8'), '<title>UniAgent 云端监控</title>')
+  assert.equal(await readFile(join(first.destination, 'supabase/migrations/monitor.sql'), 'utf8'), 'select 1;')
   assert.deepEqual(pkg.keywords, ['codex'])
   const distributionJs = ts.transpileModule(await readFile(join(first.destination, 'src/shared/distribution.ts'), 'utf8'), { compilerOptions: { module: ts.ModuleKind.ES2022 } }).outputText
   const distribution = await import('data:text/javascript;base64,' + Buffer.from(distributionJs).toString('base64'))
@@ -67,7 +73,7 @@ try {
     assert.equal(distribution.isDistributionAgent(id), false)
     assert.equal(distribution.isDistributionAgent('custom', id), false)
   }
-  for (const id of ['codex', 'claude', 'grok', 'kimi', 'deepseek', 'mcode', 'zcode']) assert.equal(distribution.isDistributionAgent(id), true)
+  for (const id of ['codex', 'claude', 'grok', 'kimi', 'deepseek', 'mcode', 'zcode', 'qoder']) assert.equal(distribution.isDistributionAgent(id), true)
   const cdp = await import(pathToFileURL(join(first.destination, 'test/cdp-fixture.mjs')))
   assert.equal(cdp.program, 'UniAgent Public')
   assert.equal(cdp.binary, 'release/mac-arm64/UniAgent Public.app/Contents/MacOS/UniAgent Public')

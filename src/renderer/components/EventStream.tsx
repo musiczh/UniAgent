@@ -6,10 +6,13 @@ import { TeamEventCard } from './TeamEventCard'
 import { parseTeamEventPrompt } from '@shared/teamEventPrompt'
 import { coalesceUsageSnapshots, withCompactionTiming } from '@shared/eventSnapshots'
 import { isTaskTurnInput, tokenSpeedForTurn } from '@shared/tokenSpeed'
+import { TASK_GENERATION_LABELS, type TaskGenerationKind } from '@shared/taskGeneration'
 import { createContext, Fragment, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import { AnchoredPopover } from './AnchoredPopover'
 import './interactionRequests.css'
 import type { ReactNode, RefObject } from 'react'
+import { useSentContentMotion } from '../conversationMotion'
 import type { TeamAssignment, TeamProject } from '@shared/teamTypes'
 import { ASYNC_QUESTION_PREFIX, asInteractionRequest, asyncQuestionReply, interactionRequestKey, isPendingInteraction, isSkippedQuestionAnswer, localPlanRequest, planFeedbackInAnswer, withPlanText } from '@shared/interactionRequests'
 import type { HistoryForkPoint } from '@shared/types'
@@ -24,13 +27,17 @@ import { ViewImageThumbnail } from './ViewImageThumbnail'
 import { NativeImageThumbnail } from './NativeImageThumbnail'
 import { adoptToolResultImages, nativeImageName, nativeImageSelectors, viewImagePath } from '@shared/viewImage'
 import { formatMessageFullTime, formatMessageTime } from './ImmersiveReader'
-import { captureSelection, type Annotation, type CapturedSelection } from '../textAnnotations'
+import { captureSelection, rangeForSelection, type Annotation, type CapturedSelection } from '../textAnnotations'
 import { Chevron, UiIcon } from './Icons'
 import { ModelSwitchCard } from './ModelSwitchCard'
 import { SentCapabilityChips } from './SkillChips'
 import { cacheAttachmentPreview, getCachedAttachmentPreview } from '../hooks'
 import { fileDiffsFromSummary, parseUnifiedDiff, totalStat, type FileDiff } from './diffModel'
 import { SubAgentIcon } from './SubAgentIcon'
+import { AgentIcon } from './AgentIcon'
+import { routerAssignmentCall, type RouterRequest } from '@shared/router'
+import { routerCardView, routerCardViews, type RouterCardView } from '@shared/routerClarification'
+import { RouterAssignmentCard, RouterAssignmentContext, RouterAssignmentEvent } from './RouterAssignmentCard'
 import {
   isSubAgentGenerationAdvance,
   isSubAgentTerminal,
@@ -106,6 +113,29 @@ interface HistoryForkActions {
 const HistoryForkContext = createContext<HistoryForkActions | undefined>(undefined)
 const ImmersiveReaderContext = createContext<((event: UAEvent) => void) | undefined>(undefined)
 
+function MessagePromptAction({ prompt }: { prompt: string }): JSX.Element {
+  const [open, setOpen] = useState(false)
+  const anchor = useRef<HTMLButtonElement>(null)
+  const id = useId()
+  const close = useCallback((restoreFocus = false): void => {
+    setOpen(false)
+    if (restoreFocus) anchor.current?.focus()
+  }, [])
+  useEffect(() => setOpen(false), [prompt])
+  return <span className="message-prompt">
+    <button ref={anchor} type="button" className="message-action" title="附加提示词" aria-label="查看附加提示词"
+      aria-haspopup="dialog" aria-expanded={open} aria-controls={id} onClick={event => { event.preventDefault(); setOpen(value => !value) }}>
+      <UiIcon name="file" size={15} />
+    </button>
+    {open && <AnchoredPopover anchor={anchor} id={id} labelledBy={`${id}-title`} onClose={close} className="message-prompt-popover">
+      <div className="message-prompt-head"><strong id={`${id}-title`}>附加提示词</strong>
+        <button type="button" className="message-action" aria-label="关闭附加提示词" onClick={() => close(true)}><UiIcon name="close" size={12} /></button>
+      </div>
+      <pre className="message-prompt-body">{prompt}</pre>
+    </AnchoredPopover>}
+  </span>
+}
+
 function MessageActions({
   event,
   kind,
@@ -114,6 +144,7 @@ function MessageActions({
   suffix,
   readable = false,
   hooks,
+  usage,
 }: {
   event: UAEvent
   kind: 'agent' | 'user'
@@ -122,9 +153,13 @@ function MessageActions({
   suffix?: JSX.Element
   readable?: boolean
   hooks?: UAEvent[]
+  usage?: ReactNode
 }): JSX.Element {
   const historyFork = useContext(HistoryForkContext)
   const onOpenReader = useContext(ImmersiveReaderContext)
+  const prompt = kind === 'user' && typeof event.payload.displayText === 'string' &&
+    typeof event.payload.text === 'string' && event.payload.text !== event.payload.displayText
+    ? event.payload.text : ''
   const [copied, setCopied] = useState(false)
   const [hooksOpen, setHooksOpen] = useState(false)
   const hooksId = useId()
@@ -159,6 +194,7 @@ function MessageActions({
         >
           <UiIcon name={copied ? 'check' : 'copy'} size={15} />
         </button>}
+        {prompt.trim() && <MessagePromptAction prompt={prompt} />}
         {kind === 'agent' && readable && onOpenReader && (
           <button className="message-action" title="沉浸阅读" aria-label="沉浸阅读" onClick={() => onOpenReader(event)}>
             <UiIcon name="book-open" size={16} />
@@ -199,6 +235,7 @@ function MessageActions({
             <UiIcon name="zap" size={15} />
           </button>
         )}
+        {usage}
         <time
           className="message-time"
           dateTime={Number.isFinite(event.ts) && event.ts > 0 ? new Date(event.ts).toISOString() : undefined}
@@ -220,6 +257,8 @@ const AnnotationContext = createContext<{
   annotationsBySeq: Map<number, Annotation[]>
   onEditAnnotation?: (id: string) => void
 }>({ annotationsBySeq: new Map() })
+
+export const MessageAvatarContext = createContext<{ agentId: string; adapter?: string } | null>(null)
 
 /**
  * 子 Agent v3 — a sub-agent lifecycle transition rendered as ONE inline row in
@@ -254,6 +293,7 @@ type HandoffMilestone = 'start' | 'delivered' | 'force-delivered' | 'terminal'
 
 type Segment =
   | { kind: 'chain'; id: string; events: UAEvent[] }
+  | { kind: 'router_assignment'; id: string; event: UAEvent }
   | { kind: 'reply'; id: string; event: UAEvent }
   | { kind: 'user_append'; id: string; event: UAEvent }
   | { kind: 'image'; id: string; event: UAEvent }
@@ -408,8 +448,10 @@ const CHAIN_TYPES = new Set([
  * as a list of segments, so multiple replies interleave with their own chain
  * blocks (à la Codex) instead of being merged into one bucket.
  */
-function groupTurns(events: UAEvent[], activeWaitingHandoffId = '', teamProject?: TeamProject, status?: string): Turn[] {
+function groupTurns(events: UAEvent[], activeWaitingHandoffId = '', teamProject?: TeamProject, status?: string, routerCards = false, routerRequests: RouterRequest[] = []): Turn[] {
   const turns: Turn[] = []
+  const routerAssignments = new Map<string, Extract<Segment, { kind: 'router_assignment' }>>()
+  const routerInputs = new Set<string>()
   let cur: Turn | null = null
   let teamRunId: number | undefined
   // 子 Agent v3 — track each child's last-seen phase across the WHOLE session so
@@ -430,7 +472,7 @@ function groupTurns(events: UAEvent[], activeWaitingHandoffId = '', teamProject?
       // Compaction terminal snapshots change seq; keep the expanded step mounted.
       id: (ev.type === 'context_compaction' || ev.type === 'model_switch') && ev.payload?.id
         ? `turn-${ev.type === 'model_switch' ? 'mswitch' : 'compaction'}-${turns.at(-1)?.id ?? 'initial'}:${ev.payload.id}`
-        : `turn-${ev.payload?.clientTurnKey ?? ev.seq}`,
+        : `turn-${ev.payload?.clientTurnKey ?? ev.payload?.routedInputId ?? ev.seq}`,
       user: null,
       events: [],
       segments: [],
@@ -521,13 +563,19 @@ function groupTurns(events: UAEvent[], activeWaitingHandoffId = '', teamProject?
         t.events.push(ev)
         t.segments.push({
           kind: 'user_append',
-          id: `user-append-${ev.payload?.id ?? ev.seq}`,
+          id: `user-append-${ev.payload?.clientTurnKey ?? ev.payload?.id ?? ev.seq}`,
           event: ev,
         })
         continue
       }
+      const requestId = routerCards && typeof ev.payload.routedInputId === 'string' ? ev.payload.routedInputId : undefined
       const t = startCur(ev)
-      t.user = ev
+      cur = t
+      if (!requestId || !routerInputs.has(requestId)) t.user = ev
+      if (requestId) routerInputs.add(requestId)
+      t.done = false
+      t.completionSeq = null
+      t.finalReplySeq = null
       t.events.push(ev)
       continue
     }
@@ -574,6 +622,21 @@ function groupTurns(events: UAEvent[], activeWaitingHandoffId = '', teamProject?
         ? startCur(ev)
         : ensure(ev)
     t.events.push(ev)
+    const routerCall = routerAssignmentCall(ev)
+    if (routerCards && routerCall) {
+      const request = routerRequests.find(row => row.requestId === routerCall.requestId)
+      const key = request ? routerCardView(request, ev).key : routerCall.requestId
+      const existing = routerAssignments.get(key)
+      if (existing) existing.event = ev
+      else {
+        const segment: Extract<Segment, { kind: 'router_assignment' }> = {
+          kind: 'router_assignment', id: `router-${key}`, event: ev,
+        }
+        routerAssignments.set(key, segment)
+        t.segments.push(segment)
+      }
+      continue
+    }
     if (teamProject && ev.type === 'tool_call' && /(?:^|__)(ask_team_user|dispatch_team_task)$/.test(String(ev.payload.name || '')) && ev.state !== 'failed') continue
     t.endTs = Math.max(t.endTs, ev.ts)
     // Hook history stays on the turn, outside the live and completed work timeline.
@@ -867,6 +930,9 @@ export function EventStream({
   handoffSessionTargets,
   onJumpToSession,
   scrollToBottomSignal,
+  focusSeq,
+  focusRouterRequestId,
+  onFocusLocated,
   onOpenTurnReview,
   onRewindToTurn,
   onOpenFile,
@@ -877,7 +943,9 @@ export function EventStream({
   onOpenReader,
   requestDockRef,
   onRequestEarlier,
+  beforeConversation,
   afterConversation,
+  routerFallbackRequests,
 }: {
   events: UAEvent[]
   historyFork?: HistoryForkActions
@@ -891,6 +959,9 @@ export function EventStream({
   handoffSessionTargets?: Record<string, HandoffSessionTarget>
   onJumpToSession?: (sessionId: string) => void
   scrollToBottomSignal?: number
+  focusSeq?: number
+  focusRouterRequestId?: string
+  onFocusLocated?: (seq: number) => void
   /** 需求一 — open the review overlay scoped to one turn; `filePath` preselects a
    * file (变更卡内文件行点击). Both are optional so callers can wire incrementally. */
   onOpenTurnReview?: (arg: { turnId: string; diff: string; filePath?: string }) => void
@@ -904,18 +975,60 @@ export function EventStream({
   onOpenReader?: (event: UAEvent) => void
   requestDockRef?: RefObject<HTMLDivElement>
   onRequestEarlier?: () => Promise<unknown>
+  beforeConversation?: ReactNode
   afterConversation?: ReactNode
+  routerFallbackRequests?: RouterRequest[]
 }): JSX.Element {
   const streamRef = useRef<HTMLDivElement>(null)
+  const routerContext = useContext(RouterAssignmentContext)
+  const focusedRouterVersion = routerContext?.requests.find(row => row.requestId === focusRouterRequestId)?.version
+  useEffect(() => {
+    if (focusSeq === undefined) return
+    followRef.current = false
+    const frame = requestAnimationFrame(() => {
+      const stream = streamRef.current
+      const row = stream?.querySelector<HTMLElement>(`[data-source-seq="${focusSeq}"], [data-seq="${focusSeq}"]`)
+      if (stream && row) {
+        stream.scrollTo({ top: stream.scrollTop + row.getBoundingClientRect().top - stream.getBoundingClientRect().top - 24, behavior: 'auto' })
+        onFocusLocated?.(focusSeq)
+      }
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [focusSeq, events, onFocusLocated])
   const teamContext = useContext(TeamSessionContext)
   const ignoreFoldScrollRef = useRef(false)
   const followRef = useRef(true)
+  const focusedRouterRequest = useRef<string>()
+  useEffect(() => {
+    if (!focusRouterRequestId) { focusedRouterRequest.current = undefined; return }
+    const key = `${sessionId}:${focusRouterRequestId}:${focusedRouterVersion ?? ''}`
+    if (focusedRouterRequest.current === key) return
+    const frame = requestAnimationFrame(() => {
+      const stream = streamRef.current
+      const row = stream?.querySelector<HTMLElement>(`.router-assignment[data-router-request="${CSS.escape(focusRouterRequestId)}"]:not([data-router-clarification])`)
+      if (!stream || !row) return
+      followRef.current = false
+      const input = row.querySelector<HTMLElement>('input:not(:disabled)') || row.querySelector<HTMLElement>('button:not(:disabled)')
+      const top = Math.max(row.getBoundingClientRect().top - 24, (input || row).getBoundingClientRect().bottom - stream.clientHeight + 24)
+      stream.scrollTo({ top: stream.scrollTop + top - stream.getBoundingClientRect().top, behavior: 'auto' })
+      input?.focus({ preventScroll: true })
+      focusedRouterRequest.current = key
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [focusRouterRequestId, focusedRouterVersion, sessionId, events, beforeConversation, afterConversation, routerFallbackRequests])
+  const commentScrollRef = useRef<{
+    root: HTMLElement
+    selection: Pick<CapturedSelection, 'start' | 'end' | 'quote'>
+    top: number
+    scrollTop: number
+  } | null>(null)
   const scrollSizeRef = useRef({ height: 0, viewport: 0 })
   const earlierLoadRef = useRef<{ sessionKey?: string; height: number; top: number } | null>(null)
   function requestEarlier(): void {
     const stream = streamRef.current
     if (!onRequestEarlier || !stream || stream.scrollTop > 20 || earlierLoadRef.current) return
     followRef.current = false
+    commentScrollRef.current = null
     const load = { sessionKey: sessionId ?? events[0]?.sessionId, height: stream.scrollHeight, top: stream.scrollTop }
     earlierLoadRef.current = load
     void onRequestEarlier().catch(() => {}).finally(() => {
@@ -964,9 +1077,34 @@ export function EventStream({
   }, [renderedEvents])
   const teamProject = teamContext && teamContext.project.memberSessions[teamContext.project.team.leaderMemberId] === sessionId ? teamContext.project : undefined
   const turns = useMemo(
-    () => groupTurns(renderedEvents, waitingForHandoff?.handoffId, teamProject, status),
-    [renderedEvents, waitingForHandoff?.handoffId, teamProject, status],
+    () => groupTurns(renderedEvents, waitingForHandoff?.handoffId, teamProject, status, !!routerContext, routerContext?.requests),
+    [renderedEvents, waitingForHandoff?.handoffId, teamProject, status, routerContext?.requests],
   )
+  const routerFallbacks = useMemo(() => {
+    const positions = new Map<number, RouterCardView[]>(), represented = new Set<string>()
+    if (!routerFallbackRequests?.length) return positions
+    for (const turn of turns) for (const segment of turn.segments) if (segment.kind === 'router_assignment') {
+      const request = routerContext?.requests.find(row => row.requestId === routerAssignmentCall(segment.event)?.requestId)
+      if (request) represented.add(routerCardView(request, segment.event).key)
+    }
+    for (const request of routerFallbackRequests) {
+      for (const view of routerCardViews(request)) {
+        if (represented.has(view.key)) continue
+        const owner = view.request.routerSessionId
+        if (owner && routerContext?.sessionIds?.includes(owner) && owner !== sessionId) continue
+        const start = view.request.roundStartedAt || view.request.createdAt
+        const inputIndex = turns.findLastIndex(turn => turn.events.some(event => event.type === 'user_message' && event.payload.routedInputId === request.requestId &&
+          event.ts >= start && (!view.clarification || event.ts <= view.clarification.answeredAt)))
+        const next = inputIndex >= 0 ? inputIndex + 1 : turns.findIndex(turn => turn.startTs > start)
+        const position = next < 0 ? turns.length : next
+        const rows = positions.get(position) || []
+        rows.push(view); positions.set(position, rows)
+      }
+    }
+    return positions
+  }, [turns, routerFallbackRequests, routerContext, sessionId])
+  const renderRouterFallbacks = (position: number) => routerContext && routerFallbacks.get(position)?.map(view =>
+    <RouterAssignmentCard key={view.key} request={view.request} clarification={view.clarification} agents={routerContext.agents} resolve={routerContext.resolve} openTask={routerContext.openTask} openFeedback={routerContext.openFeedback}/>)
   const rewindableTurns = useMemo(() => rewindableVisualTurnIndexes(turns), [turns])
   const changeCardTurns = useMemo(() => changeCardVisualTurnIndexes(turns), [turns])
   const planDecisionTurnIndex = turns.length - 1
@@ -1211,6 +1349,7 @@ export function EventStream({
   }
   const locateRequest = (event: UAEvent): void => {
     followRef.current = false
+    commentScrollRef.current = null
     setLocateSeq(event.seq)
   }
   useEffect(() => {
@@ -1248,11 +1387,23 @@ export function EventStream({
     const previous = scrollSnapshot.current
     if (!previous || previous.sessionKey !== sessionKey || previous.signal !== scrollToBottomSignal) {
       followRef.current = true
+      commentScrollRef.current = null
       ignoreFoldScrollRef.current = false
       earlierLoadRef.current = null
     }
     scrollSnapshot.current = { sessionKey, signal: scrollToBottomSignal }
     const syncLayout = (): void => {
+      const anchor = commentScrollRef.current
+      if (anchor) {
+        const range = anchor.root.isConnected ? rangeForSelection(anchor.root, anchor.selection) : null
+        if (range) {
+          // Preserve the selected text, not its old scrollTop: opening/resizing
+          // the comment panel rewraps the reply, including within one paragraph.
+          const top = Math.min(anchor.top, Math.max(16, stream.clientHeight - 32))
+          stream.scrollTop += range.getBoundingClientRect().top - stream.getBoundingClientRect().top - top
+          anchor.scrollTop = stream.scrollTop
+        } else commentScrollRef.current = null
+      }
       // Limit navigation to this transcript; scrollIntoView also scrolls ancestors.
       if (followRef.current) stream.scrollTop = stream.scrollHeight
       scrollSizeRef.current = { height: stream.scrollHeight, viewport: stream.clientHeight }
@@ -1268,6 +1419,7 @@ export function EventStream({
 
   const handleProcessedFoldToggle = (opening: boolean): void => {
     followRef.current = false
+    commentScrollRef.current = null
     if (!manageProcessedFoldScroll || !streamRef.current) return
     const stream = streamRef.current
     const sessionKey = scrollSnapshot.current?.sessionKey
@@ -1333,7 +1485,7 @@ export function EventStream({
     return ends
   }, [renderedEvents])
 
-  const liveStatus = waitingForHandoff && !compacting
+  const liveStatus = routerContext ? null : waitingForHandoff && !compacting
     ? <HandoffWaitLine info={waitingForHandoff} onJump={onJumpToSession} />
     : busy && !compacting && !waitingForMembers && activity && !activeQueueView
       ? <StatusLine text={activity} /> : null
@@ -1347,23 +1499,15 @@ export function EventStream({
     <HtmlPreviewSessionContext.Provider value={sessionId}>
     <RequestPresentationContext.Provider value={{ docked: !!dockTarget, locateSeq, select: selectRequest, asyncReplies, onOpenFile }}>
     <div className="stream-area">
-      {selection && (
-        <SelectionLayer
-          streamRef={streamRef}
-          onComment={selection.onComment}
-          editRequest={selection.editRequest}
-          onUpdateComment={selection.onUpdateComment}
-          onRemoveComment={selection.onRemoveComment}
-          onEditRequestHandled={selection.onEditRequestHandled}
-          onDetail={selection.onDetail}
-          onSide={selection.onSide}
-          onSideComment={selection.onSideComment}
-        />
-      )}
       <div
         ref={streamRef}
         className="event-stream"
+        onPointerDown={() => { commentScrollRef.current = null }}
+        onKeyDown={event => {
+          if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) commentScrollRef.current = null
+        }}
         onWheel={(e) => {
+          commentScrollRef.current = null
           if (e.deltaY < 0) { followRef.current = false; requestEarlier() }
         }}
         onScroll={(e) => {
@@ -1373,13 +1517,19 @@ export function EventStream({
           // A layout-generated scroll can arrive before ResizeObserver. It is
           // not a user leaving the bottom; keep following until layout settles.
           if (size.height !== el.scrollHeight || size.viewport !== el.clientHeight) return
+          if (commentScrollRef.current) {
+            if (Math.abs(el.scrollTop - commentScrollRef.current.scrollTop) <= 1) return
+            commentScrollRef.current = null
+          }
           const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60
           followRef.current = atBottom
         }}
       >
+        {beforeConversation}
         {turns.map((t, index) => (
+          <Fragment key={t.id}>
+          {renderRouterFallbacks(index)}
           <TurnBlock
-            key={t.id}
             turn={t}
             active={t.id === activeTurnId}
             liveStatus={index === turns.length - 1 ? liveStatus : null}
@@ -1410,12 +1560,37 @@ export function EventStream({
             planRequest={requests.map(requestWithAnswer).find(event => event.payload.kind === 'planMode' &&
               (event.payload.requestId === t.planModeRequest?.payload.requestId || event.payload.method === 'local/plan' && (event.payload.planSeq ?? event.seq) === t.planMessage?.seq))}
           />
+          </Fragment>
         ))}
+        {renderRouterFallbacks(turns.length)}
         {waitingForMembers && turns.length === 0 && <TeamWaitingMembersStep />}
         {turns.length === 0 && liveStatus}
         {afterConversation}
         <div />
       </div>
+      {selection && (
+        <SelectionLayer
+          streamRef={streamRef}
+          onComment={selection.onComment}
+          editRequest={selection.editRequest}
+          onUpdateComment={selection.onUpdateComment}
+          onRemoveComment={selection.onRemoveComment}
+          onEditRequestHandled={selection.onEditRequestHandled}
+          onDetail={selection.onDetail}
+          onSide={selection.onSide}
+          onSideComment={selection.onSideComment && (captured => {
+            const stream = streamRef.current
+            const root = stream?.querySelector<HTMLElement>(`[data-seq="${captured.seq}"] .agent-md`)
+            const range = root && rangeForSelection(root, captured)
+            followRef.current = false
+            commentScrollRef.current = stream && root && range ? {
+              root, selection: captured, scrollTop: stream.scrollTop,
+              top: Math.max(16, Math.min(range.getBoundingClientRect().top - stream.getBoundingClientRect().top, stream.clientHeight - 32)),
+            } : null
+            selection.onSideComment?.(captured)
+          })}
+        />
+      )}
     </div>
     {docked && dockTarget && dockContainer && hasPendingRequests && createPortal(
       <section className={`interaction-dock${activeQuestion ? ' is-question' : ''}${activeRequest?.payload.teamQuestion ? ' is-team' : ''}${fullscreen ? ' is-fullscreen' : ''}${requestCollapsed ? ' is-collapsed' : ''}`}
@@ -1521,7 +1696,7 @@ function SelectionLayer({
   // Capture the selection on mouseup inside the stream. A mouseup landing on our
   // own popover (the comment box) must NOT recapture or dismiss it. Defer one
   // tick so the browser has finalized the selection before we read it.
-  useEffect(() => {
+  useLayoutEffect(() => {
     const stream = streamRef.current
     if (!stream) return
     const onMouseUp = (e: MouseEvent): void => {
@@ -1724,7 +1899,7 @@ function SelectionLayer({
       </>}
       {onSideComment && <><span className="sel-sep" /><button className="sel-btn" onClick={() => {
         onSideComment(sel); clearNativeSelection()
-      }}><UiIcon name="message-square" size={14} /> 侧边评论</button></>}
+      }}><UiIcon name="annotation" size={14} /> 侧边评论</button></>}
     </div>,
     document.body,
   )
@@ -2551,6 +2726,7 @@ function TurnBlock({
   planRequest?: UAEvent
 }): JSX.Element {
   const requestPresentation = useContext(RequestPresentationContext)
+  const routerContext = useContext(RouterAssignmentContext)
   const timelineTurn = useMemo<Turn>(() => planRequest && !turn.planModeRequest
     ? { ...turn, segments: [...turn.segments, {
       kind: 'approval', id: `approval-${planRequest.payload.requestId}`, event: planRequest,
@@ -2567,8 +2743,9 @@ function TurnBlock({
     return idx
   }, [turn.segments, turn.completionSeq, turn.finalReplySeq])
   const latestReplySeq = turn.events.findLast((event) => event.type === 'agent_message')?.seq
+  const showTurnFooters = showFooters && !routerContext
 
-  const useProcessedFold = turn.done && lastReplyIdx >= 0 && !waitingForMembers && !liveStatus
+  const useProcessedFold = !routerContext && turn.done && lastReplyIdx >= 0 && !waitingForMembers && !liveStatus
   const finalReply = useProcessedFold
     ? (turn.segments[lastReplyIdx] as Extract<Segment, { kind: 'reply' }>).event
     : null
@@ -2579,9 +2756,10 @@ function TurnBlock({
     }
     return [...latest.values()]
   }, [turn.events])
-  const showHooks = hooks.length > 0 && showFooters && !active && !waitingForMembers && !liveStatus
-  const moveFinalActions = !!finalReply && (showHooks || showFooters && turn.footers.length > 0)
-  const actionEvent = finalReply ?? (showHooks
+  const showHooks = hooks.length > 0 && showTurnFooters && !active && !waitingForMembers && !liveStatus
+  const usageEvents = showTurnFooters ? turn.footers.filter(event => event.payload.kind === 'usage') : []
+  const moveFinalActions = !!finalReply && (showHooks || showTurnFooters && turn.footers.length > 0)
+  const actionEvent = finalReply ?? (showHooks || usageEvents.length > 0
     ? turn.events.findLast(event => event.type === 'agent_message') ?? turn.events.at(-1)
     : undefined)
   const changeFiles = useMemo(
@@ -2594,6 +2772,7 @@ function TurnBlock({
       {turn.user && (
         <UserBubble
           ev={turn.user}
+          onOpenFile={onOpenFile}
           onRewind={
             onRewindToTurn && rewindable && turn.user && (turn.rewindTurnId || turn.nativeTurnId)
               ? () => onRewindToTurn({ turnId: turn.rewindTurnId || turn.nativeTurnId, userEventSeq: turn.user!.seq })
@@ -2657,22 +2836,25 @@ function TurnBlock({
             }
           />
         )}
-        {showFooters && turn.footers.map((ev) => (
+        {showTurnFooters && turn.footers.filter(ev => ev.payload.kind !== 'usage').map((ev) => (
           <EventCard
             key={eventKey(ev)}
             ev={ev}
-            cumulative={cumulativeBySeq.get(ev.seq)}
-            queueWaitMs={turn.queueView?.phase === 'done' ? turn.queueView.waitedMs : undefined}
             onOpenFile={onOpenFile}
           />
         ))}
-        {(moveFinalActions || showHooks) && actionEvent && (
+        {(moveFinalActions || showHooks || usageEvents.length > 0) && actionEvent && (
           <MessageActions
             event={actionEvent}
             kind="agent"
             text={actionEvent.type === 'agent_message' ? String(actionEvent.payload.text || '') : undefined}
             readable={actionEvent.type === 'agent_message' && actionEvent.payload.phase !== 'commentary'}
             hooks={showHooks ? hooks : undefined}
+            usage={usageEvents.length > 0 ? <UsageAction
+              events={usageEvents}
+              cumulative={cumulativeBySeq.get(usageEvents.at(-1)!.seq)}
+              queueWaitMs={turn.queueView?.phase === 'done' ? turn.queueView.waitedMs : undefined}
+            /> : undefined}
           />
         )}
       </div>
@@ -2805,6 +2987,8 @@ export function PlanStatusBar({
  * Hovering the capsule pops the summary card above it (`summary` slot); the old
  * timing-split popover is gone.
  */
+export const TurnStatusActionsContext = createContext<ReactNode>(null)
+
 export function TurnStatusBar({
   events,
   status,
@@ -2821,6 +3005,7 @@ export function TurnStatusBar({
   summaryOpen?: boolean
   onTimerHoverChange?: (hovering: boolean) => void
 }): JSX.Element | null {
+  const actions = useContext(TurnStatusActionsContext)
   const steps = showPlan ? latestPlanSteps(events) : []
   const busy = isSessionBusy(status)
   const turnStartTs = busy ? currentTurnStartTs(events) : null
@@ -2840,7 +3025,7 @@ export function TurnStatusBar({
     return () => clearInterval(t)
   }, [busy])
 
-  if (!steps.length && turnStartTs === null && lastDurationMs === null) return null
+  if (!steps.length && turnStartTs === null && lastDurationMs === null && !actions) return null
   const allDone =
     steps.length > 0 &&
     steps.filter((s) => s.status === 'completed').length === steps.length
@@ -2887,6 +3072,7 @@ export function TurnStatusBar({
           )}
         </div>
       )}
+      {actions}
     </div>
   )
 }
@@ -3490,7 +3676,7 @@ type ProcessRow = { item: ProcessItem; hints: UAEvent[]; key: string }
 
 /**折叠锚点：用户追加消息、提问/审批卡片保持可见，按位置切段。 */
 function isFoldAnchor(item: ProcessItem): boolean {
-  return item.kind === 'user_append' || item.kind === 'approval'
+  return item.kind === 'user_append' || item.kind === 'approval' || item.kind === 'router_assignment'
 }
 
 /**「提示」折进归属 item：紧随错误事件行的提示挂到该行下（参考 Hook 逻辑），
@@ -3771,6 +3957,9 @@ function TeamEventNotice({ ev }: { ev: UAEvent }): JSX.Element | null {
 }
 
 function UserAppendStep({ ev }: { ev: UAEvent }): JSX.Element {
+  const readOnly = useContext(ReadOnlyConversationContext)
+  const motionRef = useRef<HTMLDetailsElement>(null)
+  useSentContentMotion(motionRef, readOnly ? undefined : ev.payload.clientTurnKey || ev.payload.routedInputId || `session:${ev.sessionId}`)
   const presentation = useContext(RequestPresentationContext)
   const question = presentation.asyncReplies.get(ev.seq)
   const skipped = isSkippedQuestionAnswer(question?.payload.submittedAnswer)
@@ -3783,7 +3972,7 @@ function UserAppendStep({ ev }: { ev: UAEvent }): JSX.Element {
     quote: string
     comment: string
   }[]
-  const messageText = comments.length && typeof ev.payload.displayText === 'string' && ev.payload.displayText
+  const messageText = typeof ev.payload.displayText === 'string'
     ? ev.payload.displayText
     : ev.payload.text
   const remote = ev.payload.source !== 'app' && typeof messageText === 'string'
@@ -3804,7 +3993,7 @@ function UserAppendStep({ ev }: { ev: UAEvent }): JSX.Element {
   return (
     <div className="user-append-step">
       <span className="user-append-node" aria-hidden><UiIcon name="user-circle" size={13} /></span>
-      <details className={`user-append-card${question ? ' async-question-reply' : ''}`}>
+      <details className={`user-append-card${question ? ' async-question-reply' : ''}`} ref={motionRef}>
         <summary className="user-append-head">
           <span className="user-append-label">{question ? questionLabel : '用户追加消息'}</span>
           <span className={question ? 'async-reply-preview' : 'user-append-preview'} title={summary}>{summary}</span>
@@ -3888,6 +4077,7 @@ function LiveTurn({
   onJumpToSession?: (sessionId: string) => void
   onOpenFile?: (path: string, line?: number) => void
 }): JSX.Element {
+  const routerContext = useContext(RouterAssignmentContext)
   const items = processItems(turn.segments, turn.finalReplySeq)
   const steps = items.filter((item): item is ProcessStep => item.kind === 'step')
   const latestWork = items.findLast(item => !['hint', 'notice', 'event'].includes(item.kind))
@@ -3900,9 +4090,12 @@ function LiveTurn({
   // 压缩进度、失败异常等一切都由卡片承载（步骤行与卡片内错误框），时间轴不再
   // 渲染该回合的其它任何行。
   const switchOnly = !turn.user && items.some((item) => item.kind === 'model_switch')
-  const visibleItems = switchOnly ? items.filter((item) => item.kind === 'model_switch') : items
+  const visibleItems = routerContext
+    ? items.filter(item => ['router_assignment', 'approval', 'user_append'].includes(item.kind))
+    : switchOnly ? items.filter((item) => item.kind === 'model_switch') : items
   const renderRow = (row: ProcessRow): JSX.Element | null => {
     const seg = row.item
+    if (seg.kind === 'router_assignment') return <RouterAssignmentEvent event={seg.event} />
     if (seg.kind === 'queue_wait') return <QueueWaitStep view={seg.view} />
     if (seg.kind === 'runtime') return <ProcessRuntimeStep ev={seg.event} hints={row.hints} onOpenFile={onOpenFile} />
     if (seg.kind === 'hint' || seg.kind === 'notice') return <ProcessNotice ev={seg.event} onOpenFile={onOpenFile} />
@@ -3955,7 +4148,7 @@ function LiveTurn({
   }
   return (
     <>
-      {!switchOnly && <ProcessTimelineHead items={items} fallbackWait={fallbackWait} />}
+      {!routerContext && !switchOnly && <ProcessTimelineHead items={items} fallbackWait={fallbackWait} />}
       {partitionProcessStages(visibleItems).map((stage) =>
         stage.kind === 'anchor' ? (
           <Fragment key={stage.row.key}>{renderRow(stage.row)}</Fragment>
@@ -4001,7 +4194,7 @@ function DoneTurn({
   // Runtime events and notices keep their chronological position in the history.
   // Generated images retain their standalone preview beside the final reply.
   const processed = turn.segments.filter((segment, index) => {
-    if (segment.kind === 'image') return false
+    if (segment.kind === 'image' || segment.kind === 'router_assignment') return false
     if (index < lastReplyIdx) return true
     return index > lastReplyIdx &&
       ['handoff', 'team_wait', 'team_dispatch', 'team_delivery', 'team_event', 'queue_wait', 'runtime', 'notice', 'hint', 'model_switch', 'subagent'].includes(segment.kind)
@@ -4033,6 +4226,8 @@ function DoneTurn({
         />
       )}
       {images.map((segment) => <GeneratedImageCard key={segment.id} ev={segment.event} />)}
+      {turn.segments.map(segment => segment.kind === 'router_assignment'
+        ? <RouterAssignmentEvent key={segment.id} event={segment.event} /> : null)}
       {finalSeg.kind === 'reply' && <ReplyBlock ev={finalSeg.event} readable={finalSeg.event.payload.phase !== 'commentary'} onOpenFile={onOpenFile} showActions={showFinalActions} />}
       {turn.segments.slice(lastReplyIdx + 1).map(segment => segment.kind === 'approval'
         ? <ApprovalCard key={segment.id} ev={segment.event} onRespond={onRespond} />
@@ -4129,19 +4324,24 @@ function TurnChangeCard({
   )
 }
 
-export function UserBubble({ ev, onRewind }: { ev: UAEvent; onRewind?: () => void }): JSX.Element {
+export function UserBubble({ ev, onRewind, onOpenFile }: { ev: UAEvent; onRewind?: () => void; onOpenFile?: (path: string, line?: number) => void }): JSX.Element {
+  const avatar = useContext(MessageAvatarContext)
+  const readOnly = useContext(ReadOnlyConversationContext)
+  const bubbleRef = useRef<HTMLDivElement>(null)
+  useSentContentMotion(bubbleRef, readOnly ? undefined : ev.payload.clientTurnKey || ev.payload.routedInputId || `session:${ev.sessionId}`)
+  const generationLabel = readOnly && Object.hasOwn(TASK_GENERATION_LABELS, ev.payload.generationKind)
+    ? TASK_GENERATION_LABELS[ev.payload.generationKind as TaskGenerationKind] : undefined
   const teamAssignmentContext = useContext(TeamAssignmentDisplayContext)
   const attachments = (ev.payload.attachments || []) as Attachment[]
   const nativeContext = ev.payload.nativeContext as ResolvedNativeTurnContext | undefined
-  // 选中即评论 — a sent turn may carry structured comment cards (引用+评论). When
-  // present, the bubble's main text is the instruction (`displayText`) and the
-  // cards render below it, marking this as a 带评论的消息.
+  // displayText is the original user input, including an empty image-only turn.
+  // The full prompt remains on the event for execution and optional inspection.
   const comments = (Array.isArray(ev.payload.comments) ? ev.payload.comments : []) as {
     quote: string
     comment: string
   }[]
   const bubbleText =
-    comments.length && typeof ev.payload.displayText === 'string' && ev.payload.displayText
+    typeof ev.payload.displayText === 'string'
       ? ev.payload.displayText
       : ev.payload.text
   const assignmentCard = teamAssignmentContext
@@ -4165,10 +4365,12 @@ export function UserBubble({ ev, onRewind }: { ev: UAEvent; onRewind?: () => voi
     ].filter(Boolean).join('\n')),
   ].filter(Boolean).join('\n\n')
   return (
-    <div className={`card user-msg${remote ? ' has-feishu-context' : ''}`}>
-      <div className="bubble">
+    <div className={`card user-msg${remote ? ' has-feishu-context' : ''}`} data-source-seq={ev.seq} data-client-turn-key={ev.payload.clientTurnKey || ev.payload.routedInputId}>
+      {avatar && <span className="message-role-icon" role="img" aria-label="用户"><UiIcon name="user-circle" size={17} /></span>}
+      <div className="bubble" ref={bubbleRef}>
+        {generationLabel && <div className="composer-capability-chips bubble-capability-chips" aria-label="生成调用类型"><span className="capability-chip">{generationLabel}</span></div>}
         <SentCapabilityChips context={nativeContext} command={command} />
-        <span>{remote?.text ?? bubbleText}</span>
+        <Markdown text={visibleText} onOpenFile={onOpenFile} />
         {comments.length > 0 && (
           <div className="bubble-comments">
             {comments.map((c, i) => (
@@ -4217,7 +4419,7 @@ export function UserBubble({ ev, onRewind }: { ev: UAEvent; onRewind?: () => voi
   )
 }
 
-function BubbleImage({
+export function BubbleImage({
   sessionId,
   attachment,
   optimistic,
@@ -4440,12 +4642,16 @@ export function ReplyBlock({
   // only; the map is empty in side / detail streams, so nothing highlights there).
   // The comment cards themselves live in the composer's 待评论托盘, not here.
   const { annotationsBySeq, onEditAnnotation } = useContext(AnnotationContext)
+  const avatar = useContext(MessageAvatarContext)
   const annotations = annotationsBySeq.get(ev.seq)
   return (
     <div
       className={`card agent-msg${dim ? ' dim' : ''}${streaming ? ' streaming' : ''}`}
       data-seq={ev.seq}
+      data-message-id={ev.payload.id}
+      data-turn-id={ev.payload.turnId}
     >
+      {avatar && <span className="message-role-icon" role="img" aria-label="AI"><AgentIcon agentId={avatar.agentId} adapter={avatar.adapter} size={17} /></span>}
       <Markdown text={ev.payload.text || ''} onOpenFile={onOpenFile} annotations={annotations} onEditAnnotation={onEditAnnotation} />
       {streaming && <span className="stream-cursor" aria-hidden />}
       {showActions && <MessageActions event={ev} kind="agent" text={String(ev.payload.text || '')} readable={readable} />}
@@ -4453,7 +4659,7 @@ export function ReplyBlock({
   )
 }
 
-function PlanDecision({
+export function PlanDecision({
   onImplement,
   onRevise,
   onSkip,
@@ -5010,20 +5216,17 @@ function ContextCompactionRow({ ev }: { ev: UAEvent }): JSX.Element {
 function EventCard({
   ev,
   onRespond,
-  cumulative,
-  queueWaitMs,
   onOpenFile,
   forceOpen,
   latestOutputKey,
 }: {
   ev: UAEvent
   onRespond?: (requestId: string, answer: unknown) => void | Promise<void>
-  cumulative?: CumUsage
-  queueWaitMs?: number
   onOpenFile?: (path: string, line?: number) => void
   forceOpen?: boolean
   latestOutputKey?: string
 }): JSX.Element | null {
+  const routerContext = useContext(RouterAssignmentContext)
   const stateKey = ev.type === 'reasoning' ? latestOutputKey : undefined
   const autoOpen = ev.type === 'reasoning'
     ? !!latestOutputKey && eventKey(ev) === latestOutputKey
@@ -5121,6 +5324,7 @@ function EventCard({
       )
 
     case 'tool_call': {
+      if (routerContext && routerAssignmentCall(ev)) return <RouterAssignmentEvent event={ev}/>
       if (isGeneratedImageEvent(ev)) return <GeneratedImageCard ev={ev} />
       const imagePath = viewImagePath(ev)
       return (
@@ -5215,9 +5419,7 @@ function EventCard({
       if (ev.payload.kind === 'context_usage' || ev.payload.kind === 'usage_report') {
         return <div className="card system-notice"><Markdown text={formatClaudeNativeReport(ev.payload.kind, ev.payload.contextUsage ?? ev.payload.usageReport)} onOpenFile={onOpenFile} /></div>
       }
-      if (ev.payload.kind === 'usage') {
-        return <UsageCard ev={ev} cumulative={cumulative} queueWaitMs={queueWaitMs} />
-      }
+      if (ev.payload.kind === 'usage') return null
       if (ev.payload.kind === 'launch') {
         return <LaunchNotice event={ev} />
       }
@@ -5332,81 +5534,143 @@ function StateTag({ state }: { state?: string }): JSX.Element | null {
   return <span className={`state-tag st-${state}`}>{map[state] || state}</span>
 }
 
-/**
- * Per-turn token card (G2-1). The collapsed line shows ONLY this turn's input /
- * output (plus cache-hit when present). Clicking expands to a compact two-row
- * table: one row for THIS turn (本轮 = one question + one answer) and one row for
- * the whole-session cumulative totals (会话累计 = sum across every turn so far).
- * The two rows differ once a session has more than one turn.
- */
-function UsageCard({
-  ev,
+/** Per-turn usage lives in the message toolbar; details retain native session totals. */
+function UsageAction({
+  events,
   cumulative,
   queueWaitMs,
 }: {
-  ev: UAEvent
+  events: UAEvent[]
   cumulative?: CumUsage
   queueWaitMs?: number
 }): JSX.Element {
   const [open, setOpen] = useState(false)
+  const [position, setPosition] = useState({ left: 12, top: 12 })
+  const buttonRef = useRef<HTMLButtonElement>(null)
+  const popoverRef = useRef<HTMLDivElement>(null)
+  const id = useId()
+  const ev = events.at(-1)!
   const u = ev.payload.usage || {}
-  const inTok = u.inputTokens ?? u.input_tokens
-  const outTok = u.outputTokens ?? u.output_tokens
-  const cached = u.cachedInputTokens ?? u.cached_input_tokens
-  const cost = u.cost ?? ev.payload.cost
+  const total = events.length > 1 ? computeCumulativeUsage(events).get(ev.seq) : undefined
+  const inTok = total ? total.input : u.inputTokens ?? u.input_tokens
+  const outTok = total ? total.output : u.outputTokens ?? u.output_tokens
+  const cached = total ? total.cached : u.cachedInputTokens ?? u.cached_input_tokens
+  const cost = total ? total.cost : u.cost ?? ev.payload.cost
   // Prefer the adapter's own session totals (streaming path carries them);
   // otherwise fall back to the running sum we computed across usage footers.
   const sInput = u.sessionInputTokens ?? cumulative?.input
   const sOutput = u.sessionOutputTokens ?? cumulative?.output
   const sCached = u.sessionCachedInputTokens ?? cumulative?.cached
   const sCost = u.sessionCost !== undefined ? u.sessionCost : cumulative?.cost
+  const waitText = queueWaitMs !== undefined && queueWaitMs > 0 ? `等待算力 ${Math.round(queueWaitMs / 1000)}s` : ''
+  const summary = u.tokensAvailable === false ? `本轮 · ${u.credits !== undefined ? `${u.credits.toFixed(3)} Credits · ` : ''}未提供 Token 计数` : `本轮 · 输入 ${fmtInt(inTok)} · 输出 ${fmtInt(outTok)}${cached != null && cached > 0 ? ` · 命中缓存 ${fmtInt(cached)}` : ''}${waitText ? ` · ${waitText}` : ''}`
+
+  const closeAndFocus = (): void => {
+    setOpen(false)
+    buttonRef.current?.focus()
+  }
+  useLayoutEffect(() => {
+    if (!open) return
+    const button = buttonRef.current
+    const popover = popoverRef.current
+    if (!button || !popover) return
+    const reposition = (): void => {
+      const anchor = button.getBoundingClientRect()
+      const bounds = popover.getBoundingClientRect()
+      const left = Math.max(12, Math.min(anchor.left, window.innerWidth - bounds.width - 12))
+      const top = Math.max(12, Math.min(
+        anchor.bottom + 8 + bounds.height <= window.innerHeight - 12 ? anchor.bottom + 8 : anchor.top - bounds.height - 8,
+        window.innerHeight - bounds.height - 12,
+      ))
+      setPosition(current => current.left === left && current.top === top ? current : { left, top })
+    }
+    const outside = (event: Event): void => {
+      if (!button.contains(event.target as Node) && !popover.contains(event.target as Node)) setOpen(false)
+    }
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      event.stopPropagation()
+      closeAndFocus()
+    }
+    const onScroll = (event: Event): void => {
+      if (!popover.contains(event.target as Node)) setOpen(false)
+    }
+    reposition()
+    const observer = new ResizeObserver(reposition)
+    observer.observe(popover)
+    observer.observe(button)
+    document.addEventListener('pointerdown', outside)
+    document.addEventListener('focusin', outside)
+    document.addEventListener('keydown', onKeyDown, true)
+    window.addEventListener('resize', reposition)
+    window.addEventListener('scroll', onScroll, true)
+    return () => {
+      observer.disconnect()
+      document.removeEventListener('pointerdown', outside)
+      document.removeEventListener('focusin', outside)
+      document.removeEventListener('keydown', onKeyDown, true)
+      window.removeEventListener('resize', reposition)
+      window.removeEventListener('scroll', onScroll, true)
+    }
+  }, [open])
 
   return (
-    <div className={`card system-notice usage ${open ? 'open' : ''}`}>
-      <div className="usage-line" onClick={() => setOpen((v) => !v)}>
-        <span className="usage-caret">
-          <Chevron open={open} size={13} />
-        </span>
-        <span>
-          本轮 · 输入 {fmtInt(inTok)} · 输出 {fmtInt(outTok)}
-        </span>
-        {cached != null && cached > 0 && (
-          <span> · 命中缓存 {fmtInt(cached)}</span>
-        )}
-        {queueWaitMs !== undefined && queueWaitMs > 0 && (
-          <span> · 等待算力 {Math.round(queueWaitMs / 1000)}s</span>
-        )}
-      </div>
-      {open && (
-        <table className="usage-table">
-          <thead>
-            <tr>
-              <th></th>
-              <th>输入</th>
-              <th>输出</th>
-              <th>命中缓存</th>
-              <th>费用</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <th>本轮</th>
-              <td>{fmtInt(inTok)}</td>
-              <td>{fmtInt(outTok)}</td>
-              <td>{cached != null && cached > 0 ? fmtInt(cached) : '—'}</td>
-              <td>{cost != null ? fmtCost(cost) : '—'}</td>
-            </tr>
-            <tr>
-              <th>会话累计</th>
-              <td>{fmtInt(sInput)}</td>
-              <td>{fmtInt(sOutput)}</td>
-              <td>{sCached != null && sCached > 0 ? fmtInt(sCached) : '—'}</td>
-              <td>{sCost != null ? fmtCost(sCost) : '—'}</td>
-            </tr>
-          </tbody>
-        </table>
+    <span className="message-usage">
+      <button
+        ref={buttonRef}
+        type="button"
+        className="message-action"
+        title={`${open ? '收起' : '查看'} Token 用量\n${summary}`}
+        aria-label="查看 Token 用量"
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-controls={id}
+        onClick={() => setOpen(value => !value)}
+      >
+        <UiIcon name="tokens" size={15} />
+      </button>
+      {open && createPortal(
+        <div ref={popoverRef} id={id} className="usage-popover" role="dialog" aria-labelledby={`${id}-title`} style={position}>
+          <div className="usage-popover-head">
+            <strong id={`${id}-title`}>{u.tokensAvailable === false ? 'Credits 用量' : 'Token 用量'}</strong>
+            <button type="button" className="message-action usage-popover-close" aria-label="关闭 Token 明细" onClick={closeAndFocus}>
+              <UiIcon name="close" size={12} />
+            </button>
+          </div>
+          <div className="usage-table-scroll">
+            <table className="usage-table">
+              <thead>
+                <tr>
+                  <th></th>
+                  <th>输入</th>
+                  <th>输出</th>
+                  <th>命中缓存</th>
+                  <th>{u.tokensAvailable === false ? 'Credits' : '费用'}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <th>本轮</th>
+                  <td>{u.tokensAvailable === false ? '未提供' : fmtInt(inTok)}</td>
+                  <td>{u.tokensAvailable === false ? '未提供' : fmtInt(outTok)}</td>
+                  <td>{u.tokensAvailable === false ? '未提供' : cached != null && cached > 0 ? fmtInt(cached) : '—'}</td>
+                  <td>{u.tokensAvailable === false ? u.credits?.toFixed(3) ?? '—' : cost != null ? fmtCost(cost) : '—'}</td>
+                </tr>
+                <tr>
+                  <th>会话累计</th>
+                  <td>{u.tokensAvailable === false ? '未提供' : fmtInt(sInput)}</td>
+                  <td>{u.tokensAvailable === false ? '未提供' : fmtInt(sOutput)}</td>
+                  <td>{u.tokensAvailable === false ? '未提供' : sCached != null && sCached > 0 ? fmtInt(sCached) : '—'}</td>
+                  <td>{u.tokensAvailable === false ? u.sessionCredits?.toFixed(3) ?? '—' : sCost != null ? fmtCost(sCost) : '—'}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          {waitText && <p className="usage-wait">{waitText}</p>}
+        </div>, document.body,
       )}
-    </div>
+    </span>
   )
 }
 
@@ -5542,17 +5806,20 @@ function CompactRequestCard({ ev, onSelect, highlighted, readOnly }: { ev: UAEve
   </div>
 }
 
-function RequestDetailCard({
+export function RequestDetailCard({
   ev,
   onRespond,
   readOnly,
+  onOpenFile: openFile,
 }: {
   ev: UAEvent
   onRespond?: (requestId: string, answer: unknown) => void | Promise<void>
   readOnly?: boolean
+  onOpenFile?: (path: string, line?: number) => void
 }): JSX.Element {
   const readOnlyConversation = useContext(ReadOnlyConversationContext)
-  const { onOpenFile } = useContext(RequestPresentationContext)
+  const presentation = useContext(RequestPresentationContext)
+  const onOpenFile = openFile || presentation.onOpenFile
   const { requestId, kind, params, method, options } = ev.payload
   const resolved = ev.state === 'success' || ev.state === 'cancelled' || ev.state === 'failed' || !!ev.payload.interactionExpired || isAnsweredQuestion(ev)
   const mcpTool = kind === 'mcpTool' || (kind === 'elicitation' && isMcpToolApproval(params))

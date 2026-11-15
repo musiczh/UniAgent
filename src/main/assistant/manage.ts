@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto'
 import { mkdir, readFile, writeFile, rename } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { AgentDef, AgentRole, AgentRoleCatalogEntry, AppSettings, AppSettingsPatch, Session, SessionConfig, UAEvent } from '../../shared/types'
@@ -7,7 +6,6 @@ import type { TeamDefinitionInput } from '../../shared/teamTypes'
 import type { Orchestrator } from '../orchestrator'
 import type { TeamService } from '../teamService'
 import { sessionActivityStatus } from '../../shared/sessionStatus'
-import { SETTINGS_CATEGORIES, MAX_SIDEBAR_SHORTCUTS } from '../../shared/settingsNavigation'
 import { teamInteractionForUser, teamQuestionParams, teamRequestId } from '../../shared/teamQuestions'
 import { assistantIndexedMessage } from './transcript'
 import { encodeAnswer, isMcpToolApproval, normalizeQuestions, OTHER_VALUE, questionAnswerKind } from '../../shared/questions'
@@ -15,6 +13,9 @@ import { MANAGE_CONFIRMATION_PREFIX, MANAGE_RESOURCES, type ManageOperation, typ
 import { resolveUserDataHome } from '../userData'
 import type { AssistantScope } from './mcp'
 import type { AppRestartService } from '../appRestart'
+import { SettingsService } from '../settingsService'
+import { manageRevision, publicManagementValue } from './manageValue'
+export { manageRevision, publicManagementValue } from './manageValue'
 
 type Params = Record<string, unknown>
 type Spec = { fields: string[]; required?: string[]; help?: string }
@@ -37,13 +38,14 @@ const operations: Record<ManageResource, { query: Record<string, Spec>; execute:
     update: { fields: ['agentId'], required: ['agentId'] }
   } },
   settings: { query: {
+    read: { fields: ['path'], help: '通过 uniagent_settings 分层读取设置目录与字段定义；path 默认 /' },
     get: { fields: ['section'], help: 'section: app / assistant / all / projects / requirements / presets / models / capabilities / automations；凭据只返回是否已配置' },
     restartStatus: { fields: ['id'], help: '查询重启并续聊请求的实际状态；省略 id 返回当前或最近一次请求，操作回执完成不代表 App 已重启' }
   }, execute: {
     restart: { fields: ['targetAppPath','prompt'], required: ['targetAppPath','prompt'], help: 'macOS：启动已准备好且支持续聊的 UniAgent.app 绝对路径；prompt 为重启后继续当前助手会话的任务。必须由用户在宿主卡片确认，有其他活动会话时选择等待或立即重启；不能代答。返回 awaiting_confirmation 后结束本轮，等待用户操作' },
     cancelRestart: { fields: ['id'], required: ['id'], help: '取消当前助手会话尚未开始退出的重启请求' },
     reconsiderRestart: { fields: ['id'], required: ['id'], help: '为当前助手会话的重启请求重新显示宿主选择卡，可以改为立即重启或继续等待' },
-    update: { fields: ['section','patch','expectedRevision'], required: ['section','patch','expectedRevision'], help: 'section 为 app 或 assistant，patch 为该配置的局部字段；assistant 的 defaultModel/defaultPermissionMode/defaultWorkdir/reviewRuntime 可用 null 恢复默认。凭据需在设置页填写' },
+    update: { fields: ['section','path','patch','expectedRevision'], required: ['patch','expectedRevision'], help: '推荐 uniagent_settings：从 read 返回的 path、revision 提交 JSON patch；兼容 section=app/assistant 的旧调用。字段由设置定义提供，凭据与授权使用专用流程' },
     document: { fields: ['type','content','expectedRevision'], required: ['type','content','expectedRevision'], help: '修改 SOUL/工作规则须宿主确认；USER/MEMORY 使用 assistant_memory' }
   } },
   roles: { query: { list: { fields: ['id','offset','limit'] } }, execute: {
@@ -62,6 +64,8 @@ const operations: Record<ManageResource, { query: Record<string, Spec>; execute:
 }
 
 export interface ManagementDeps {
+  saveRouter?: import('../settingsService').SettingsServiceDeps['saveRouter']
+  recoveryErrors?: import('../settingsService').SettingsServiceDeps['recoveryErrors']
   appRestart?: Pick<AppRestartService, 'request' | 'status' | 'cancel' | 'reconsider'>
   orchestrator: Orchestrator; teams: TeamService
   agents(): AgentDef[]; roles(): AgentRoleCatalogEntry[]
@@ -78,19 +82,7 @@ export interface ManagementDeps {
   detectAgents(): Promise<AgentDef[]>; updateAgent(id: string): Promise<AgentDef>
   changed(resource: string): void
 }
-export function manageRevision(value: unknown): string { return createHash('sha256').update(JSON.stringify(value,(_key,v) => v && typeof v === 'object' && !Array.isArray(v) ? Object.fromEntries(Object.keys(v).sort().map(key => [key,v[key]])) : v) ?? 'undefined').digest('hex') }
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i
-const SECRET_FIELDS = new Set(['apikey','appsecret','clientsecret','authtoken','privatekey','password','token','accesstoken','refreshtoken','authorization','cookie','credentials','env','headers','cadksessioncontext','sessioncontext'])
-export function publicManagementValue(value: unknown): any {
-  if (Array.isArray(value)) return value.map(publicManagementValue)
-  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).flatMap(([key,v]) => {
-    const normalized = key.toLowerCase().replace(/[_-]/g,'')
-    if (SECRET_FIELDS.has(normalized)) return ['apikey','appsecret','password','accesstoken','refreshtoken'].includes(normalized) ? [[key+'Configured',!!v]] : []
-    return [[key,publicManagementValue(v)]]
-  }))
-  if (typeof value === 'string') return value.replace(/\bBearer\s+\S+/gi,'Bearer [redacted]').replace(/\b((?:[A-Z_]*API[_-]?KEY|APP[_-]?SECRET|ACCESS[_-]?TOKEN|PASSWORD)\s*[=:]\s*)[^\s,;]+/gi,'$1[redacted]')
-  return value
-}
 function object(value: unknown, name = 'params'): Params {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`invalid_${name}`)
   return value as Params
@@ -127,7 +119,21 @@ export class UniAgentManagement {
   private ready?: Promise<void>
   private closed = false
   private readonly directory: string
-  constructor(private deps: ManagementDeps, directory = join(resolveUserDataHome(),'assistants','operations')) { this.directory = directory }
+  private readonly settings: SettingsService
+  constructor(private deps: ManagementDeps, directory = join(resolveUserDataHome(),'assistants','operations')) { this.directory = directory; this.settings = new SettingsService(deps) }
+  async callSettings(scope: AssistantScope, raw: unknown): Promise<unknown> {
+    const request = object(raw,'settings_request'), params = object(request.params)
+    if (Object.keys(request).some(key => !['action','params'].includes(key)) || !['read','update'].includes(String(request.action))) throw new Error('invalid_settings_request')
+    if (request.action === 'read') {
+      if (Object.keys(params).some(key => !['path','operationId'].includes(key)) || params.path !== undefined && params.operationId !== undefined) throw new Error('invalid_settings_params')
+      return params.operationId !== undefined
+        ? this.call(scope,{action:'query',resource:'operations',operation:'get',params:{id:params.operationId}})
+        : this.call(scope,{action:'query',resource:'settings',operation:'read',params})
+    }
+    if (Object.keys(params).some(key => !['path','patch','expectedRevision','operationId'].includes(key)) || !Object.hasOwn(params,'patch') || params.path === undefined) throw new Error('invalid_settings_params')
+    const {operationId,...changes} = params
+    return this.call(scope,{action:'execute',resource:'settings',operation:'update',params:changes,operationId})
+  }
   private load(): Promise<void> {
     return this.ready ||= (async () => {
       try {
@@ -181,7 +187,7 @@ export class UniAgentManagement {
     }
     if (!request.resource || !MANAGE_RESOURCES.includes(request.resource)) throw new Error('invalid_resource')
     if (request.action === 'execute' && !request.operation) throw new Error('execute_requires_operation')
-    const operation = request.operation || Object.keys(operations[request.resource][request.action])[0]
+    const operation = request.operation || (request.resource === 'settings' && request.action === 'query' ? 'get' : Object.keys(operations[request.resource][request.action])[0])
     const spec = operations[request.resource][request.action][operation]
     if (!spec) throw new Error('unsupported_management_operation')
     const params = request.params === undefined ? {} : object(request.params)
@@ -211,7 +217,7 @@ export class UniAgentManagement {
           await this.run(record,params)
         })
       } catch (error) { record.state = 'failed'; record.error = String(publicManagementValue(String(error))); await this.persist(record) }
-    } else if (request.resource === 'settings' && ['restart','reconsiderRestart'].includes(operation)) {
+    } else if (request.resource === 'settings' && ['restart','reconsiderRestart','update'].includes(operation)) {
       await this.run(record,params)
     } else {
       void this.run(record,params)
@@ -220,13 +226,15 @@ export class UniAgentManagement {
   }
   private confirmation(resource: ManageResource, operation: string, p: Params, callerId: string): string | undefined {
     if (resource === 'settings' && ['restart','cancelRestart','reconsiderRestart'].includes(operation)) return undefined // The restart service owns the protected choice card.
+    if (resource === 'settings' && operation === 'update' && p.path !== undefined) return this.settings.confirmation(p.path,p.patch)
+    if (resource === 'settings' && operation === 'update') return this.settings.legacyConfirmation(p.section,object(p.patch))
     if (resource === 'tasks' && operation === 'update') {
       const { target,patch } = this.taskConfigUpdate(p,callerId)
       if (patch.permissionMode !== undefined && patch.permissionMode !== target.config.permissionMode) return '请确认会话执行权限变更。'
     }
     if (operation === 'delete') return '此操作会删除所选配置，请确认目标和影响。'
     if (resource === 'agents' && ['initialize','update'].includes(operation) && !(operation === 'initialize' && this.deps.agents().some(a => a.id === p.agentId && a.lifecycle?.availability === 'available'))) return '此操作会安装、登录或更新所选 Agent，可能下载文件或修改全局安装。敏感凭据仍需在授权页面填写。'
-    if (resource === 'settings' && (operation === 'document' || object(p.patch).autoUpdateAgentsOnLaunch === true || object(p.patch).autoUpdateAgentsWhenIdle === true)) return '此操作会修改助手身份文档或启用自动更新 Agent，请核对具体更改。'
+    if (resource === 'settings' && operation === 'document') return '此操作会修改助手身份文档，请核对具体更改。'
     const permissions = resource === 'roles' && p.role ? [object(p.role).permissionMode] : resource === 'teams' && p.team
       ? (object(p.team).members as any[] || []).map(member => member?.role?.permissionMode) : []
     if (permissions.some(mode => ['approve-for-me','auto-edit','full-access','unattended','guarded'].includes(String(mode)))) return '所创建或修改的角色包含自动批准、自动编辑或完全访问权限，请确认权限范围。'
@@ -249,7 +257,7 @@ export class UniAgentManagement {
       record.result = publicManagementValue(result)
       if (JSON.stringify(record.result ?? null).length > 64000) record.result = { truncated: true, message: '操作已执行；请 query 查询目标的最新详情' }
       record.state = 'completed'
-      await this.refreshRestartReceipt(record)
+      record = await this.refreshRestartReceipt(record)
       try { this.deps.changed(record.resource) } catch { /* UI refresh cannot undo a completed operation. */ }
     } catch (error) { record.state = 'failed'; record.error = String(publicManagementValue(error instanceof Error ? error.message : String(error))) }
     record.updatedAt = Date.now()
@@ -304,6 +312,7 @@ export class UniAgentManagement {
     }
     if (resource === 'agents') return this.deps.agents().filter(a => !p.agentId || a.id === p.agentId).map(a => ({ id: a.id, name: a.name, adapter: a.adapter, installed: a.installed,
       enabled: this.deps.appSettings().enabledAgentIds?.includes(a.id), lifecycle: a.lifecycle, capabilities: a.capabilities, modelCount: a.models.length, models: p.agentId ? a.models : undefined, defaultModel: a.defaultModel }))
+    if (resource === 'settings' && operation === 'read') return this.settings.read(p.path)
     if (resource === 'settings') {
       const section = String(p.section || 'app')
       const config = section === 'app' ? this.deps.appSettings() : section === 'assistant' ? await this.deps.assistant() : await this.deps.configuration(section)
@@ -437,7 +446,7 @@ export class UniAgentManagement {
       if (target.teamBinding) throw new Error('专家团任务请使用 teams 的管理动作')
       if (operation === 'continue') await this.deps.orchestrator.sendMessage(target.id,text(p.prompt,'prompt',32000),undefined,undefined,false,{ source: 'mcp' })
       else if (operation === 'stop') this.deps.orchestrator.interrupt(target.id)
-      else if (operation === 'archive') this.deps.orchestrator.setArchived(target.id,bool(p.archived,'archived'))
+      else if (operation === 'archive') await this.deps.orchestrator.setArchived(target.id,bool(p.archived,'archived'))
       else if (operation === 'rename') this.deps.orchestrator.renameSession(target.id,text(p.title,'title'))
       return { accepted: true, session: briefSession(target) }
     }
@@ -478,34 +487,10 @@ export class UniAgentManagement {
         if (!['soul','working_rules'].includes(String(p.type))) throw new Error('事实文档请使用 assistant_memory')
         return this.deps.saveAssistant(input,[{ type: p.type as 'soul' | 'working_rules', content: typeof p.content === 'string' ? p.content : text(p.content,'content',16000), expectedRevision: integer(p.expectedRevision,0,Number.MAX_SAFE_INTEGER) }],detail.assistant)
       }
+      if (p.path !== undefined) return this.settings.update(p.path,p.patch,p.expectedRevision)
       const patch = object(p.patch,'patch')
-      if (p.section === 'assistant') {
-        this.checkRevision(detail.assistant,p.expectedRevision)
-        if (Object.keys(patch).some(key => !['enabled','defaultAgentId','defaultModel','defaultPermissionMode','defaultWorkdir','autoReviewEnabled','reviewRuntime'].includes(key))) throw new Error('invalid_assistant_patch')
-        for (const key of ['enabled','autoReviewEnabled']) if (patch[key] !== undefined) bool(patch[key],key)
-        for (const key of ['defaultAgentId','defaultModel','defaultPermissionMode','defaultWorkdir']) if (patch[key] !== undefined && !(key !== 'defaultAgentId' && patch[key] === null) && (typeof patch[key] !== 'string' || String(patch[key]).length > 4000)) throw new Error('invalid_'+key)
-        if (patch.reviewRuntime !== undefined && patch.reviewRuntime !== null) {
-          const runtime = object(patch.reviewRuntime,'reviewRuntime')
-          if (Object.keys(runtime).some(key => !['agentId','model'].includes(key)) || typeof runtime.agentId !== 'string' || runtime.model !== undefined && typeof runtime.model !== 'string') throw new Error('invalid_reviewRuntime')
-        }
-        const next = { ...input,...patch } as AssistantInput
-        for (const key of ['defaultModel','defaultPermissionMode','defaultWorkdir','reviewRuntime'] as const) if (patch[key] === null) delete next[key]
-        const agent = this.deps.agents().find(a => a.id === next.defaultAgentId)
-        if (!agent || next.defaultModel && !agent.models.some(model => model.id === next.defaultModel)) throw new Error('所选默认 Agent 或模型不存在')
-        if (next.reviewRuntime) {
-          const reviewAgent = this.deps.agents().find(a => a.id === next.reviewRuntime!.agentId)
-          if (!reviewAgent || next.reviewRuntime.model && !reviewAgent.models.some(model => model.id === next.reviewRuntime!.model)) throw new Error('所选复盘 Agent 或模型不存在')
-        }
-        return this.deps.saveAssistant(next,[],detail.assistant)
-      }
-      if (p.section !== 'app' || Object.keys(patch).some(key => !['autoUpdateAgentsOnLaunch','autoUpdateAgentsWhenIdle','enabledAgentIds','autoCheckUpdate','theme','notificationMode','coverSidebar','sidebarShortcuts'].includes(key))) throw new Error('配置字段不支持自动修改；凭据和通道授权请在设置页完成')
-      this.checkRevision(this.deps.appSettings(),p.expectedRevision)
-      for (const key of ['autoUpdateAgentsOnLaunch','autoUpdateAgentsWhenIdle','autoCheckUpdate','coverSidebar']) if (patch[key] !== undefined) bool(patch[key],key)
-      if (patch.theme !== undefined && !['system','dark','light'].includes(String(patch.theme))) throw new Error('invalid_theme')
-      if (patch.notificationMode !== undefined && !['unfocused','always','off'].includes(String(patch.notificationMode))) throw new Error('invalid_notificationMode')
-      if (patch.enabledAgentIds !== undefined && (!Array.isArray(patch.enabledAgentIds) || patch.enabledAgentIds.some(id => !this.deps.agents().some(agent => agent.id === id)) || new Set(patch.enabledAgentIds).size !== patch.enabledAgentIds.length)) throw new Error('invalid_enabledAgentIds')
-      if (patch.sidebarShortcuts !== undefined && (!Array.isArray(patch.sidebarShortcuts) || patch.sidebarShortcuts.length > MAX_SIDEBAR_SHORTCUTS || patch.sidebarShortcuts.some(id => !SETTINGS_CATEGORIES.some(category => category.id === id)) || new Set(patch.sidebarShortcuts).size !== patch.sidebarShortcuts.length)) throw new Error('invalid_sidebarShortcuts')
-      return this.updateAppSettings(patch as AppSettingsPatch)
+      if (p.section !== 'app' && p.section !== 'assistant') throw new Error('invalid_settings_section')
+      return this.settings.updateLegacy(p.section,patch,p.expectedRevision)
     }
     throw new Error('unsupported_management_operation')
   }

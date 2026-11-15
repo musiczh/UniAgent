@@ -10,6 +10,7 @@ import { SessionStore } from '../src/main/sessionStore'
 import { appNotificationBody, SessionAttentionBadge, shouldShowAppNotification } from '../src/main/appNotifications'
 import { useSessionAttention } from '../src/renderer/hooks'
 import type { Session, UAEvent } from '../src/shared/types'
+import type { SessionAttentionSnapshot } from '../src/shared/sessionAttention'
 
 const session = (id = 'session-1', patch: Partial<Session> = {}): Session => ({
   id, title: id, status: 'idle', createdAt: 1,
@@ -19,11 +20,11 @@ const attentionEvent = (type: UAEvent['type'], state: UAEvent['state'], patch: P
   sessionId: 'session-1', seq: 1, ts: 1, type, state, payload: {}, ...patch
 })
 
-function badgeFixture() {
+function badgeFixture(onChange?: (snapshot: SessionAttentionSnapshot) => void) {
   let focused = false
   let text = ''
   const updates: string[] = []
-  const badge = new SessionAttentionBadge(value => { text = value; updates.push(value) }, () => focused)
+  const badge = new SessionAttentionBadge(value => { text = value; updates.push(value) }, () => focused, onChange)
   return { badge, updates, text: () => text, focus: (value: boolean) => { focused = value } }
 }
 
@@ -49,7 +50,7 @@ test('Dock badge counts questions, approvals, completion and failures once per s
   }
 })
 
-test('only reading clears attention; execution and approval state remain unchanged', () => {
+test('accepted answers clear their question without changing execution or approval state', () => {
   const f = badgeFixture()
   const owner = session('session-1', { status: 'awaiting-approval' })
   const event = attentionEvent('approval_request', 'pending', { payload: { kind: 'question', requestId: 'q1' } })
@@ -57,7 +58,9 @@ test('only reading clears attention; execution and approval state remain unchang
   f.badge.handleEvent(event, owner)
   f.badge.handleEvent(attentionEvent('turn_started', 'running'), owner)
   f.badge.handleEvent({ ...event, state: 'success' }, owner)
-  assert.equal(f.text(), '1', 'starting work or resolving a request does not read the session')
+  assert.equal(f.text(), '1', 'an unconfirmed provider update does not clear the question')
+  f.badge.handleEvent({ ...event, state: 'success', payload: { ...event.payload, submittedAnswer: {} } }, owner)
+  assert.equal(f.text(), '', 'a confirmed answer clears attention from any entry point')
   f.focus(true)
   f.badge.setVisibleSession(owner.id)
   assert.equal(f.text(), '', 'zero unread sessions removes the badge instead of displaying 0')
@@ -69,6 +72,31 @@ test('only reading clears attention; execution and approval state remain unchang
   assert.equal(f.text(), '', 'replaying the same pending request cannot make a read session unread')
   f.badge.handleEvent({ ...event, seq: 2, payload: { ...event.payload, requestId: 'q2' } }, owner)
   assert.equal(f.text(), '1', 'a new question after reading becomes unread again')
+})
+
+test('answering one of several questions preserves other questions and new main/side results', () => {
+  const f = badgeFixture(), owner = session()
+  const question = (requestId: string, seq: number) => attentionEvent('approval_request', 'pending', {
+    seq, payload: { kind: 'question', requestId }
+  })
+  const first = question('q1', 1), second = question('q2', 2)
+  const answer = (event: UAEvent) => ({ ...event, state: 'success' as const, payload: { ...event.payload, submittedAnswer: {} } })
+  f.badge.handleEvent(first, owner)
+  f.badge.handleEvent(second, owner)
+  f.badge.handleEvent(answer(second), owner)
+  assert.equal(f.text(), '1', 'answering the newest question cannot hide another pending question')
+  f.badge.handleEvent(answer(first), owner)
+  assert.equal(f.text(), '', 'answering every question clears the session')
+  f.badge.handleEvent(first, owner)
+  assert.equal(f.text(), '', 'late pending snapshots cannot revive answered questions')
+  f.badge.handleEvent(attentionEvent('turn_completed', 'success', { seq: 3 }), owner)
+  f.badge.handleEvent(attentionEvent('turn_completed', 'success', { seq: 4 }), owner, 'side')
+  f.badge.handleEvent(answer(first), owner)
+  assert.equal(f.text(), '1', 'replayed answers preserve new results')
+  f.badge.handleEvent(attentionEvent('user_message', 'success', { seq: 5, payload: { text: '继续', source: 'feishu' } }), owner)
+  assert.equal(f.text(), '1', 'main input preserves an unread side result')
+  f.badge.handleEvent(attentionEvent('user_message', 'success', { seq: 6, payload: { text: '继续', source: 'app' } }), owner, 'side')
+  assert.equal(f.text(), '', 'accepted side input clears its own result')
 })
 
 test('foreground session is read while background and hidden-page sessions remain unread', () => {
@@ -122,12 +150,16 @@ test('archiving a real session clears its unread badge after persistence', async
   const orchestrator = new Orchestrator(() => undefined, store, join(directory, 'artifacts'))
   orchestrator.loadPersisted()
   const f = badgeFixture()
-  orchestrator.on('sessionArchived', id => f.badge.removeSession(id))
-  f.badge.handleEvent(attentionEvent('turn_completed', 'success'), orchestrator.getSessionById('session-1'))
+  orchestrator.on('sessionArchived', id => f.badge.archiveSession(id))
+  const completed = attentionEvent('turn_completed', 'success')
+  f.badge.handleEvent(completed, orchestrator.getSessionById('session-1'))
   assert.equal(f.text(), '1')
   orchestrator.setArchived('session-1', true)
   assert.equal(store.load()[0].archived, true)
   assert.equal(f.text(), '', 'an archived session cannot leave an unreachable unread count')
+  orchestrator.setArchived('session-1', false)
+  f.badge.handleEvent(completed, orchestrator.getSessionById('session-1'))
+  assert.equal(f.text(), '', 'restoring an archived session cannot unread its previous completion')
 })
 
 test('side events share the session count and keep separate event identities', () => {
@@ -230,34 +262,80 @@ test('non-attention events and unavailable/tool sessions do not inflate the Dock
 })
 
 test('renderer reports the visible session and clears it when the session page is hidden', async () => {
-  const f = badgeFixture()
+  let sidebarUnread = true
+  const f = badgeFixture(snapshot => { sidebarUnread = !!snapshot.unreadBySession['session-1'] })
   f.focus(true)
   f.badge.handleEvent(attentionEvent('approval_request', 'pending'), session())
   const dispatcher = (React as any).__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED.ReactCurrentDispatcher
   const previousDispatcher = dispatcher.current
   const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window')
-  const effects: Array<() => void> = []
+  const previousDocument = Object.getOwnPropertyDescriptor(globalThis, 'document')
+  const effects: Array<() => void | (() => void)> = []
   const calls: Array<string | null> = []
+  const browserWindow = new EventTarget()
+  const browserDocument = Object.assign(new EventTarget(), { visibilityState: 'visible', hasFocus: () => focused })
+  let focused = true
+  let cleanup: (() => void) | undefined
   try {
-    Object.defineProperty(globalThis, 'window', { configurable: true, value: { uniagent: {
+    Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(browserWindow, { uniagent: {
       setBadgeVisibleSession: async (id: string | null) => { calls.push(id); f.badge.setVisibleSession(id) }
-    } } })
-    dispatcher.current = { useEffect(effect: () => void) { effects.push(effect) } }
+    } }) })
+    Object.defineProperty(globalThis, 'document', { configurable: true, value: browserDocument })
+    dispatcher.current = { useEffect(effect: () => void | (() => void)) { effects.push(effect) }, useRef: (value: unknown) => ({ current: value }) }
     useSessionAttention('session-1')
     assert.equal(f.text(), '1', 'rendering alone does not read before the effect commits')
-    effects.pop()!()
+    cleanup = effects.pop()!() || undefined
     await Promise.resolve()
     assert.equal(f.text(), '', 'showing the session reads it through the preload bridge')
-    useSessionAttention(null)
-    effects.pop()!()
-    await Promise.resolve()
+    assert.equal(sidebarUnread, false, 'showing the session clears the shared sidebar snapshot too')
+
+    focused = false
+    f.focus(false)
+    f.badge.handleNavigation(true, false)
     f.badge.handleEvent(attentionEvent('turn_completed', 'success'), session())
+    sidebarUnread = true
+    browserWindow.dispatchEvent(new Event('focus'))
+    assert.equal(f.text(), '1', 'a focus notification cannot read while the document is still unfocused')
+    assert.equal(sidebarUnread, true)
+    focused = true
+    f.focus(true)
+    browserWindow.dispatchEvent(new Event('focus'))
+    await Promise.resolve()
+    assert.equal(f.text(), '', 'returning to the same session resynchronizes its Dock read state')
+    assert.equal(sidebarUnread, false, 'focus reads the same session in the sidebar')
+
+    browserDocument.visibilityState = 'hidden'
+    f.focus(false)
+    f.badge.handleEvent(attentionEvent('turn_completed', 'success', { seq: 2 }), session())
+    sidebarUnread = true
+    browserWindow.dispatchEvent(new Event('focus'))
+    assert.equal(f.text(), '1', 'a hidden document cannot read a session')
+    assert.equal(sidebarUnread, true)
+    browserDocument.visibilityState = 'visible'
+    f.focus(true)
+    browserDocument.dispatchEvent(new Event('visibilitychange'))
+    assert.equal(f.text(), '', 'restoring visibility reads the visible session')
+    assert.equal(sidebarUnread, false)
+
+    cleanup?.()
+    useSessionAttention(null)
+    cleanup = effects.pop()!() || undefined
+    await Promise.resolve()
+    f.badge.handleEvent(attentionEvent('turn_completed', 'success', { seq: 3 }), session())
     assert.equal(f.text(), '1', 'hiding the session prevents future events from being read')
-    assert.deepEqual(calls, ['session-1', null])
+    assert.deepEqual(calls, ['session-1', 'session-1', 'session-1', null])
+    cleanup?.()
+    cleanup = undefined
+    browserWindow.dispatchEvent(new Event('focus'))
+    browserDocument.dispatchEvent(new Event('visibilitychange'))
+    assert.deepEqual(calls, ['session-1', 'session-1', 'session-1', null], 'unmount removes the read listeners')
   } finally {
+    cleanup?.()
     dispatcher.current = previousDispatcher
     if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow)
     else Reflect.deleteProperty(globalThis, 'window')
+    if (previousDocument) Object.defineProperty(globalThis, 'document', previousDocument)
+    else Reflect.deleteProperty(globalThis, 'document')
   }
 })
 

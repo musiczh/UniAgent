@@ -388,6 +388,10 @@ await Promise.all([
   seedClaudeHistory(),
   seedAutomations()
 ])
+await put(join(userData, 'app-settings.json'), JSON.stringify({ schemaVersion: 1,
+  sidebarShortcuts: ['history', 'automations', 'tokens'],
+  autoCheckUpdate: false, autoUpdateAgentsOnLaunch: false, autoUpdateAgentsWhenIdle: false
+}))
 if (modelMenuOnly) await put(join(userData, 'sessions.json'), JSON.stringify([{
   id:'model-menu-fixture', title:'模型菜单验证', config:{agentId:'codex',model:'gpt-6.1-sol',permissionMode:'read-only',workdir:isolatedHome},
   status:'idle',createdAt:Date.now(),origin:'created',readOnly:false
@@ -538,6 +542,7 @@ await new Promise((res, rej) => {
   ws.addEventListener('error', rej, { once: true })
 })
 await send('Runtime.enable')
+await send('Page.addScriptToEvaluateOnNewDocument', { source: `(${installMarkdownInputDriver.toString()})()` })
 await ev(`(${installMarkdownInputDriver.toString()})()`)
 
 const results = []
@@ -870,20 +875,20 @@ for (let i = 0; i < 200; i++) {
 const streamed = lens.length >= 2 && lens[lens.length - 1] > lens[0]
 check('streaming turn completed', completed && streamed, `completed=${completed}, streamed=${streamed}, ${lens.length} running snapshots`)
 
-// ---- G2-1: per-turn usage card shows current-turn only; expandable detail ----
+// ---- G2-1: toolbar usage icon shows current-turn tooltip; expandable detail ----
 await sleep(400)
 const usageLine = JSON.parse(await ev(`(()=>{
-  const card=document.querySelector('.system-notice.usage');
-  if(!card) return JSON.stringify({err:'no usage card'});
-  const line=card.querySelector('.usage-line');
-  return JSON.stringify({collapsedText:line?line.textContent:''});
+  const button=document.querySelector('.message-usage > button');
+  if(!button) return JSON.stringify({err:'no usage icon'});
+  return JSON.stringify({collapsedText:button.title});
 })()`))
-check('G2-1 per-turn token card present', !usageLine.err && !!usageLine.collapsedText, usageLine.collapsedText || usageLine.err)
+check('G2-1 per-turn token icon present', !usageLine.err && !!usageLine.collapsedText, usageLine.collapsedText || usageLine.err)
 // Click to expand, THEN (after React re-renders) read the two-row table.
-await ev(`(()=>{const l=document.querySelector('.system-notice.usage .usage-line');if(l)l.click();return 1;})()`)
+await ev(`(()=>{const button=document.querySelector('.message-usage > button');if(button)button.click();return 1;})()`)
 await sleep(300)
 const usageDetail = JSON.parse(await ev(`(()=>{
-  const card=document.querySelector('.system-notice.usage');
+  const button=document.querySelector('.message-usage > button');
+  const card=button?document.getElementById(button.getAttribute('aria-controls')):null;
   const table=card?card.querySelector('.usage-table'):null;
   const rowHeads=table?[...table.querySelectorAll('tbody th')].map(t=>t.textContent):[];
   return JSON.stringify({hasTable:!!table,rowHeads});
@@ -895,14 +900,13 @@ check(
 )
 
 // ---- Doc-fix: 本轮 ≠ 会话累计 across turns. Run a SECOND completed turn and
-// verify the newest card's session cumulative input strictly exceeds this
+// verify the newest icon's session cumulative input strictly exceeds this
 // turn's input (proves the baseline is carried, not reset every turn). ----
-// The usage footer card renders slightly AFTER `turn_completed`, so first wait
-// for turn 1's card to actually exist — otherwise `usageCountBefore` captures 0
-// and the turn-2 loop would mistake turn 1's own card for the new one.
+// Usage renders slightly AFTER `turn_completed`, so first wait for turn 1's
+// icon — otherwise the turn-2 loop could mistake it for the new one.
 let usageCountBefore = 0
 for (let i = 0; i < 40; i++) {
-  usageCountBefore = await ev(`(()=>document.querySelectorAll('.system-notice.usage').length)()`)
+  usageCountBefore = await ev(`(()=>document.querySelectorAll('.message-usage > button').length)()`)
   if (usageCountBefore >= 1) break
   await sleep(300)
 }
@@ -910,22 +914,22 @@ await ev(`window.uniagent.sendMessage(${JSON.stringify(sid)}, 'Reply with exactl
 let turn2Done = false
 for (let i = 0; i < 120; i++) {
   await sleep(400)
-  const n = await ev(`(()=>document.querySelectorAll('.system-notice.usage').length)()`)
+  const n = await ev(`(()=>document.querySelectorAll('.message-usage > button').length)()`)
   if (n > usageCountBefore) { turn2Done = true; break }
 }
 await sleep(400)
 const multi = JSON.parse(await ev(`(()=>{
-  const cards=[...document.querySelectorAll('.system-notice.usage')];
-  const last=cards[cards.length-1];
-  if(!last) return JSON.stringify({err:'no card'});
-  const line=last.querySelector('.usage-line');
-  if(line && !last.classList.contains('open')) line.click();
+  const buttons=[...document.querySelectorAll('.message-usage > button')];
+  const last=buttons.at(-1);
+  if(!last) return JSON.stringify({err:'no usage icon'});
+  if(last.getAttribute('aria-expanded')==='false') last.click();
   return JSON.stringify({ready:1});
 })()`))
 await sleep(300)
 const cmp = JSON.parse(await ev(`(()=>{
-  const cards=[...document.querySelectorAll('.system-notice.usage')];
-  const last=cards[cards.length-1];
+  const buttons=[...document.querySelectorAll('.message-usage > button')];
+  const button=buttons.at(-1);
+  const last=button?document.getElementById(button.getAttribute('aria-controls')):null;
   const t=last?last.querySelector('.usage-table'):null;
   if(!t) return JSON.stringify({err:'no table'});
   const rows=[...t.querySelectorAll('tbody tr')];
@@ -1435,10 +1439,10 @@ for (let i = 0; i < 30; i++) {
 check('需求19 live status line appears instantly on send', liveStatus.line, `text="${liveStatus.text}"`)
 check('需求19 status line has shimmer animation', liveStatus.shimmer, `shimmerEl=${liveStatus.shimmer}`)
 const lastRow = await ev(`(()=>{
-  const es=document.querySelector('.event-stream');
-  if(!es) return false;
-  const real=[...es.children].filter(c=>c.offsetHeight>0&&c.className);
-  return real.length? real[real.length-1].classList.contains('status-line'):false;
+  const es=document.querySelector('.event-stream'),line=es?.querySelector('.status-line');
+  if(!es||!line)return false;
+  const messages=[...es.querySelectorAll('.user-msg,.agent-msg,.process-step')].filter(node=>node.offsetHeight>0);
+  return messages.every(node=>!!(node.compareDocumentPosition(line)&Node.DOCUMENT_POSITION_FOLLOWING));
 })()`)
 check('需求19 status line is the last row while running', !!lastRow)
 const sendScrolled = await poll(
@@ -1666,7 +1670,7 @@ check(
 // picker per history row (only meaningful with >1 installed agent), AND the
 // backend exportNativeSession must round-trip a real native session into another
 // agent's history + return an imported session under the target agent. ----
-const installedIds = caps.filter((c) => c.installed).map((c) => c.id)
+const installedIds = caps.filter((c) => c.installed && c.capabilities?.crossAgentFork === true).map((c) => c.id)
 // Open the history panel and check the cross-agent affordance is wired.
 // 修复#2 — clicking a row no longer imports a snapshot Session into the sidebar;
 // it opens an inline READ-ONLY viewer whose fork-bar carries 原Agent分叉 +
@@ -2012,29 +2016,25 @@ check(
 
 // ==== P1–P6 (latest bug-fix batch) ================================
 
-// ---- P1: 等待算力 card — left-aligned to the message column, Chinese-only
-// (no English), and it carries a ticking elapsed timer. Once done, the total
-// moves into a durable call-chain record. We assert both CSS contracts and that
-// the OLD `.queue-banner-msg` rule is gone. ----
-const p1 = JSON.parse(await ev(`(()=>{
-  let center=false,time=false,record=false,recordTime=false,oldMsg=false,check=false;
-  for(const ss of document.styleSheets){
-    try{ for(const r of ss.cssRules){
-      const s=r.selectorText||'';
-      if(s==='.queue-banner'){ const c=r.style.cssText||''; if(/max-width/.test(c)&&/margin/.test(c)) center=true; }
-      if(s.includes('.queue-banner-time')) time=true;
-      if(s==='.queue-wait-record') record=true;
-      if(s.includes('.queue-wait-record-time')) recordTime=true;
-      if(s.includes('.queue-wait-record-check')) check=true;
-      if(s.includes('.queue-banner-msg')) oldMsg=true;
-    } }catch{}
-  }
-  return JSON.stringify({center,time,record,recordTime,check,oldMsg});
-})()`))
+// Queue waiting now lives in the process timeline. Verify its clock and the
+// persisted terminal duration through real renderer events.
+await ev(`document.querySelector('[data-session-id="${sid}"]')?.click()`)
+const p1Now = Date.now(), p1QueueId = 'acceptance-queue-' + p1Now
+await ev(`window.uniagent.e2eInjectEvents([
+  {sessionId:${JSON.stringify(sid)},seq:${p1Now},ts:${p1Now},type:'user_message',payload:{text:'queue timeline acceptance'}},
+  {sessionId:${JSON.stringify(sid)},seq:${p1Now + 1},ts:${p1Now},type:'queue_status',state:'running',payload:{id:${JSON.stringify(p1QueueId)},queue:{state:'waiting',startedAt:${p1Now},waitedMs:0,position:2}}}
+])`)
+const p1Read = () => ev(`(()=>{const nodes=[...document.querySelectorAll('.session-view .process-queue')];const node=nodes.at(-1);return JSON.stringify({count:nodes.length,active:!!node?.classList.contains('active'),text:node?.textContent||'',live:!!node?.querySelector('.process-step-live-dot'),done:!!node?.querySelector('.process-step-done-dot'),legacy:!!document.querySelector('.queue-banner-msg')});})()`)
+await poll(async () => JSON.parse(await p1Read()).active, Boolean)
+const p1Start = JSON.parse(await p1Read())
+const p1Tick = await poll(async () => JSON.parse(await p1Read()).text, text => text !== p1Start.text, 5000)
+await ev(`window.uniagent.e2eInjectEvents([{sessionId:${JSON.stringify(sid)},seq:${p1Now + 2},ts:Date.now(),type:'queue_status',state:'success',payload:{id:${JSON.stringify(p1QueueId)},queue:{state:'ready',waitedMs:3200,acquired:true}}}])`)
+await poll(async () => JSON.parse(await p1Read()).done, Boolean)
+const p1 = JSON.parse(await p1Read())
 check(
-  'P1 等待算力 live timer + durable call-chain record (no legacy msg)',
-  p1.center && p1.time && p1.record && p1.recordTime && p1.check && !p1.oldMsg,
-  `centered=${p1.center}, time=${p1.time}, record=${p1.record}, recordTime=${p1.recordTime}, check=${p1.check}, legacyMsg=${p1.oldMsg}`
+  'P1 等待算力 advances its timeline clock and retains one terminal duration',
+  p1Start.active && p1Start.live && /第 3 位.*已等待/.test(p1Start.text) && p1Tick !== p1Start.text && p1.count === p1Start.count && !p1.active && p1.done && /3 秒.*已结束/.test(p1.text) && !p1.legacy,
+  JSON.stringify({before:p1Start,after:p1})
 )
 
 // ---- P2: codex history restore. An aborted rollout carries only response_item
@@ -2141,9 +2141,9 @@ try {
 } catch (e) {
   p5cat = { ok: false, err: e.message }
 }
-const wantTools = ['uniagent_query', 'uniagent_task', 'send_to_feishu']
+const wantTools = ['uniagent_query', 'uniagent_task', 'send_to_feishu', 'send_to_weixin']
 check(
-  'P5 MCP advertises exactly three ordinary tools',
+  'P5 MCP advertises exactly four ordinary tools',
   p5.tools?.length === wantTools.length && wantTools.every((t) => p5.tools.includes(t)),
   `tools=[${(p5.tools || []).join(',')}]`
 )
@@ -2170,7 +2170,7 @@ const p6Panel = JSON.parse(await ev(`(()=>{
   const navIcons=[...document.querySelectorAll('.set-nav-item .ic > svg.ui-icon')].length;
   return JSON.stringify({mounted:!!panel,title:title?title.textContent.trim():'',nav,navIcons});
 })()`))
-const wantCats = ['通用', 'Agent', '个人助手', '工具能力', '任务模板']
+const wantCats = ['通用', 'Agent', '飞书&助手', '工具能力', '任务模板']
 check('P6 设置 entry opens settings panel', p6entry === 1 && p6Panel.mounted && /设置/.test(p6Panel.title), `title="${p6Panel.title}"`)
 await settingsNav('通用')
 const p6General = JSON.parse(await ev(`(()=>{
@@ -2189,6 +2189,8 @@ const p6Agent = JSON.parse(await ev(`(()=>{
   return JSON.stringify({groups,cliRows,redetect,toggles});
 })()`))
 await settingsNav('通用')
+await ev(`(()=>{const row=[...document.querySelectorAll('.set-page:not([hidden]) .rowlink')].find(x=>x.querySelector('.r-label')?.textContent.trim()==='开发者选项');row?.click();return !!row;})()`)
+await poll(() => ev(`(()=>document.querySelector('.set-page:not([hidden]) h2')?.textContent==='开发者选项')()`), Boolean)
 const p6Diag = JSON.parse(await ev(`(()=>{
   const groups=[...document.querySelectorAll('.set-page:not([hidden]) .set-group-t')].map(x=>(x.textContent||'').trim());
   const rows=[...document.querySelectorAll('.set-page:not([hidden]) .r-label')].map(x=>(x.textContent||'').trim());
@@ -2201,9 +2203,16 @@ const p6Presets = JSON.parse(await ev(`(()=>{
   return JSON.stringify({group,addRow});
 })()`))
 check(
-  '需求6 设置分类导航合并助手与飞书、诊断移入通用（含图标）',
+  '需求6 设置分类导航合并助手与飞书、诊断收进开发者选项（含图标）',
   wantCats.every((c) => p6Panel.nav.includes(c)) && !p6Panel.nav.includes('飞书 Bot') && !p6Panel.nav.includes('诊断与日志') && p6Panel.navIcons >= wantCats.length,
   JSON.stringify(p6Panel)
+)
+check(
+  '通用页仅提供开发者选项入口，默认隐藏诊断与排队预估',
+  p6General.rows.includes('开发者选项') && !p6General.groups.includes('诊断与日志') && !p6General.groups.includes('排队预估') &&
+    !p6General.rows.includes('Session 导入错误') && !p6General.rows.includes('App 运行错误日志') && !p6General.rows.includes('工具能力排查日志') &&
+    !p6General.rows.includes('清空全部日志') && !p6General.rows.includes('等待时间预测质量'),
+  JSON.stringify(p6General)
 )
 check(
   '需求6 通用页展示版本 + 自动检查更新 + 覆盖侧栏开关',
@@ -2217,8 +2226,9 @@ check(
   JSON.stringify(p6Agent)
 )
 check(
-  '需求6 通用页诊断按 Session 导入与 App 运行分类',
-  p6Diag.groups.includes('诊断与日志') && p6Diag.rows.includes('Session 导入错误') && p6Diag.rows.includes('App 运行错误日志'),
+  '开发者选项保留诊断分类、工具日志、清空日志与排队预估',
+  p6Diag.groups.includes('诊断与日志') && p6Diag.rows.includes('Session 导入错误') && p6Diag.rows.includes('App 运行错误日志') &&
+    p6Diag.rows.includes('工具能力排查日志') && p6Diag.rows.includes('清空全部日志') && p6Diag.groups.includes('排队预估') && p6Diag.rows.includes('等待时间预测质量'),
   JSON.stringify(p6Diag)
 )
 check(
@@ -3307,7 +3317,7 @@ const req2CompactBefore = JSON.parse(await ev(`(()=>JSON.stringify({ids:[...docu
 const req2CompactId = `req2-compact-${Date.now()}`
 await ev(`window.uniagent.e2eInjectEvents([{sessionId:${JSON.stringify(req2Sid)},seq:Date.now(),ts:Date.now(),type:'context_compaction',state:'running',payload:{id:${JSON.stringify(req2CompactId)}}}])` )
 await poll(() => ev(`(()=>{const step=[...document.querySelectorAll('.session-view .process-step')].at(-1);if(step&&!step.classList.contains('open'))step.querySelector('.process-step-meta')?.click();return !!document.querySelector('.context-compaction[data-compaction-id=${JSON.stringify(req2CompactId)}]');})()`), Boolean, 3000)
-const req2CompactRunning = await ev(`(()=>{const n=document.querySelector('.context-compaction[data-compaction-id=${JSON.stringify(req2CompactId)}]');const s=document.querySelector('.status-line .shimmer');return !!n&&n.classList.contains('state-running')&&!!s&&(s.textContent||'').includes('上下文压缩中');})()` )
+const req2CompactRunning = await ev(`(()=>{const n=document.querySelector('.context-compaction[data-compaction-id=${JSON.stringify(req2CompactId)}]');return !!n&&n.classList.contains('state-running')&&n.getAttribute('aria-label')==='上下文压缩中…'&&!!n.querySelector('.spin');})()` )
 await ev(`window.uniagent.e2eInjectEvents([{sessionId:${JSON.stringify(req2Sid)},seq:Date.now()+1,ts:Date.now()+1,type:'context_compaction',state:'success',payload:{id:${JSON.stringify(req2CompactId)}}}])` )
 await sleep(100)
 const req2Compact = JSON.parse(await ev(`(()=>{const id=${JSON.stringify(req2CompactId)};const nodes=[...document.querySelectorAll('.context-compaction')].filter(x=>x.getAttribute('data-compaction-id')===id);return JSON.stringify({count:nodes.length,running:nodes.some(x=>x.classList.contains('state-running')),completed:nodes.some(x=>x.classList.contains('state-success')),inside:nodes.every(x=>!!x.closest('.process-step-calls')),elapsed:nodes.every(x=>!!x.querySelector('.context-compaction-duration'))});})()`))
@@ -3334,11 +3344,12 @@ check('需求20 非首条用户消息上下间距各为 40px', req2CompactUi.use
 const req19PlanId = `plan-reused-${Date.now()}`
 await ev(`window.uniagent.e2eInjectEvents([
   {sessionId:${JSON.stringify(req2Sid)},seq:Date.now(),ts:Date.now(),type:'plan_update',state:'success',payload:{id:${JSON.stringify(req19PlanId)},steps:[{text:'previous turn',status:'in_progress'}]}},
-  {sessionId:${JSON.stringify(req2Sid)},seq:Date.now()+1,ts:Date.now()+1,type:'user_message',state:'success',payload:{id:'plan-boundary-${Date.now()}',text:'new plan turn'}},
-  {sessionId:${JSON.stringify(req2Sid)},seq:Date.now()+2,ts:Date.now()+2,type:'plan_update',state:'success',payload:{id:${JSON.stringify(req19PlanId)},steps:[{text:'stale running',status:'in_progress'},{text:'latest running',status:'in_progress'}]}}
+  {sessionId:${JSON.stringify(req2Sid)},seq:Date.now()+1,ts:Date.now()+1,type:'turn_completed',state:'success',payload:{}},
+  {sessionId:${JSON.stringify(req2Sid)},seq:Date.now()+2,ts:Date.now()+2,type:'user_message',state:'success',payload:{id:'plan-boundary-${Date.now()}',text:'new plan turn'}},
+  {sessionId:${JSON.stringify(req2Sid)},seq:Date.now()+3,ts:Date.now()+3,type:'plan_update',state:'success',payload:{id:${JSON.stringify(req19PlanId)},steps:[{text:'stale running',status:'in_progress'},{text:'latest running',status:'in_progress'}]}}
 ])` )
-await poll(() => ev(`(()=>{const bar=document.querySelector('.session-view > .plan-bar');return bar?(bar.querySelector('.plan-pill-text')?.textContent||'').replace(/\s+/g,' ').trim():'';})()`), (text) => text === '第 2 / 2 步')
-const req19Plan = JSON.parse(await ev(`(()=>{const bar=document.querySelector('.session-view > .plan-bar');return JSON.stringify({label:(bar?.querySelector('.plan-pill-text')?.textContent||'').replace(/\s+/g,' ').trim(),terminal:!!bar?.classList.contains('is-terminal'),spinner:!!bar?.querySelector('.plan-pill-spin')});})()`))
+await poll(() => ev(`(()=>{const bar=document.querySelector('.session-view .plan-bar');return bar?(bar.querySelector('.plan-pill-text')?.textContent||'').replace(/\s+/g,' ').trim():'';})()`), (text) => text === '第 2 / 2 步')
+const req19Plan = JSON.parse(await ev(`(()=>{const bar=document.querySelector('.session-view .plan-bar');return JSON.stringify({label:(bar?.querySelector('.plan-pill-text')?.textContent||'').replace(/\s+/g,' ').trim(),terminal:!!bar?.classList.contains('is-terminal'),spinner:!!bar?.querySelector('.plan-pill-spin')});})()`))
 check('需求19 同一 plan ID 跨轮不覆盖旧位置且多运行项高亮最新项', req19Plan.label === '第 2 / 2 步' && req19Plan.terminal && !req19Plan.spinner, JSON.stringify(req19Plan))
 
 // ==== 需求3 — multi-question / multi-select approval form ====================
@@ -3668,19 +3679,19 @@ const submitCurrentQuestion = async (requestId) => {
 {
   await ev(`(()=>{const b=[...document.querySelectorAll('.sidebar-nav-item')].find(x=>(x.textContent||'').includes('定时任务'));if(b)b.click();return !!b;})()`)
   await poll(() => ev(`(()=>!!document.querySelector('.automations-panel'))()`), Boolean)
-  await poll(() => ev(`(()=>document.querySelectorAll('.auto-item-clickable').length)()`), (n) => n > 0)
+  await poll(() => ev(`(()=>document.querySelectorAll('.auto-task-row').length)()`), (n) => n > 0)
   const req1List = JSON.parse(await ev(`(()=>{
-    const rows=[...document.querySelectorAll('.auto-item-clickable')];
+    const rows=[...document.querySelectorAll('.auto-task-row')];
     const tabs=[...document.querySelectorAll('.automations-panel .auto-agent-tab')];
     return JSON.stringify({
       total:rows.length,
       cloud:rows.filter(r=>!!r.querySelector('.auto-source')).length,
-      badges:rows.map(r=>(r.querySelector('.auto-badge')?.textContent||'').trim()),
+      badges:rows.map(r=>r.querySelector('[role="switch"]')?.getAttribute('aria-checked')),
       tabs:tabs.map(t=>(t.textContent||'').trim())
     });
   })()`))
   check('需求1 定时任务列表渲染本机任务（无云端来源标记）', req1List.total === 2 && req1List.cloud === 0, JSON.stringify(req1List))
-  check('需求1 定时任务状态徽标来自磁盘 status', req1List.badges.includes('已暂停') && req1List.badges.includes('运行中'), JSON.stringify(req1List.badges))
+  check('需求1 定时任务启停状态来自磁盘 status', req1List.badges.includes('false') && req1List.badges.includes('true'), JSON.stringify(req1List.badges))
   check('需求1 定时任务按 Agent 分 tab', req1List.tabs.length >= 3 && req1List.tabs.some((t)=>/全部/.test(t)), JSON.stringify(req1List.tabs))
   const req1TraexFilter = JSON.parse(await ev(`(()=>{
     const tab=document.querySelector('.auto-agent-tab[data-agent-id=traex]');
@@ -3690,7 +3701,7 @@ const submitCurrentQuestion = async (requestId) => {
   })()`))
   await sleep(100)
   const req1TraexFiltered = JSON.parse(await ev(`(()=>{
-    const rows=[...document.querySelectorAll('.auto-item-clickable')];
+    const rows=[...document.querySelectorAll('.auto-task-row')];
     return JSON.stringify({
       active:document.querySelector('.auto-agent-tab[data-agent-id=traex]')?.getAttribute('aria-selected')||'',
       count:rows.length,
@@ -3704,7 +3715,7 @@ const submitCurrentQuestion = async (requestId) => {
   // Local task detail: inline fields and visual schedule are editable; save becomes
   // enabled only after a harmless fixture-only name edit. Status may be toggled.
   const req1OpenDetail = await ev(`(()=>{
-    const row=[...document.querySelectorAll('.auto-item-clickable')].find(r=>(r.textContent||'').includes('E2E 每日日报'));
+    const row=[...document.querySelectorAll('.auto-task-row')].find(r=>(r.textContent||'').includes('E2E 每日日报'));
     if(!row)return false; row.click(); return true;
   })()`)
   await poll(() => ev(`(()=>!!document.querySelector('.auto-inline-editor'))()`), Boolean)
@@ -3712,13 +3723,14 @@ const submitCurrentQuestion = async (requestId) => {
     const name=document.querySelector('.auto-name-input');
     const prompt=document.querySelector('.auto-prompt-input');
     const save=document.querySelector('.auto-save');
-    const toggle=document.querySelector('.auto-status-btn');
+    const toggle=document.querySelector('.auto-header-status .ui-switch');
     const del=document.querySelector('.auto-del-btn');
     const scheduler=document.querySelector('.sched-builder');
     return JSON.stringify({
       inline:!!document.querySelector('.auto-inline-editor'),
       back:!!document.querySelector('.auto-back'),
       name:!!name, nameEnabled:!!name&&!name.disabled, promptEnabled:!!prompt&&!prompt.disabled,
+      promptPreview:!!document.querySelector('.auto-prompt-preview')&&!!prompt?.hidden,
       scheduler:!!scheduler, scheduleDisabled:scheduler?[...scheduler.querySelectorAll('input,select,button')].filter(x=>!x.classList.contains('settings-btn')||!x.textContent.includes('高级')).every(x=>x.disabled):true,
       save:!!save, saveDisabled:save?save.disabled:null,
       toggle:!!toggle, toggleDisabled:toggle?toggle.disabled:null,
@@ -3727,7 +3739,7 @@ const submitCurrentQuestion = async (requestId) => {
   })()`))
   check(
     '需求1 本机任务使用可编辑内联表单 + 可视化调度（无旧编辑 modal）',
-    req1OpenDetail && req1Detail.inline && req1Detail.back && req1Detail.nameEnabled && req1Detail.promptEnabled &&
+    req1OpenDetail && req1Detail.inline && req1Detail.back && req1Detail.nameEnabled && req1Detail.promptEnabled && req1Detail.promptPreview &&
       req1Detail.scheduler && req1Detail.save && req1Detail.saveDisabled === true && !req1Detail.modal,
     JSON.stringify(req1Detail)
   )
@@ -3747,9 +3759,9 @@ const submitCurrentQuestion = async (requestId) => {
   check('需求1 本机任务修改后显示未保存状态并可保存', req1DetailEdit.found && req1DetailDirty.saveEnabled && /未保存/.test(req1DetailDirty.dirty), JSON.stringify(req1DetailDirty))
   await ev(`(()=>{const b=document.querySelector('.auto-discard');if(b)b.click();return !!b;})()`)
   await sleep(80)
-  const req1BeforeToggle = await ev(`(()=>{const b=document.querySelector('.auto-status-btn');if(!b||b.disabled)return '';const text=(b.textContent||'').trim();b.click();return text;})()`)
+  const req1BeforeToggle = await ev(`(()=>{const b=document.querySelector('.auto-header-status .ui-switch');if(!b||b.disabled)return '';const checked=b.getAttribute('aria-checked');b.click();return checked;})()`)
   await sleep(180)
-  const req1AfterToggle = await ev(`(()=>{const b=document.querySelector('.auto-status-btn');return b?(b.textContent||'').trim():'';})()`)
+  const req1AfterToggle = await ev(`(()=>{const b=document.querySelector('.auto-header-status .ui-switch');return b?b.getAttribute('aria-checked'):'';})()`)
   check(
     '需求1 本机任务可切换启停且删除按钮可用（未点击）',
     !!req1BeforeToggle && req1BeforeToggle !== req1AfterToggle && req1Detail.deleteDisabled === false,
@@ -4067,34 +4079,30 @@ for (const [name, id] of [['Codex', 'codex'], ['Claude Code', 'claude']]) {
   }
 }
 
-// Installation actions must seed an executable, agent-specific tutorial into
-// the real task composer rather than the old generic request. 需登录的 Agent（TraeX）在
-// CLI 状态列表里显示「继续配置」；未安装的 Agent（Grok）显示「初始化」。
-for (const [name, expected] of [
-  ['TraeX', ['traex_install.sh', 'traecli login status', '旧版 Coco']],
-  ['Grok', ['command -v grok', 'grok update --check --json', 'ACP initialize + session/new']]
-]) {
+// Installed agents reuse their native program and show the remaining login
+// step. Missing agents offer official installation and a copyable fallback.
+for (const name of ['TraeX', 'Grok']) {
   await ev(`(()=>{const b=document.querySelector('.settings-entry');if(b)b.click();return !!b;})()`)
   await poll(() => ev(`(()=>!!document.querySelector('.settings-panel .set-nav'))()`), Boolean)
   await settingsNav('Agent')
-  // 未安装的 Agent（Grok）在 CLI 状态列表直接给「初始化」按钮；需登录/异常的 Agent（TraeX）
-  // 只以 rowlink 呈现，需先点开单 Agent 详情页，其中「登录状态/运行状态」行才有「继续配置/重新配置」。
   await ev(`(()=>{
     const rows=[...document.querySelectorAll('.set-page:not([hidden]) .row')];
     const row=rows.find(r=>(r.querySelector('.r-label')?.textContent||'').includes(${JSON.stringify(name)}));
     if(!row)return false;
-    const inline=[...row.querySelectorAll('button')].find(x=>/初始化|继续配置|重新配置/.test(x.textContent||''));
+    const inline=[...row.querySelectorAll('button')].find(x=>/配置与安装/.test(x.textContent||''));
     if(inline){inline.click();return true;}
     row.click();return true;
   })()`)
-  await poll(() => ev(`document.querySelector('.new-task')?.parentElement?.style.display === 'contents' || !![...document.querySelectorAll('.set-page:not([hidden]) .set-mini-btn')].find(x=>/继续配置|重新配置/.test(x.textContent||''))`), Boolean)
-  // 若刚才只是打开了详情页，再点详情内的「继续配置/重新配置」。
-  await ev(`(()=>{const b=[...document.querySelectorAll('.set-page:not([hidden]) .set-mini-btn')].find(x=>/继续配置|重新配置/.test(x.textContent||''));if(b){b.click();return true;}return false;})()`)
-  const prompt = await poll(
-    () => ev(`window.__markdownInput.text('.new-task .prompt-input')`),
-    (value) => expected.every((text) => value.includes(text))
-  )
-  check('CLI 初始化输入框包含 ' + name + ' 完整官方教程', expected.every((text) => prompt.includes(text)), prompt.slice(0, 180))
+  await poll(() => ev(`!!document.querySelector('.set-page:not([hidden]) .deepseek-setup')`), Boolean)
+  if (name === 'TraeX') {
+    const login = await ev(`(()=>{const page=document.querySelector('.set-page:not([hidden])');return {reused:page.textContent.includes('已复用本机程序'),automatic:[...page.querySelectorAll('button')].some(button=>button.textContent==='自动登录'),sso:[...page.querySelectorAll('button')].some(button=>button.textContent==='SSO 登录'),login:[...page.querySelectorAll('button')].some(button=>button.textContent==='一键登录'&&!button.disabled),keys:page.querySelectorAll('input[type="password"]').length};})()`)
+    check('TraeX 复用本机程序并提供自动登录与 SSO 登录', login.reused && login.automatic && login.sso && login.login && login.keys === 0, JSON.stringify(login))
+  } else {
+    const install = await ev(`(()=>{const page=document.querySelector('.set-page:not([hidden])');const fallback=page.querySelector('.mcode-prompt-toggle');fallback?.click();return {install:[...page.querySelectorAll('button')].some(button=>button.textContent==='一键安装'&&!button.disabled),fallback:!!fallback};})()`)
+    const expected = ['command -v grok', 'grok update --check --json', 'ACP initialize + session/new']
+    const prompt = await poll(() => ev(`document.querySelector('textarea[aria-label="Grok 完整安装提示词"]')?.value||''`), value => expected.every(text => value.includes(text)))
+    check('Grok 提供一键安装和无需已有 Agent 的完整安装提示词', install.install && install.fallback && expected.every(text => prompt.includes(text)), JSON.stringify(install))
+  }
 }
 
 } // full verification

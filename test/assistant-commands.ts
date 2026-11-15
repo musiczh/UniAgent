@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events'
 import { AssistantCommands } from '../src/main/assistant/commands'
 import type { Orchestrator } from '../src/main/orchestrator'
 import type { Session, SessionConfig } from '../src/shared/types'
+import type { AssistantConversationSelection } from '../src/shared/assistantConversation'
 
 const snapshot = { assistantId: 'personal' as const, soul: '', soulRevision: 1, workingRules: '', workingRulesRevision: 1 }
 const previousConfig: SessionConfig = {
@@ -20,7 +21,8 @@ let defaults: SessionConfig = {
   agentId: 'claude', model: 'default-model', permissionMode: 'ask', workdir: '/default', projectId: 'default-project', assistantSnapshot: { ...snapshot, soulRevision: 2 }
 }
 const currentSnapshot = { ...snapshot, soulRevision: 3 }
-const defaultConfig = async () => { defaultsRead++; return defaults }
+const choices: Array<AssistantConversationSelection | undefined> = []
+const defaultConfig = async (selection?: AssistantConversationSelection) => { defaultsRead++; choices.push(selection); return defaults }
 const drafts: Array<{ previousId?: string; command?: string }> = []
 const fake = Object.assign(new EventEmitter(), {
   assistantCommandSessions: new Set<string>(), getSessionById: () => session, getQueue: () => [],
@@ -59,4 +61,13 @@ await assert.rejects(unavailable.execute('s_a','new','r4'), /default_agent_unava
 assert.equal(created, beforeFailure, 'invalid defaults cannot create a replacement session')
 assert.equal(invalidated, beforeInvalidation, 'failed configuration resolution must not invalidate the current conversation')
 assert.equal(fake.assistantCommandSessions.size, 0, 'failed commands release the session lock')
+const selection = { agentId: 'codex', model: 'chosen', effort: 'low' as const }
+const beforeSelection = defaultsRead
+await Promise.all([commands.execute('s_a', 'new', 'selected', selection), commands.execute('s_a', 'new', 'selected', selection)])
+assert.deepEqual(choices.at(-1), selection, 'one-off choices reach the default configuration boundary')
+assert.equal(defaultsRead, beforeSelection + 1, 'retrying a selected creation remains idempotent')
+const beforeInvalid = { defaultsRead, created, invalidated }
+await assert.rejects(commands.execute('s_a', 'clear', 'invalid-clear', selection), /不支持覆盖参数/)
+await assert.rejects(commands.execute('s_a', 'new', 'invalid-new', { agentId: 'codex', workdir: '/injected' } as any), /参数无效/)
+assert.deepEqual({ defaultsRead, created, invalidated }, beforeInvalid, 'invalid selections cannot invalidate or replace the original conversation')
 console.log('assistant commands: defaults, channel ownership, clear, idempotency and failure handling passed')

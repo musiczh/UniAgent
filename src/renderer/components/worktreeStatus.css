@@ -1,0 +1,17 @@
+.worktree-status-badge { font:inherit; font-size:11px; border:0; cursor:pointer; -webkit-app-region:no-drag; }
+.worktree-status-badge.is-pending { color:var(--amber); background:var(--orange-soft); }
+.worktree-status-badge.is-clean { color:var(--text-dim); background:var(--bg-elev2); }
+.worktree-status-badge.is-compact { margin:0 12px 10px; padding:3px 7px; align-self:flex-start; }
+.worktree-status-badge:focus-visible { outline:2px solid var(--blue); outline-offset:3px; }
+.worktree-status-merge { color:var(--blue); border-color:var(--blue); }
+.worktree-status-merge:disabled { opacity:.4; cursor:default; }
+.worktree-status-fields { display:grid; grid-template-columns:80px minmax(0,1fr); gap:12px; font-size:12px; line-height:1.8; }
+.worktree-status-fields dt { color:var(--text-dim); }
+.worktree-status-fields dd { margin:0; white-space:pre-wrap; overflow-wrap:anywhere; user-select:text; }
+.worktree-status-commits { border-top:1px solid var(--border-soft); margin-top:18px; padding-top:16px; font-size:12px; }
+.worktree-status-commits h3 { margin:0 0 10px; font-size:12px; }
+.worktree-status-commits ol { list-style:none; padding:0; margin:0; }
+.worktree-status-commits li { display:flex; gap:10px; padding:7px 0; line-height:1.7; }
+.worktree-status-commits code { flex:none; font-size:11px; color:var(--text-dim); }
+.worktree-status-commits li span { min-width:0; overflow-wrap:anywhere; user-select:text; }
+.worktree-status-commits p { color:var(--text-faint); line-height:1.8; }

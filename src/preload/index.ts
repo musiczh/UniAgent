@@ -1,5 +1,8 @@
+import { QODER_IPC } from '../shared/qoder'
 import { CLAUDE_SOURCE_IPC, MODEL_CREDENTIAL_IPC, type ModelSourceClient, type ReusableCredential, type CredentialSelection } from '../shared/claudeSources'
+import { FORK_IPC, type ForkRequest, type ForkPreflight, type ForkJob } from '../shared/sessionFork'
 import { ASSISTANT_IPC, type AssistantDetail, type AssistantInput, type DocumentEdit, type AssistantDocumentType, type DocumentRevision, type AssistantDocument } from '../shared/assistant'
+import type { AssistantConversationSelection } from '../shared/assistantConversation'
 import { REQUIREMENT_IPC, type Requirement, type RequirementInput, type RequirementPatch } from '../shared/requirementTypes'
 import { contextBridge, ipcRenderer } from 'electron'
 import { COMMENT_IPC, type CommentSelection, type CommentModel, type CommentThread } from '../shared/comments'
@@ -12,6 +15,17 @@ import { CODEX_SOURCE_IPC, type CodexSourceInput, type CodexSourceModelQueryInpu
 import type { AgentQuotaSnapshot } from '../shared/agentQuota'
 import { LOCAL_MODEL_IPC, type LocalModelsSnapshot } from '../shared/localModels'
 import { TEAM_IPC, type TeamCatalog, type TeamCreateProjectInput, type TeamDefinition, type TeamDefinitionInput, type TeamProject, type TeamArtifact } from '../shared/teamTypes'
+import { TASK_IPC, type TaskDecision, type TaskDecisionAnswer } from '../shared/taskDecisions'
+import { WORKTREE_ARCHIVE_IPC, type WorktreeArchiveAction, type WorktreeArchiveReview } from '../shared/worktreeArchive'
+import type { TaskDecisionInput, TaskLifecycleSnapshot } from '../shared/taskLifecycle'
+import type { TaskBoardQuery, TaskBoardSnapshot } from '../shared/taskBoard'
+import type { TaskTitleResult } from '../shared/taskTitle'
+import { ROUTER_IPC, type RouterConfig, type RouterInput, type RouterRequest, type RouterResolution, type RouterSnapshot, type GlobalMemoryRequest, type GlobalMemoryItem } from '../shared/router'
+import { PROJECT_MEMORY_IPC, PROJECT_MEMORY_CHANGED, type ProjectMemoryRequest, type ProjectMemoryPage } from '../shared/projectMemory'
+import { ROUTER_REVIEW_IPC, type RouterFeedbackInput, type RouterReviewDetail, type RouterReviewQuery, type RouterReviewPage, type RouterReviewTarget, type RouterReviewDeletionItem, type RouterReviewDeletionPlan, type RouterReviewDeleteResult } from '../shared/routerReview'
+import type { TaskTitleGenerationConfig } from '../shared/types'
+import { SESSION_WORKTREE_STATUS_IPC, type SessionWorktreeStatus } from '../shared/sessionWorktreeStatus'
+import { TASK_GENERATION_IPC, type TaskGenerationConversation } from '../shared/taskGeneration'
 import {
   IPC,
   type AgentDef,
@@ -45,6 +59,7 @@ import {
   type Project,
   type ProjectGitInfo,
   type ProjectWorktree,
+  type SessionDeletionPreview,
   type ProjectInput,
   type PickedFile,
   type AgentPref,
@@ -72,6 +87,7 @@ import {
   type UAEvent
 } from '../shared/types'
 import type { AgentsStrategy, CapabilityInventoryManageRequest, CapabilityInventoryManageResult, CapabilityAgentId, CapabilityExecuteRequest, CapabilityInventoryDetail, CapabilityInventoryResult, CapabilityInventorySyncPreparation, CapabilityInventorySyncRequest, CapabilityJobSnapshot, CapabilityMarkdownPreview, CapabilityPlanRequest, CapabilityPluginActionRequest, CapabilityPluginActionResult, CapabilityScanRequest, CapabilityScanResult, CapabilitySyncJob, CapabilitySyncPlan } from '../shared/capabilitySync'
+import type { SessionInfo } from '../shared/sessionInfo'
 import type {
   CollaborationModeId,
   NativeCapabilityRequest,
@@ -220,6 +236,7 @@ const api = {
     return () => ipcRenderer.removeListener(ASSISTANT_IPC.manageChanged,listener)
   },
   getAssistantWorkspace: (): Promise<Project> => invoke(ASSISTANT_IPC.workspace),
+  openAssistantAppConversation: (): Promise<Session> => invoke(ASSISTANT_IPC.openAppConversation),
   getAssistantFeishu: (): Promise<import('../shared/assistant').AssistantFeishuState> => invoke(ASSISTANT_IPC.feishu),
   getAssistantWeixin: (): Promise<AssistantWeixinState> => invoke(WEIXIN_IPC.state),
   loginAssistantWeixin: (): Promise<AssistantWeixinState> => invoke(WEIXIN_IPC.login),
@@ -244,11 +261,39 @@ const api = {
   savePersonalAssistant: (input: AssistantInput, edits: DocumentEdit[]): Promise<AssistantDetail> => invoke(ASSISTANT_IPC.save, input, edits),
   assistantVersions: (type: AssistantDocumentType): Promise<DocumentRevision[]> => invoke(ASSISTANT_IPC.versions, type),
   rollbackAssistantDocument: (type: AssistantDocumentType, revision: number, expectedRevision: number): Promise<AssistantDocument> => invoke(ASSISTANT_IPC.rollback, type, revision, expectedRevision),
-  assistantCommand: (sessionId: string, command: 'new' | 'clear', requestId: string): Promise<Session> => invoke(ASSISTANT_IPC.command, sessionId, command, requestId),
+  assistantCommand: (sessionId: string, command: 'new' | 'clear', requestId: string, selection?: AssistantConversationSelection): Promise<Session> => invoke(ASSISTANT_IPC.command, sessionId, command, requestId, selection),
   onAssistantChanged: (callback: () => void): (() => void) => {
     const listener = () => callback()
     ipcRenderer.on(ASSISTANT_IPC.changed, listener)
     return () => ipcRenderer.removeListener(ASSISTANT_IPC.changed, listener)
+  },
+  getRouterSnapshot: (): Promise<RouterSnapshot> => invoke(ROUTER_IPC.snapshot),
+  getRouterDraftImages: (): Promise<PickedFile[]> => invoke(ROUTER_IPC.draftImages, 'read'),
+  saveRouterDraftImages: (images: PickedFile[], append = false): Promise<void> => invoke(ROUTER_IPC.draftImages, append ? 'append' : 'save', images),
+  clearRouterDraftImages: (images: Attachment[]): Promise<void> => invoke(ROUTER_IPC.draftImages, 'submitted', images),
+  listRouterReviews: (query?: RouterReviewQuery): Promise<RouterReviewPage> => invoke(ROUTER_REVIEW_IPC.list, query),
+  getRouterReviewDeletion: (ids?: string[]): Promise<RouterReviewDeletionPlan> => invoke(ROUTER_REVIEW_IPC.deletion, ids),
+  deleteRouterReviews: (items: RouterReviewDeletionItem[]): Promise<RouterReviewDeleteResult> => invoke(ROUTER_REVIEW_IPC.delete, items),
+  getRouterReview: (id: string, attemptId?: string, includeTrace = false): Promise<RouterReviewDetail> => invoke(ROUTER_REVIEW_IPC.detail, id, attemptId, includeTrace),
+  saveRouterFeedback: (input: RouterFeedbackInput): Promise<RouterReviewDetail> => invoke(ROUTER_REVIEW_IPC.save, input),
+  getRouterReviewTargets: (): Promise<RouterReviewTarget[]> => invoke(ROUTER_REVIEW_IPC.targets),
+  dismissRouterFeedback: (id: string, attemptId: string): Promise<void> => invoke(ROUTER_REVIEW_IPC.dismiss, id, attemptId),
+  copyRouterReviewPrompt: (id?: string): Promise<{ directory: string; count: number }> => invoke(ROUTER_REVIEW_IPC.copy, id),
+  saveRouterConfig: (config: RouterConfig, version: number): Promise<RouterSnapshot> => invoke(ROUTER_IPC.saveConfig, config, version),
+  openRouter: (): Promise<Session | undefined> => invoke(ROUTER_IPC.open),
+  newRouterSession: (sessionId: string): Promise<Session> => invoke(ROUTER_IPC.newSession,sessionId),
+  submitRouterInput: (input: RouterInput): Promise<RouterRequest> => invoke(ROUTER_IPC.submit,input),
+  resolveRouterInput: (input: RouterResolution): Promise<RouterRequest> => invoke(ROUTER_IPC.resolve,input),
+  cancelRouterInput: (id: string,version:number): Promise<RouterRequest> => invoke(ROUTER_IPC.cancel,id,version),
+  interruptRouter: (): Promise<void> => invoke(ROUTER_IPC.interrupt),
+  globalMemory: (input: GlobalMemoryRequest): Promise<GlobalMemoryItem[]> => invoke(ROUTER_IPC.memory,input),
+  projectMemory: (projectId: string, input: ProjectMemoryRequest): Promise<ProjectMemoryPage> => invoke(PROJECT_MEMORY_IPC,projectId,input),
+  onProjectMemoryChanged: (callback:()=>void): (()=>void) => {
+    const listener=()=>callback();ipcRenderer.on(PROJECT_MEMORY_CHANGED,listener)
+    return ()=>ipcRenderer.removeListener(PROJECT_MEMORY_CHANGED,listener)
+  },
+  onRouterChanged: (callback:()=>void): (()=>void) => {
+    const listener=()=>callback();ipcRenderer.on(ROUTER_IPC.changed,listener);return()=>ipcRenderer.removeListener(ROUTER_IPC.changed,listener)
   },
   createSession: (
     config: SessionConfig,
@@ -291,6 +336,8 @@ const api = {
     invoke(IPC.setQueueEditing, sessionId, itemId),
   interrupt: (sessionId: string): Promise<void> => invoke(IPC.interrupt, sessionId),
   listSessions: (): Promise<Session[]> => invoke(IPC.listSessions),
+  testTaskTitleGeneration: (input: { requestId: string; config: TaskTitleGenerationConfig; prompt: string }): Promise<TaskTitleResult> => invoke(IPC.testTaskTitleGeneration, input),
+  cancelTaskTitleGenerationTest: (requestId: string): Promise<void> => invoke(IPC.cancelTaskTitleGenerationTest, requestId),
   listQueues: (): Promise<Record<string, QueueItem[]>> => invoke(IPC.listQueues),
   getEvents: (sessionId: string): Promise<UAEvent[]> =>
     invoke(IPC.getEvents, sessionId),
@@ -298,17 +345,34 @@ const api = {
     invoke(IPC.getSessionForkPoints, sessionId),
   getSessionRuntimeState: (sessionId: string, includeEvents = true): Promise<SessionRuntimeState> =>
     invoke(IPC.getSessionRuntimeState, sessionId, includeEvents),
+  getSessionInfo: (sessionId: string): Promise<SessionInfo> => invoke(IPC.getSessionInfo, sessionId),
+  revealSessionInfoFile: (sessionId: string, fieldId: string): Promise<void> =>
+    invoke(IPC.revealSessionInfoFile, sessionId, fieldId),
   refreshNativeSession: (sessionId: string): Promise<NativeSessionRefreshResult> =>
     invoke(IPC.refreshNativeSession, sessionId),
   enableToolSession: (sessionId: string): Promise<Session> =>
     invoke(IPC.enableToolSession, sessionId),
   // G2-4: archive / unarchive / permanently delete a session.
+  getWorktreeArchiveReviews: (): Promise<WorktreeArchiveReview[]> => invoke(WORKTREE_ARCHIVE_IPC.list),
+  actWorktreeArchive: (input: WorktreeArchiveAction): Promise<void> => invoke(WORKTREE_ARCHIVE_IPC.act, input),
+  onWorktreeArchiveReviews: (callback: (reviews: WorktreeArchiveReview[]) => void): (() => void) => {
+    const listener = (_event: unknown, reviews: WorktreeArchiveReview[]) => callback(reviews)
+    ipcRenderer.on(WORKTREE_ARCHIVE_IPC.changed, listener)
+    return () => ipcRenderer.removeListener(WORKTREE_ARCHIVE_IPC.changed, listener)
+  },
   archiveSession: (sessionId: string): Promise<Session | undefined> =>
     invoke(IPC.archiveSession, sessionId),
   unarchiveSession: (sessionId: string): Promise<Session | undefined> =>
     invoke(IPC.unarchiveSession, sessionId),
-  deleteSession: (sessionId: string): Promise<void> =>
-    invoke(IPC.deleteSession, sessionId),
+  previewSessionDeletion: (sessionId: string, requestId?: string): Promise<SessionDeletionPreview> => invoke(IPC.previewSessionDeletion, sessionId, requestId),
+  cancelSessionDeletionPreview: (requestId: string): Promise<void> => invoke(IPC.cancelSessionDeletionPreview, requestId),
+  onSessionDeletionChecking: (cb: (value: { requestId: string; title: string }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, value: { requestId: string; title: string }) => cb(value)
+    ipcRenderer.on(IPC.sessionDeletionChecking, handler)
+    return () => ipcRenderer.removeListener(IPC.sessionDeletionChecking, handler)
+  },
+  deleteSession: (sessionId: string, confirmationId?: string): Promise<void> =>
+    invoke(IPC.deleteSession, sessionId, confirmationId),
   // 需求4: rename + pin/unpin a session.
   renameSession: (sessionId: string, title: string): Promise<Session | undefined> =>
     invoke(IPC.renameSession, sessionId, title),
@@ -321,6 +385,15 @@ const api = {
     invoke(IPC.updateSessionConfig, sessionId, patch),
   respondRequest: (sessionId: string, requestId: string, answer: unknown): Promise<void> =>
     invoke(IPC.respondRequest, sessionId, requestId, answer),
+  getTaskDecisions: (sessionId: string): Promise<TaskDecision[]> => invoke(TASK_IPC.decisions, sessionId),
+  resolveTaskDecision: (sessionId: string, input: TaskDecisionAnswer): Promise<void> => invoke(TASK_IPC.resolve, sessionId, input),
+  getTaskState: (sessionId: string): Promise<TaskLifecycleSnapshot> => invoke(TASK_IPC.state, sessionId),
+  decideTask: (sessionId: string, input: TaskDecisionInput): Promise<TaskLifecycleSnapshot> => invoke(TASK_IPC.decide, sessionId, input),
+  getTaskBoard: (query?: TaskBoardQuery): Promise<TaskBoardSnapshot> => invoke(TASK_IPC.board, query),
+  onTaskBoardChanged: (cb: () => void): (() => void) => {
+    ipcRenderer.on(TASK_IPC.changed, cb)
+    return () => ipcRenderer.removeListener(TASK_IPC.changed, cb)
+  },
 
   // Doc2: history
   listAgentHistory: (agentId: string): Promise<SessionSummary[]> =>
@@ -372,6 +445,13 @@ const api = {
     point?: HistoryForkPoint
   ): Promise<Session | undefined> =>
     invoke(IPC.forkCrossSession, sourceAgentId, nativeId, targetAgentId, point),
+  preflightFork: (request: ForkRequest): Promise<ForkPreflight> => invoke(FORK_IPC.preflight, request),
+  startFork: (planId: string): Promise<ForkJob> => invoke(FORK_IPC.start, planId),
+  getForkJob: (id: string): Promise<ForkJob | undefined> => invoke(FORK_IPC.get, id),
+  listForkJobs: (): Promise<ForkJob[]> => invoke(FORK_IPC.list),
+  cancelForkJob: (id: string): Promise<ForkJob> => invoke(FORK_IPC.cancel, id),
+  retryForkJob: (id: string, allowMissing = false, targetModel?: string): Promise<ForkJob> => invoke(FORK_IPC.retry, id, allowMissing, targetModel),
+  revealForkArchive: (id: string): Promise<void> => invoke(FORK_IPC.reveal, id),
 
   // Doc10: fetch before/after contents for the side-by-side review panel.
   reviewGetFilePair: (req: ReviewFilePairReq): Promise<ReviewFilePair> =>
@@ -423,10 +503,10 @@ const api = {
   capabilitySyncPreview: (scanId: string, itemId: 'global-instructions:agents', strategy: AgentsStrategy): Promise<CapabilityMarkdownPreview> => invoke(IPC.capabilitySyncPreview, { scanId, itemId, strategy }),
   onCapabilitySyncProgress: (cb: (job: CapabilitySyncJob) => void): (() => void) => { const h = (_e: unknown, job: CapabilitySyncJob): void => cb(job); ipcRenderer.on(IPC.capabilitySyncProgress, h); return () => ipcRenderer.removeListener(IPC.capabilitySyncProgress, h) },
   capabilityInventoryList: (): Promise<CapabilityInventoryResult> => invoke(IPC.capabilityInventoryList),
-  capabilityInventoryDetail: (id: string): Promise<CapabilityInventoryDetail> => invoke(IPC.capabilityInventoryDetail, { id }),
+  capabilityInventoryDetail: (id: string, loadMcpTools = false): Promise<CapabilityInventoryDetail> => invoke(IPC.capabilityInventoryDetail, { id, ...(loadMcpTools ? { loadMcpTools: true } : {}) }),
   capabilityInventoryManage: (request: CapabilityInventoryManageRequest): Promise<CapabilityInventoryManageResult> => invoke(IPC.capabilityInventoryManage, request),
   capabilityInventoryPrepareSync: (request: CapabilityInventorySyncRequest): Promise<CapabilityInventorySyncPreparation> => invoke(IPC.capabilityInventoryPrepareSync, request),
-  capabilityMutationPlanRemove: (target: 'codex' | 'traex', selections: string[]): Promise<CapabilitySyncPlan> => invoke(IPC.capabilityMutationPlanRemove, { target, selections }),
+  capabilityMutationPlanRemove: (target: 'codex' | 'traex' | 'qoder', selections: string[]): Promise<CapabilitySyncPlan> => invoke(IPC.capabilityMutationPlanRemove, { target, selections }),
   capabilityPluginAction: (request: CapabilityPluginActionRequest): Promise<CapabilityPluginActionResult> => invoke(IPC.capabilityPluginAction, request),
   capabilitySkillLinkRemove: (id: string, agentId: CapabilityAgentId, expectedFingerprint?: string): Promise<{ agentId?: CapabilityAgentId; name: string; affectedAgents?: CapabilityAgentId[] }> => invoke(IPC.capabilitySkillLinkRemove, { id, agentId, ...(expectedFingerprint ? { expectedFingerprint } : {}) }),
   onCapabilityInventoryChanged: (cb: () => void): (() => void) => { const h = (): void => cb(); ipcRenderer.on(IPC.capabilityInventoryChanged, h); return () => ipcRenderer.removeListener(IPC.capabilityInventoryChanged, h) },
@@ -444,6 +524,10 @@ const api = {
   deleteRole: (id: string): Promise<AgentRoleCatalogEntry[]> =>
     invoke(IPC.deleteRole, id),
   listRequirements: (): Promise<Requirement[]> => invoke(REQUIREMENT_IPC.list),
+  readRequirementOverview: (id: string, documentId?: string, query?: import('../shared/requirementTypes').RequirementOverviewQuery): Promise<import('../shared/requirementTypes').RequirementOverview> => invoke(REQUIREMENT_IPC.overview, id, documentId, query),
+  requirementCuration: (id: string, action?: 'read' | 'retry' | 'retryFailed' | 'pause' | 'organize'): Promise<import('../shared/requirementTypes').RequirementCurationState> => invoke(REQUIREMENT_IPC.curation, id, action),
+  requirementCurationConversation: (id: string): Promise<import('../shared/requirementTypes').RequirementCurationConversation> => invoke(REQUIREMENT_IPC.curationConversation, id),
+  requirementStorage: (id: string, token?: string): Promise<import('../shared/requirementTypes').RequirementStoragePreview> => invoke(REQUIREMENT_IPC.storage, id, token),
   createRequirement: (input: RequirementInput): Promise<Requirement> => invoke(REQUIREMENT_IPC.create, input),
   updateRequirement: (id: string, patch: RequirementPatch): Promise<Requirement> => invoke(REQUIREMENT_IPC.update, id, patch),
   openRequirementDir: (id: string): Promise<void> => invoke(REQUIREMENT_IPC.openDir, id),
@@ -455,6 +539,13 @@ const api = {
   listProjects: (): Promise<Project[]> => invoke(IPC.listProjects),
   getProjectGitInfo: (projectId: string, requestId?: string): Promise<ProjectGitInfo> => invoke(IPC.getProjectGitInfo, projectId, requestId),
   listProjectWorktrees: (projectId: string): Promise<ProjectWorktree[]> => invoke(IPC.listProjectWorktrees, projectId),
+  getSessionWorktreeStatus: (sessionId: string, refresh?: boolean): Promise<SessionWorktreeStatus | null> => invoke(SESSION_WORKTREE_STATUS_IPC, sessionId, refresh),
+  getTaskGenerationConversation: (taskId: string): Promise<TaskGenerationConversation> => invoke(TASK_GENERATION_IPC.read, taskId),
+  onTaskGenerationChanged: (cb: (event: { taskId: string }) => void): (() => void) => {
+    const handler = (_event: unknown, value: { taskId: string }): void => cb(value)
+    ipcRenderer.on(TASK_GENERATION_IPC.changed, handler)
+    return () => { ipcRenderer.removeListener(TASK_GENERATION_IPC.changed, handler) }
+  },
   removeProjectWorktree: (projectId: string, path: string): Promise<ProjectWorktree[]> => invoke(IPC.removeProjectWorktree, projectId, path),
   openProjectWorktree: (projectId: string, path: string): Promise<void> => invoke(IPC.openProjectWorktree, projectId, path),
   retryWorktreeTask: (sessionId: string): Promise<void> => invoke(IPC.retryWorktreeTask, sessionId),
@@ -529,15 +620,21 @@ const api = {
   // 选中即评论 / 详情: ephemeral detail-branch chat explaining a text selection.
   listComments: (id: string): Promise<CommentThread[]> => invoke(COMMENT_IPC.list, id),
   createComment: (id: string, selection: CommentSelection): Promise<CommentThread> => invoke(COMMENT_IPC.create, id, selection),
-  sendComment: (owner: string, id: string, text: string, model?: CommentModel): Promise<void> => invoke(COMMENT_IPC.send, owner, id, text, model),
+  sendComment: (owner: string, id: string, text: string, model?: CommentModel, clientTurnKey?: string): Promise<void> => invoke(COMMENT_IPC.send, owner, id, text, model, clientTurnKey),
   stopComment: (owner: string, id: string): Promise<void> => invoke(COMMENT_IPC.stop, owner, id),
+  deleteComment: (owner: string, id: string): Promise<void> => invoke(COMMENT_IPC.remove, owner, id),
   respondComment: (owner: string, id: string, request: string, answer: unknown): Promise<void> => invoke(COMMENT_IPC.respond, owner, id, request, answer),
   onCommentChanged: (cb: (thread: CommentThread) => void): (() => void) => {
     const handler = (_e: unknown, thread: CommentThread): void => cb(thread)
     ipcRenderer.on(COMMENT_IPC.changed, handler)
     return () => ipcRenderer.removeListener(COMMENT_IPC.changed, handler)
   },
-  getDetailWindow: (): Promise<{ sessionId: string; quote: string; selectedMessageText: string; nonce: number }> => invoke('detailWindow:action', 'initial'),
+  onCommentRemoved: (cb: (reference: { sessionId: string; id: string }) => void): (() => void) => {
+    const handler = (_e: unknown, reference: { sessionId: string; id: string }): void => cb(reference)
+    ipcRenderer.on(COMMENT_IPC.removed, handler)
+    return () => ipcRenderer.removeListener(COMMENT_IPC.removed, handler)
+  },
+  getDetailWindow: (): Promise<{ sessionId: string; quote: string; selectedMessageText: string; nonce: number; theme?: AppSettings['theme'] }> => invoke('detailWindow:action', 'initial'),
   onDetailPromoted: (cb: (result: { sessionId: string; kind: 'side' | 'session'; session?: Session }) => void): (() => void) => {
     const handler = (_e: unknown, result: Parameters<typeof cb>[0]): void => cb(result)
     ipcRenderer.on('detailWindow:promoted', handler)
@@ -545,8 +642,8 @@ const api = {
   },
   explainDetailSelection: (sessionId: string, context: import('../shared/detailQuickChat').DetailExplanationContext): Promise<void> =>
     invoke(IPC.detailExplain, sessionId, context),
-  sendDetailMessage: (sessionId: string, prompt: string, attachments?: Attachment[]): Promise<void> =>
-    invoke(IPC.detailSend, sessionId, prompt, attachments),
+  sendDetailMessage: (sessionId: string, prompt: string, attachments?: Attachment[], bubble?: TurnBubbleInput): Promise<void> =>
+    invoke(IPC.detailSend, sessionId, prompt, attachments, bubble),
   interruptDetail: (sessionId: string): Promise<void> => invoke(IPC.detailInterrupt, sessionId),
   getDetailEvents: (sessionId: string): Promise<UAEvent[]> => invoke(IPC.detailGetEvents, sessionId),
   getDetailStatus: (sessionId: string): Promise<'idle' | 'running'> => invoke(IPC.detailGetStatus, sessionId),
@@ -594,6 +691,9 @@ const api = {
     invoke(IPC.deleteAutomation, task),
 
   // Doc5 T2: per-agent last-choice preferences
+  listQoderByok: () => ipcRenderer.invoke(QODER_IPC.byokList),
+  saveQoderByok: (input: import('../shared/qoder').QoderByokInput) => ipcRenderer.invoke(QODER_IPC.byokSave, input),
+  deleteQoderByok: (source: Pick<import('../shared/qoder').QoderByokSource, 'id' | 'kind'>) => ipcRenderer.invoke(QODER_IPC.byokDelete, source),
   getPrefs: (): Promise<PrefsData> => invoke(IPC.getPrefs),
   setPrefs: (agentId: string, pref: AgentPref): Promise<PrefsData> =>
     invoke(IPC.setPrefs, agentId, pref),
@@ -603,6 +703,8 @@ const api = {
     return () => { ipcRenderer.removeListener(IPC.prefsChanged, listener) }
   },
   getAppSettings: (): Promise<AppSettings> => invoke(IPC.getAppSettings),
+  getRecoveryErrors: (): Promise<import('../shared/sessionRecovery').RecoveryErrorType[]> => invoke(IPC.getRecoveryErrors),
+  cancelRecovery: (sessionId: string): Promise<boolean> => invoke(IPC.cancelRecovery, sessionId),
   getLocalModels: (): Promise<LocalModelsSnapshot> => invoke(LOCAL_MODEL_IPC.get),
   downloadLocalModel: (modelId: string): Promise<LocalModelsSnapshot> => invoke(LOCAL_MODEL_IPC.download, modelId),
   deployLocalModel: (modelId: string): Promise<LocalModelsSnapshot> => invoke(LOCAL_MODEL_IPC.deploy, modelId),
@@ -813,16 +915,23 @@ const api = {
     ipcRenderer.on(IPC.appNotificationOpenSession, h)
     return () => ipcRenderer.removeListener(IPC.appNotificationOpenSession, h)
   },
-  setBadgeVisibleSession: (sessionId: string | null): Promise<void> => invoke(IPC.sessionBadgeVisible, sessionId)
+  setBadgeVisibleSession: (sessionId: string | null): Promise<void> => invoke(IPC.sessionBadgeVisible, sessionId),
+  getSessionAttention: (legacy: import('../shared/sessionAttention').LegacySessionAttention): Promise<import('../shared/sessionAttention').SessionAttentionSnapshot> => invoke(IPC.sessionAttentionGet, legacy),
+  onSessionAttentionChanged: (cb: (snapshot: import('../shared/sessionAttention').SessionAttentionSnapshot) => void): (() => void) => {
+    const h = (_e: unknown, snapshot: import('../shared/sessionAttention').SessionAttentionSnapshot): void => cb(snapshot)
+    ipcRenderer.on(IPC.sessionAttentionChanged, h)
+    return () => ipcRenderer.removeListener(IPC.sessionAttentionChanged, h)
+  }
 }
 
 // The detached reader can only operate its bound explanation branch.
 const detailApi = {
   homeDir: api.homeDir,
   getDetailWindow: api.getDetailWindow,
+  onUniAgentManagementChanged: api.onUniAgentManagementChanged,
   onDetailEvent: api.onDetailEvent, onDetailStatus: api.onDetailStatus,
   explainDetailSelection: () => invoke('detailWindow:action', 'explain'),
-  sendDetailMessage: (_id: string, text: string) => invoke('detailWindow:action', 'send', text),
+  sendDetailMessage: (_id: string, text: string, _attachments?: Attachment[], bubble?: TurnBubbleInput) => invoke('detailWindow:action', 'send', text, bubble?.clientTurnKey),
   interruptDetail: () => invoke('detailWindow:action', 'interrupt'),
   getDetailEvents: () => invoke('detailWindow:action', 'events'),
   getDetailStatus: () => invoke('detailWindow:action', 'status'),

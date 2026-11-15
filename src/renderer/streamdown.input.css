@@ -1,0 +1,14 @@
+/* Streamdown's utilities only. App-wide resets are deliberately excluded. */
+@import 'tailwindcss/theme.css';
+@import 'tailwindcss/utilities.css' source(none);
+@source '../../node_modules/streamdown/dist/*.js';
+@source '../../node_modules/@streamdown/code/dist/*.js';
+@theme inline {
+  --color-background: var(--bg);
+  --color-foreground: var(--text);
+  --color-muted: var(--bg-elev2);
+  --color-muted-foreground: var(--text-dim);
+  --color-border: var(--border);
+  --color-sidebar: var(--bg-elev);
+  --color-primary: var(--blue);
+}

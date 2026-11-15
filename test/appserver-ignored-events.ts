@@ -237,7 +237,7 @@ try {
       },
       {
         type: 'turn_completed', state: 'failed',
-        payload: { turnId: 'turn-1' }
+        payload: { turnId: 'turn-1', recoveryDelivery: 'accepted' }
       }
     ],
     'hooks enter the call chain, retries become inline status state, and failed completion does not duplicate its error'

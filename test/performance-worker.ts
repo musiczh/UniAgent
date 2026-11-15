@@ -26,7 +26,9 @@ async function rows(stream: string): Promise<any[]> {
 try {
   const entry = join(root, 'performanceWorker.mjs')
   await build({ entryPoints: ['src/main/performanceWorker.ts'], bundle: true, platform: 'node', format: 'esm', packages: 'external', outfile: entry })
-  worker = new Worker(pathToFileURL(entry), { workerData: { root: join(root, 'logs'), pid: process.pid, appVersion: 'worker-test' } })
+  worker = new Worker(pathToFileURL(entry), { workerData: { root: join(root, 'logs'), pid: process.pid, appVersion: 'worker-test', cloudMonitor: true } })
+  const cloudSamples: any[] = []
+  worker.on('message', message => { if (message.kind === 'cloud_sample') cloudSamples.push(message) })
   const failure: Error[] = []
   worker.on('error', error => failure.push(error))
   worker.postMessage({ kind: 'main_sample', data: { heapBytes: 1024, processes: [{ pid: process.pid, type: 'Browser' }] } })
@@ -36,9 +38,15 @@ try {
   assert.equal(snapshot.data.tree.processes.find((row: any) => row.pid === process.pid).type, 'Browser')
   assert.equal(snapshot.data.mainHeartbeatAgeMs < 12_000, true)
   assert.equal((await rows('app')).find(row => row.kind === 'startup').data.windowShownMs, 1, 'startup timing records remain compatible')
+  const cloud = await until(async () => cloudSamples.find(row => row.code === 'resource_sample'), 'safe cloud performance sample')
+  assert.equal(cloud.data.heapBytes, 1024)
+  assert.equal(Object.values(cloud.data).every(value => typeof value === 'number' && Number.isFinite(value)), true)
+  assert.equal('processes' in cloud.data, false)
+  assert.equal(cloudSamples.find(row => row.code === 'startup')?.data.windowShownMs, 1)
   worker.postMessage({ kind: 'renderer_stall', data: { longestMs: 500, visible: true } })
   const incident = await until(async () => (await rows('incidents')).find(row => row.kind === 'incident_event'), 'stall incident')
   assert.equal(incident.data.kind, 'renderer_stall')
+  assert.equal(cloudSamples.find(row => row.code === 'renderer_stall')?.data.longestMs, 500)
   assert.equal((await rows('incidents')).find(row => row.kind === 'incident_context').data.sample.at, snapshot.data.at)
   worker.postMessage({ kind: 'suspend' })
   await until(async () => (await rows('app')).find(row => row.kind === 'monitor_reset' && row.data.reason === 'suspend'), 'suspend boundary')

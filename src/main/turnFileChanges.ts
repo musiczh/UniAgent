@@ -13,6 +13,15 @@ const MAX_LINES = 100_000
 type Line = { text?: string }
 type Change = { path: string; oldPath?: string; kind: string; diff?: string }
 
+/** Full snapshots captured around one successful native tool, never current workspace guesses. */
+export async function snapshotFileChange(path: string, before: string | undefined, after: string): Promise<Change | undefined> {
+  if (before === after || Buffer.byteLength(before || '') > MAX_BYTES || Buffer.byteLength(after) > MAX_BYTES) return
+  if (before === undefined) return { path, kind: 'add', diff: after }
+  const lines = (value: string): Line[] => (value.match(/[^\n]*\n|[^\n]+$/g) || []).map(text => ({ text }))
+  const diff = await diffRecordedLines(lines(before), lines(after))
+  return diff ? { path, kind: 'modify', diff } : undefined
+}
+
 /** Only successful, turn-attributed edits are evidence; never inspect the workspace. */
 export async function filesFromTurnChanges(
   events: readonly UAEvent[], workdir: string

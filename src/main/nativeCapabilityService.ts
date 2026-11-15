@@ -1,3 +1,4 @@
+import { discoverQoderNativeSnapshot } from './qoderNativeCapabilities'
 import { AppServerRpcClient, type AppServerRpc } from './appServerTransport.ts'
 import { ClaudeSdkClient } from './claudeSdk'
 import { nativeCredentialEnv } from './agentSetupCredentials'
@@ -84,7 +85,7 @@ export class NativeCapabilityService {
     if (agent.adapter === 'grok' || agent.adapter === 'kimi' || agent.adapter === 'deepseek') {
       return normalizeGrokNativeSnapshot(agent, workdir)
     }
-    if (agent.adapter !== 'codex' && agent.adapter !== 'traex' && agent.adapter !== 'claude') {
+    if (agent.adapter !== 'codex' && agent.adapter !== 'traex' && agent.adapter !== 'claude' && agent.adapter !== 'qoder') {
       return emptyNativeCapabilitySnapshot(agent.id, workdir)
     }
     const key = JSON.stringify([agent.id, agent.bin, agent.version || '', workdir])
@@ -113,8 +114,8 @@ export class NativeCapabilityService {
     key: string, scope: ScopeState, generation: number): Promise<NativeCapabilitySnapshot> {
     const request = ++scope.latestRequest
 
-    if (agent.adapter === 'claude') {
-      const snapshot = await discoverClaudeNativeSnapshot(agent, workdir)
+    if (agent.adapter === 'claude' || agent.adapter === 'qoder') {
+      const snapshot = agent.adapter === 'qoder' ? await discoverQoderNativeSnapshot(agent, workdir) : await discoverClaudeNativeSnapshot(agent, workdir)
       this.cacheIfCurrent(key, scope, generation, request, snapshot.errors.length ? FAILURE_CACHE_MS : SUCCESS_CACHE_MS, snapshot)
       return snapshot
     }

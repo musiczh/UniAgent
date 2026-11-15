@@ -10,7 +10,7 @@ import { migrateAssistantCarrier, type PersonalAssistant } from '../src/shared/a
 import type { AgentDef, Session } from '../src/shared/types.ts'
 
 // Only agents able to inject a system prompt at session startup may carry the assistant.
-for (const id of ['codex', 'traex', 'claude'].filter(id => isDistributionAgent(id))) {
+for (const id of ['codex', 'traex', 'claude', 'qoder'].filter(id => isDistributionAgent(id))) {
   assert.equal(BUILTIN_AGENTS.find(agent => agent.id === id)?.capabilities.startupSystemPrompt, true, `${id} must be marked as a startup system prompt carrier`)
 }
 for (const id of ['kimi', 'grok', 'deepseek', 'zcode']) {

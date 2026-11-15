@@ -35,10 +35,12 @@ export class KimiWebRunner extends EventEmitter {
   private tools = new Map<string, any>()
   private stepUsage = new Map<number, TurnUsage>()
   private baseline = new Set<string>()
+  private transcriptMarkers = new Set<string>()
   private transcriptEpoch?: string
   private initializedHistory = false
   private pending = new Map<string, { kind: 'approval' | 'question'; row: any }>()
   private goal?: GoalState
+  private clearedGoal?: GoalState
   private completeTurn?: () => void
   private poll?: ReturnType<typeof setTimeout>
   private readonly instance = randomUUID()
@@ -226,6 +228,39 @@ export class KimiWebRunner extends EventEmitter {
   private async onFrame(frame: KimiWebFrame): Promise<void> {
     if (this.disposed) return
     const value = frame.payload || {}, type = frame.type
+    if (type === 'agent' && (frame as any).agent_id === 'main' && typeof (frame as any).plan_mode === 'boolean') {
+      this.config.collaborationMode = (frame as any).plan_mode ? 'plan' : 'default'; this.emit('collaborationModeChanged', this.config.collaborationMode)
+    }
+    // The lightweight goal feed coalesces transitions and omits goal identity
+    // and budgets. Transcript markers carry the authoritative ordered state.
+    if (type === 'goal') {
+      if (this.runtime?.usesTurnsProtocol && (frame as any).agent_id === 'main') {
+        const goal = (frame as any).goal
+        if (goal) {
+          const wasAutonomous = this.goal?.autonomous === true
+          this.goal = { ...this.goal, objective: goal.objective, status: goal.status,
+            tokenBudget: this.goal?.tokenBudget ?? null,
+            tokensUsed: goal.tokens_used, timeUsedSeconds: goal.wall_clock_ms / 1000,
+            createdAt: this.goal?.createdAt || Date.now(), updatedAt: Date.now(), continuation: 'native',
+            autonomous: goal.status === 'active', nativeActivation: goal.status === 'active' ? 'armed' : 'disarmed',
+            roundLimit: { maxRounds: this.goal?.roundLimit?.maxRounds ?? null, roundsStarted: goal.turns_used } }
+          this.emit('goalChanged', this.goal)
+          if (goal.status === 'active') this.emit('goalTurn', { state: 'running', autonomous: true })
+          else if (!this.running && wasAutonomous) this.emit('done', { nativeSessionId: this.nativeSessionId })
+        } else { this.clearedGoal = this.running ? this.goal : undefined; this.acceptGoal(null) }
+      }
+      return
+    }
+    if (type === 'item.ended' && this.runtime?.usesTurnsProtocol && (frame as any).agent_id === 'main') {
+      const item = (frame as any).item, previous = this.goal || this.clearedGoal
+      if (previous && item?.name === 'UpdateGoal' && item.status === 'ended' && item.outcome === 'completed' && ['complete', 'blocked'].includes(item.input?.status)) {
+        // Official goalService treats a successful terminal UpdateGoal result
+        // as confirmation even when the coalesced goal feed has already cleared.
+        this.goal = { ...previous, status: item.input.status, autonomous: false, nativeActivation: 'disarmed', updatedAt: Date.now() }
+        this.clearedGoal = undefined
+        this.emit('goalChanged', this.goal)
+      }
+    }
     if (type === 'interaction') {
       const interaction = frame as any
       if (!['approval', 'question'].includes(interaction.kind) || typeof interaction.interaction_id !== 'string' || !interaction.interaction_id) return
@@ -241,7 +276,7 @@ export class KimiWebRunner extends EventEmitter {
     if (['event.approval.resolved', 'event.question.answered', 'event.question.dismissed'].includes(type)) {
       this.resolveInteraction(`kimi-web-${value.approval_id ? 'approval' : 'question'}-${value.approval_id || value.question_id}`); return
     }
-    if (type.startsWith('subagent.')) {
+    if (type.startsWith('subagent.') || type === 'task' || type === 'task.list') {
       for (const task of await this.runtime!.listSubagentTasks()) this.event({ type: 'subagent', state: task.status === 'running' ? 'running' : task.status === 'failed' ? 'failed' : task.status === 'cancelled' ? 'cancelled' : 'success', payload: { id: `kimi-subagent-${task.id}`, agents: [{ agentThreadId: task.agent_id, parentThreadId: this.nativeSessionId, nativeTaskId: task.id, description: task.description, status: task.status === 'running' ? 'running' : task.status === 'failed' ? 'errored' : task.status === 'cancelled' ? 'interrupted' : 'completed' }] } })
       return
     }
@@ -276,12 +311,24 @@ export class KimiWebRunner extends EventEmitter {
     const runtime = this.runtime
     if (!runtime || this.disposed) return
     const epochChanged = this.transcriptEpoch !== undefined && this.transcriptEpoch !== snapshot.epoch
-    const transcript = await runtime.transcript(epochChanged ? undefined : this.baseline)
+    const transcript = Array.isArray(snapshot.transcript) ? { items: snapshot.transcript } : await runtime.transcript(epochChanged ? undefined : this.baseline)
     if (runtime !== this.runtime || this.disposed) return
     this.transcriptEpoch = snapshot.epoch
+    for (const marker of transcript.items) {
+      if (marker.kind !== 'marker' || !['goal', 'compaction'].includes(marker.marker) || marker.payload?.agentId !== 'main') continue
+      const key = JSON.stringify([marker.marker, marker.markerId, marker.payload.snapshot?.goalId, marker.payload.snapshot?.status, marker.payload.phase])
+      if (this.transcriptMarkers.has(key)) continue
+      this.transcriptMarkers.add(key)
+      if (marker.marker === 'goal') this.acceptGoal(marker.payload.snapshot)
+      else for (const event of kimiWebTranscriptEvents([marker])) this.event(event)
+    }
     for (const turn of transcript.items) {
       if (turn.kind !== 'turn' || this.baseline.has(String(turn.turnId))) continue
       this.begin(turn.turnId)
+      for (const step of turn.steps || []) {
+        const usage = projectKimiWebUsage(step.usage)
+        if (usage) this.stepUsage.set(step.ordinal, usage)
+      }
       const aliases = [...this.segments]
       for (const event of kimiWebTranscriptEvents([turn])) {
         if (['user_message', 'turn_started', 'turn_completed'].includes(event.type)) continue
@@ -368,7 +415,7 @@ export class KimiWebRunner extends EventEmitter {
   async getGoal(): Promise<GoalState | undefined> { await this.ensureReady(); this.acceptGoal(await this.runtime!.getGoal()); return this.goal }
   async setGoal(input: { objective: string; tokenBudget?: number; maxRounds?: number }): Promise<GoalState> {
     if (input.tokenBudget !== undefined || input.maxRounds !== undefined) throw new KimiWebError('goal_budget_unsupported')
-    await this.ensureReady(); this.acceptGoal(await this.runtime!.createGoal(input))
+    await this.ensureReady(); this.clearedGoal = undefined; this.acceptGoal(await this.runtime!.createGoal(input))
     if (!this.goal) throw new KimiWebError('goal_not_created')
     void this.startTurn(input.objective)
     return this.goal
@@ -379,7 +426,7 @@ export class KimiWebRunner extends EventEmitter {
     if (action !== 'pause' && action !== 'resume' && action !== 'cancel') throw unsupported()
     await this.ensureReady()
     const goal = await this.runtime!.controlGoal(action)
-    if (action === 'cancel') this.goal = undefined
+    if (action === 'cancel') { this.goal = undefined; this.clearedGoal = undefined }
     this.acceptGoal(goal); return this.goal
   }
   async getSubAgentItems(id: string, trusted?: { nativeTaskId: string; parentNativeSessionId: string }): Promise<UAEvent[]> {

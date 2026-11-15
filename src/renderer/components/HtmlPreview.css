@@ -111,6 +111,3 @@
   color: var(--text-dim);
   font-size: 13px;
 }
-
-.agent-md > .md-fragment:first-child > :first-child { margin-top: 0; }
-.agent-md > .md-fragment:last-child > :last-child { margin-bottom: 0; }

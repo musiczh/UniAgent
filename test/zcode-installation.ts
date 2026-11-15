@@ -212,7 +212,7 @@ server.listen(path.join(process.env.TMPDIR, 'znr-00000000-0000-0000-0000-0000000
   const trace = new ZCodeSetupTrace('installation', entry => { entries.push(entry) })
   trace.stage('verifying'); trace.fail('cancelled', new Error('secret-install-output'))
   assert.equal(entries.at(-1)?.code, 'zcode_installation_cancelled')
-  assert.match(agentInitializationPrompt('zcode', 'ZCode'), /3c5b227649371507ddc4eb46ac5133afe6db1cab/)
+  assert.match(agentInitializationPrompt('zcode', 'ZCode'), /fec975905a2abd4c07e35c40d51fa097a2258ec9/)
   console.log('zcode-installation: install/reuse/restart, credential separation, protocol faults, cancel/retry, concurrency, process cleanup, download integrity and fallback passed')
 } finally {
   if (previousHome === undefined) delete process.env.UNIAGENT_USER_DATA

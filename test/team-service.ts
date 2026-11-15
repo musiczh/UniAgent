@@ -81,16 +81,53 @@ await check('create hook observes fixed member Sessions before the team starts',
   assert.equal(f.store.project(project.id).status, 'running')
 })
 
+await check('team creation defaults to local and honors an enabled worktree preference', async f => {
+  const choices: boolean[] = []
+  ;(f.service as any).worktrees.defaultSelection = async (_space: unknown, _selection: unknown, enabled: boolean) => { choices.push(enabled); return undefined }
+  await f.service.create({ teamId: f.team.id, spaceId: f.space.id, prompt: 'Default local' })
+  f.service.configureDefaultWorktree(() => true)
+  await f.service.create({ teamId: f.team.id, spaceId: f.space.id, prompt: 'Enabled worktree' })
+  assert.deepEqual(choices, [false, true])
+})
+
 await check('orphaned team projects can recover, archive and delete', async f => {
   await f.dispatch('alpha')
   for (const sessionId of Object.values(f.project().memberSessions)) (f.orchestrator as any).removeSessionOwner(sessionId)
   await f.service.recover()
   assert.equal(f.project().status, 'interrupted')
   assert.equal(f.project().assignments[0].status, 'interrupted')
-  f.service.archive(f.project().id)
+  await f.service.archive(f.project().id)
   assert.ok(f.project().archivedAt)
-  f.service.deleteProject(f.project().id)
+  await f.service.deleteProject(f.project().id)
   assert.throws(() => f.project(), /team_project_not_found/)
+})
+
+await check('team archive waits for the shared check and revalidates before removal', async f => {
+  await f.service.stop(f.project().id)
+  let release!: () => void
+  f.service.configureArchiveCheck(async session => {
+    assert.equal(session.id, f.sid('leader'))
+    await new Promise<void>(resolve => { release = resolve })
+    return { assertCurrent: () => {} }
+  })
+  const archive = f.service.archive(f.project().id)
+  await flush(); assert.equal(f.project().archivedAt, undefined)
+  f.status(f.sid('leader'), 'running'); release()
+  await assert.rejects(archive, /team_still_running/)
+  assert.equal(f.project().archivedAt, undefined)
+  f.status(f.sid('leader'), 'idle')
+  const next = f.service.archive(f.project().id); await flush(); release(); await next
+  assert.ok(f.project().archivedAt)
+})
+
+await check('archive merge messages keep the original team Leader and input identity', async f => {
+  const calls: any[][] = []
+  f.orchestrator.sendMessage = async (...args: any[]) => { calls.push(args) }
+  await f.service.send(f.project().id, '合并归档前的改动', undefined, 'archive-input')
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0][0], f.sid('leader'))
+  assert.deepEqual(calls[0][5], { routedInputId: 'archive-input' })
+  assert.equal(calls[0][4], false)
 })
 
 await check('recovery writes session metadata only when team state differs', async f => {
@@ -106,6 +143,17 @@ await check('recovery writes session metadata only when team state differs', asy
   await f.service.recover()
   assert.equal(member.archived, false, 'recovery still reconciles a stale archive flag')
   assert.equal(writes, 1, 'only the changed member requires a session write')
+})
+
+await check('failed member cleanup keeps the team project for retry', async f => {
+  f.service.stop(f.project().id); (f.service as any).tick(); await flush()
+  const original = f.orchestrator.deleteTeamSessions.bind(f.orchestrator)
+  f.orchestrator.deleteTeamSessions = async () => { throw new Error('worktree cleanup failed') }
+  await assert.rejects(f.service.deleteProject(f.project().id), /worktree cleanup failed/)
+  assert.ok(f.project(), 'the team record is not removed before member cleanup succeeds')
+  f.orchestrator.deleteTeamSessions = original
+  await f.service.deleteProject(f.project().id)
+  assert.throws(() => f.project(), /team_project_not_found/)
 })
 
 await check('recovery yields during disk writes and publishes one complete catalog', async f => {
@@ -828,8 +876,8 @@ for (const end of ['stop', 'complete', 'fail', 'archive'] as const) {
     } else if (end === 'fail') {
       f.record(sid, { type: 'turn_completed', state: 'failed', payload: {} })
     } else if (end === 'archive') {
-      f.service.archive(f.project().id)
-      f.service.archive(f.project().id, false)
+      await f.service.archive(f.project().id)
+      await f.service.archive(f.project().id, false)
     } else f.service.stop(f.project().id)
     f.status(sid, 'running')
     f.record(sid, { type: 'user_message', payload: { text: 'Late delivery', source: 'mcp' } })

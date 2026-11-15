@@ -18,7 +18,9 @@ const scenario = (() => {
 })()
 
 function append(record) {
-  if (logPath) appendFileSync(logPath, JSON.stringify({ pid: process.pid, ...record }) + '\n', 'utf8')
+  if (logPath) appendFileSync(logPath, JSON.stringify({ pid: process.pid, ...record }, function (key, value) {
+    return key === 'value' && /^UNIAGENT_.*TOKEN$/.test(this.name || '') ? '<redacted>' : value
+  }) + '\n', 'utf8')
 }
 
 function readState() {
@@ -148,7 +150,7 @@ function update(sessionId, value, meta) {
 function initializeResult() {
   return {
     protocolVersion: 1,
-    ...(scenario.native ? {agentInfo:{name:'Grok',version:'1.0.62'}} : {}),
+    ...(scenario.native ? {agentInfo:{name:'Grok',version:scenario.nativeVersion ?? '1.0.62'}} : {}),
     agentCapabilities: {
       loadSession: true,
       promptCapabilities: { image: false, audio: false, embeddedContext: true },

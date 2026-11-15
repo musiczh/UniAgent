@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative } from 'node:path'
 import type { AgentDef, AgentLifecycleProgress, AgentLifecycleState } from '../shared/types.ts'
 import { pendingAgentDetection } from '../shared/agentReadiness.ts'
-import { DEEPSEEK_PACKAGE, DEEPSEEK_VERIFIED_VERSION } from '../shared/deepseek.ts'
+import { DEEPSEEK_PACKAGE } from '../shared/deepseek.ts'
 import { BUILTIN_AGENTS, detectAgents, failedAgentDetection, matchesAgentDetectionScope } from './agents.ts'
 import type { AgentDetectionObserver, AgentDetectionScope } from './agents.ts'
 import { updateDeepSeekRuntime } from './deepseekService.ts'
@@ -13,7 +13,7 @@ import { compareSemver, parseSemver } from './semver.ts'
 import { nativeCredentialEnv } from './agentSetupCredentials.ts'
 import { checkZCodeUpdate, getZCodeUpdateSource, updateZCodeRuntime } from './zcode/updater'
 
-type CommandAdapterId = 'codex' | 'traex' | 'claude' | 'grok' | 'kimi' | 'deepseek' | 'mcode'
+type CommandAdapterId = 'codex' | 'traex' | 'claude' | 'grok' | 'kimi' | 'deepseek' | 'mcode' | 'qoder'
 type AdapterId = CommandAdapterId | 'zcode'
 type CommandSpec = { args: readonly string[]; timeoutMs: number; cwd?: string; env?: NodeJS.ProcessEnv }
 type RunResult = { code: number; stdout: string; stderr: string; timedOut?: boolean }
@@ -66,10 +66,13 @@ const COMMANDS: Record<CommandAdapterId, { auth: CommandSpec; health: CommandSpe
     // installDeepSeek); only the registry version check uses this table.
     auth: { args: ['--version'], timeoutMs: 8000 },
     health: { args: ['--version'], timeoutMs: 8000 },
-    // Ask for the qualified release, not the `latest` dist-tag: DeepSeek ships
-    // newer pre-releases that have not passed the Host contract gate yet.
-    checkUpdate: { args: ['view', `${DEEPSEEK_PACKAGE}@${DEEPSEEK_VERIFIED_VERSION}`, 'version', '--json', '--registry=https://registry.npmjs.org'], timeoutMs: 20_000 },
+    checkUpdate: { args: ['view', DEEPSEEK_PACKAGE, 'version', '--json', '--registry=https://registry.npmjs.org'], timeoutMs: 20_000 },
     update: { args: [], timeoutMs: 300_000 }
+  },
+  qoder: {
+    auth: { args: ['status'], timeoutMs: 8000 }, health: { args: ['--version'], timeoutMs: 8000 },
+    checkUpdate: { args: ['update', '--check'], timeoutMs: 20_000 },
+    update: { args: ['update'], timeoutMs: 120_000 }
   },
   mcode: {
     // Use the same external executable for runtime operations and updates.
@@ -90,7 +93,7 @@ const defaultRunner: LifecycleRunner = (bin, spec) => new Promise((resolve) => {
 })
 
 function adapterFor(agent: AgentDef): AdapterId | undefined {
-  return agent.adapter === 'codex' || agent.adapter === 'traex' || agent.adapter === 'claude' || agent.adapter === 'grok' || agent.adapter === 'kimi' || agent.adapter === 'deepseek' || agent.adapter === 'mcode' || agent.adapter === 'zcode'
+  return agent.adapter === 'codex' || agent.adapter === 'traex' || agent.adapter === 'claude' || agent.adapter === 'grok' || agent.adapter === 'kimi' || agent.adapter === 'deepseek' || agent.adapter === 'mcode' || agent.adapter === 'zcode' || agent.adapter === 'qoder'
     ? agent.adapter : undefined
 }
 
@@ -144,6 +147,15 @@ function versionText(value: string): string | undefined {
 function latestVersionText(value: string): string | undefined {
   const field = value.match(/^\s*latest\b[^\r\n:]*\bversion\s*:\s*(?:v)?(\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)\s*$/im)
   return parseSemver(field?.[1]) ? field?.[1] : undefined
+}
+
+export function qoderUpdateVersions(value: string, current?: string): { current?: string; latest: string } | undefined {
+  const same = value.match(/Already at the latest version \((\d+\.\d+\.\d+)\)/i)
+  if (same) return { current: same[1], latest: same[1] }
+  const update = value.match(/Update available:\s*(\d+\.\d+\.\d+)(?:\s*(?:->|→)\s*(\d+\.\d+\.\d+))?/i)
+  if (update) return { current: update[2] ? update[1] : current, latest: update[2] || update[1] }
+  const latest = latestVersionText(value)
+  return latest ? { current, latest } : undefined
 }
 
 function registryVersionText(value: string): string | undefined {
@@ -473,7 +485,7 @@ export class AgentLifecycleService extends EventEmitter {
     // Grok authentication and protocol health are established by the ACP
     // initialize + session/new probe. There is no non-interactive login-status
     // command, so lifecycle verification must not invoke the interactive login.
-    if (agent.adapter === 'grok' || agent.adapter === 'kimi' || agent.adapter === 'deepseek' || agent.adapter === 'mcode') {
+    if (agent.adapter === 'grok' || agent.adapter === 'kimi' || agent.adapter === 'deepseek' || agent.adapter === 'mcode' || agent.adapter === 'qoder') {
       const updateHelp = agent.adapter === 'kimi'
         ? await this.runner(agent.bin, { args: ['upgrade', '--help'], timeoutMs: 8000, cwd: tmpdir() })
         : undefined
@@ -512,7 +524,7 @@ export class AgentLifecycleService extends EventEmitter {
       updateStatus: 'idle', message: 'CLI 已安装，需要登录', checkedAt
     }
     const healthVersion = versionText(`${health.stdout} ${health.stderr}`)
-    const healthy = health.code === 0 && !!healthVersion
+    const healthy = health.code === 0 && !health.timedOut
     return {
       availability: healthy ? 'available' : 'unhealthy', auth: authRequired(auth) ? 'unknown' : 'authenticated',
       health: healthy ? 'healthy' : 'unhealthy',
@@ -599,23 +611,25 @@ export class AgentLifecycleService extends EventEmitter {
     if (generation !== this.detectGeneration || detectionVersion !== this.detectionVersions.get(agentId)) return this.requireAgent(agentId)
     const parsedGrok = adapter === 'grok' && result.code === 0 ? grokUpdateVersions(result.stdout) : undefined
     const parsedKimi = adapter === 'kimi' && result.code === 0 ? kimiUpdateVersions(result.stdout) : undefined
+    const parsedQoder = adapter === 'qoder' && result.code === 0 ? qoderUpdateVersions(result.stdout, agent.version) : undefined
     const parsedRegistry = (adapter === 'codex' || adapter === 'claude' || adapter === 'deepseek' || adapter === 'mcode') && result.code === 0
       ? registryVersionText(result.stdout)
       : undefined
-    const parsedOutput = adapter === 'grok' || adapter === 'kimi'
-      ? !!(parsedGrok || parsedKimi)
+    const parsedOutput = adapter === 'grok' || adapter === 'kimi' || adapter === 'qoder'
+      ? !!(parsedGrok || parsedKimi || parsedQoder)
       : adapter === 'codex' || adapter === 'claude' || adapter === 'deepseek' || adapter === 'mcode'
         ? !!parsedRegistry
         : true
-    const current = parsedGrok?.current || parsedKimi?.current || versionText(agent.lifecycle?.currentVersion || '') || versionText(agent.version || '')
+    const current = parsedGrok?.current || parsedKimi?.current || parsedQoder?.current || versionText(agent.lifecycle?.currentVersion || '') || versionText(agent.version || '')
     const text = `${result.stdout} ${result.stderr}`
-    const available = adapter === 'grok' || adapter === 'kimi'
-      ? parsedGrok?.latest || parsedKimi?.latest
+    const available = adapter === 'grok' || adapter === 'kimi' || adapter === 'qoder'
+      ? parsedGrok?.latest || parsedKimi?.latest || parsedQoder?.latest
       : adapter === 'codex' || adapter === 'claude' || adapter === 'deepseek' || adapter === 'mcode'
         ? parsedRegistry
         : latestVersionText(text)
     const updateAvailable = compareSemver(available, current) === 1 ||
-      (adapter === 'deepseek' && agent.incompatible === true && available === DEEPSEEK_VERIFIED_VERSION && current !== available)
+      (adapter === 'deepseek' && agent.incompatible === true && available === current) ||
+      (adapter === 'deepseek' && !current && !!available)
     const success = result.code === 0 && parsedOutput
     const { availableVersion: _staleAvailableVersion, message: _staleMessage, ...previousLifecycle } = agent.lifecycle || await this.verify(agent)
     const lifecycle: AgentLifecycleState = {

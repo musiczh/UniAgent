@@ -88,7 +88,7 @@ await test('a failed MiniMax turn must not drain the next queued message', async
   assert.equal(frames.filter(row => row.kind === 'inbound' && row.frame.method === 'session/prompt').length, 1)
 }))
 
-await test('MiniMax uncertain delivery is retained during recovery', async () => withHost(async (host, agent, dir, store) => {
+await test('a failed queued MiniMax input is removed and never replayed after restart', async () => withHost(async (host, agent, dir, store) => {
   const session = host.createSession({ agentId: 'mcode', workdir: dir, permissionMode: 'ask' }, 'ready for recovery')
   await idle(host, session.id)
   await host.sendMessage(session.id, 'fail-turn')
@@ -99,11 +99,14 @@ await test('MiniMax uncertain delivery is retained during recovery', async () =>
     assert.equal(session.status, 'error')
   }
   await waitError()
+  assert.equal(host.getQueue(session.id).length, 1, 'only the untouched second input remains pending')
   host.resumePendingQueues()
   const deadline = Date.now() + 10000
-  while (!host.getQueue(session.id)[0]?.deliveryUncertain && Date.now() < deadline) await new Promise(resolveDelay => setTimeout(resolveDelay, 20))
+  while (host.getQueue(session.id).length && Date.now() < deadline) await new Promise(resolveDelay => setTimeout(resolveDelay, 20))
   await waitError()
-  assert.equal(host.getQueue(session.id)[0]?.deliveryUncertain, true)
+  assert.deepEqual(host.getQueue(session.id), [], 'the dispatched input remains failed in the transcript instead of returning to the queue')
+  assert.equal(store.load()[0].pendingQueue, undefined, 'the failed input is removed from the durable queue')
+  assert.equal((await host.getEvents(session.id)).filter(event => event.type === 'user_message' && event.payload.text === 'fail-turn').length, 2)
   await host.flushSessionLogs()
   host.disposeAll()
   const recovered = new Orchestrator(id => id === 'mcode' ? agent : undefined, store)
@@ -115,6 +118,6 @@ await test('MiniMax uncertain delivery is retained during recovery', async () =>
     await new Promise(resolveDelay => setTimeout(resolveDelay, 200))
     const after = await readFile(join(dir, 'protocol.jsonl'), 'utf8')
     const prompts = (text: string) => text.split('\n').filter(line => line.includes('"kind":"inbound"') && line.includes('"method":"session/prompt"')).length
-    assert.equal(prompts(after), prompts(before), 'an uncertain turn must never be resent automatically')
+    assert.equal(prompts(after), prompts(before), 'a failed turn must never be resent automatically')
   } finally { recovered.disposeAll(); await recovered.closeSessionLogs() }
 }))

@@ -19,8 +19,7 @@ const excluded = {
   'headless.ts': 'Real CLI/model matrix; requires credentials and spends tokens',
   'headless-edge.ts': 'Real CLI/model matrix; requires credentials and spends tokens',
   'team-question-runtime.ts': 'Real Codex/model driver; requires credentials and spends tokens',
-  'verify-clicks.mjs': 'Legacy driver attaches to an already running app',
-  'mermaid-bundle.ts': 'Checks built renderer output; run after pack, not against stale out/'
+  'verify-clicks.mjs': 'Legacy driver attaches to an already running app'
 }
 
 export function discoverTests(directory = new URL('../', import.meta.url)) {

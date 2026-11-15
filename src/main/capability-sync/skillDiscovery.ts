@@ -76,13 +76,17 @@ export async function secureManifest(path: string, home: string): Promise<{ text
 }
 
 export async function secureRegularText(path: string, home: string, maximum: number): Promise<string> {
+  return (await secureRegularBytes(path, home, maximum)).toString('utf8')
+}
+
+export async function secureRegularBytes(path: string, home: string, maximum: number): Promise<Buffer> {
   const expectedChain = await assertSafeDirectoryChain(dirname(path), home)
   const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
   try {
     const info = await handle.stat()
     if (!info.isFile()) throw new Error('unsafe_skill_entry')
     if (info.size > maximum) throw new Error('skill_file_too_large')
-    const text = await handle.readFile('utf8')
+    const text = await handle.readFile()
     const actualChain = await assertSafeDirectoryChain(dirname(path), home)
     if (actualChain.length !== expectedChain.length || actualChain.some((value, index) => value !== expectedChain[index])) {
       throw new Error('unsafe_skill_root')

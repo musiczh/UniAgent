@@ -152,17 +152,20 @@ try {
       incrementOK && boundedOK && costOK,
       `model=${usage.modelId} 输入=${input} 输出=${output} 占用=${occ} 窗口=${usage.contextWindow} 费用=${cost} cmds=${cmdCount}`
     )
-    // DOM: the usage card renders exactly one line with 本轮完成 + 费用 段.
+    // DOM: usage is an icon; opening its linked popup retains input and cost.
     const card = await ev(`
-      const cards = [...document.querySelectorAll('.session-view .system-notice.usage')];
-      const c = cards[cards.length-1];
-      const txt = (c?.textContent||'').replace(/\\s+/g,' ').trim();
-      return JSON.stringify({ present: !!c, txt, oneLine: !/\\n/.test(c?.textContent||''), hasFee: /费用/.test(txt), hasIn: /输入/.test(txt) });
+      const buttons = [...document.querySelectorAll('.session-view .message-usage > button')];
+      const button = buttons.at(-1);
+      if (button?.getAttribute('aria-expanded') === 'false') button.click();
+      await new Promise(resolve => setTimeout(resolve, 100));
+      const panel = button ? document.getElementById(button.getAttribute('aria-controls')) : null;
+      const txt = (panel?.textContent||'').replace(/\\s+/g,' ').trim();
+      return JSON.stringify({ present: !!button && !!panel, hasFee: /费用/.test(txt), hasIn: /输入/.test(txt), txt });
     `)
     const cc = JSON.parse(card)
     rec(
-      'Doc5-T1 usage 卡片一行渲染',
-      cc.present && cc.oneLine && cc.hasIn && (usage.modelId ? cc.hasFee : true),
+      'Doc5-T1 Token 图标与用量弹层',
+      cc.present && cc.hasIn && (usage.modelId ? cc.hasFee : true),
       `"${cc.txt}"`
     )
   }

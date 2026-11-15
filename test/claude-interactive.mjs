@@ -1,16 +1,20 @@
 import assert from 'node:assert/strict'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { resolve } from 'node:path'
+import { join, resolve } from 'node:path'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { createServer } from 'vite'
 
 const markdownStub = {
   name: 'claude-ui-test-markdown',
   enforce: 'pre',
   resolveId(source, importer) {
+    if (/^virtual:uniagent-(?:mermaid-runtime|markdown-worker)-url$/.test(source)) return '\0claude-ui-runtime-url'
     if (source === './Markdown' && importer?.endsWith('/EventStream.tsx')) return '\0claude-ui-test-markdown'
   },
   load(id) {
+    if (id === '\0claude-ui-runtime-url') return 'export default "about:blank"'
     if (id === '\0claude-ui-test-markdown') return "import React from 'react'; export const Markdown = () => React.createElement('span')"
   }
 }
@@ -19,13 +23,23 @@ const server = await createServer({
   resolve: { alias: { '@shared': resolve('src/shared') } },
   server: { middlewareMode: true }, appType: 'custom', logLevel: 'silent'
 })
+const fixture = await mkdtemp(join(tmpdir(), 'ua-claude-interactive-'))
+const orchestrators = []
 try {
   const { TurnRunner, buildCommand } = await server.ssrLoadModule('/src/main/adapter.ts')
   const { Orchestrator } = await server.ssrLoadModule('/src/main/orchestrator.ts')
+  const { SessionStore } = await server.ssrLoadModule('/src/main/sessionStore.ts')
   const { BUILTIN_AGENTS } = await server.ssrLoadModule('/src/main/agents.ts')
   const { ApprovalCard, EventStream } = await server.ssrLoadModule('/src/renderer/components/EventStream.tsx')
   const claudeDef = BUILTIN_AGENTS.find((entry) => entry.id === 'claude')
   assert.ok(claudeDef)
+  const createOrchestrator = (overrides) => {
+    const directory = join(fixture, String(orchestrators.length))
+    const instance = new Orchestrator(() => claudeDef, new SessionStore(join(directory, 'sessions.json')), join(directory, 'artifacts'))
+    Object.assign(instance, overrides)
+    orchestrators.push(instance)
+    return instance
+  }
   const agent = {
     id: 'claude', name: 'Claude Code', bin: 'claude', adapter: 'claude', icon: '', builtin: true,
     capabilities: { modelSelect: true, reasoningEffort: false, streaming: true, permissionModes: [{ id: 'ask', label: '请求批准' }] },
@@ -204,7 +218,7 @@ try {
     respond: () => ({ handled: true, hasPendingRequests: false }),
     setClaudePermissionMode: async (mode) => { switchedModes.push(mode) }
   }
-  const orchestrator = {
+  const orchestrator = createOrchestrator({
     sessions: new Map([['plan-session', approvedSession]]),
     events: new Map([['plan-session', [{ type: 'approval_request', state: 'pending', payload: { requestId: approvalId, kind: 'planMode' } }]]]),
     runners: new Map([['plan-session', approvedRunner]]),
@@ -215,8 +229,7 @@ try {
     retainAnsweredRequest() {},
     setStatus: (_session, status) => { approvedSession.status = status },
     persist() {}
-  }
-  Object.setPrototypeOf(orchestrator, Orchestrator.prototype)
+  })
   const planResponse = Orchestrator.prototype.respondToRequest.call(orchestrator, 'plan-session', approvalId, { decision: 'approved' })
   assert.equal(planResponse.handled, true)
   assert.equal(approvedSession.config.permissionMode, 'ask')
@@ -225,49 +238,48 @@ try {
   const routedPrompts = []
   const runningSession = { config: { agentId: 'claude' }, status: 'running' }
   const routeRunner = { steer: async (prompt) => { routedPrompts.push(prompt) } }
-  const routeBase = {
+  const routeBase = createOrchestrator({
     sessions: new Map([['running-session', runningSession]]),
     getAgent: () => claudeDef,
     nativeActionReservations: new Set(), rewinding: new Set(),
     runners: new Map([['running-session', routeRunner]]),
     streamers: new Map(),
     record: (...args) => routedPrompts.push(args[1].payload.text)
-  }
+  })
   await Orchestrator.prototype.forceSendStrict.call(routeBase, 'running-session', 'MCP force')
   assert.equal(routedPrompts[0], 'MCP force')
 
   const teamPrompts = []
   const teamSession = { teamBinding: { teamProjectId: 'team-1' }, config: { agentId: 'claude' }, status: 'running' }
-  const teamBase = {
+  const teamBase = createOrchestrator({
     sessions: new Map([['team-session', teamSession]]), getAgent: () => claudeDef,
     runners: new Map([['team-session', { steer: async (prompt) => { teamPrompts.push(prompt) } }]]),
     streamers: new Map(), protocolRunners: new Map(), record: (_id, event) => teamPrompts.push(event.payload.text)
-  }
+  })
   await Orchestrator.prototype.steerTeamMessage.call(teamBase, 'team-session', 'Leader direct message')
   assert.deepEqual(teamPrompts, ['Leader direct message', 'Leader direct message'])
 
   const compactSession = { config: { agentId: 'claude' }, nativeSessionId: 'native-session', status: 'idle' }
   const compactRequests = []
-  const compactOrchestrator = {
+  const compactOrchestrator = createOrchestrator({
     sessions: new Map([['compact-session', compactSession]]),
     getAgent: () => claudeDef,
     nativeActionReservations: new Set(), rewinding: new Set(), pendingSends: new Map(),
     queues: new Map(), isBusy: () => false, isReady: () => true,
     sendMessage: async (_id, prompt) => compactRequests.push(prompt)
-  }
+  })
   await Orchestrator.prototype.compactSession.call(compactOrchestrator, 'compact-session')
   assert.deepEqual(compactRequests, ['/compact'])
 
   const stopSession = { id: 'stop-session', status: 'running', config: { agentId: 'claude' } }
   let routedStops = 0
-  const stopOrchestrator = {
+  const stopOrchestrator = createOrchestrator({
     sessions: new Map([[stopSession.id, stopSession]]), teamStopVersions: new Map(), channelSendTurns: new Map(), feishuTeamInputs: new Set(),
     deferredDispatches: new Map(), editingQueueItems: new Map(), protocolPendingStarts: new Map(), recoveryStartTokens: new Map(),
     bumpSessionActivity() {}, isBusy: () => true, setStatus: (_session, status) => { stopSession.status = status },
     streamers: new Map(), protocolRunners: new Map(), runners: new Map([[stopSession.id, { interrupt: () => { routedStops++ } }]]),
     queues: new Map(), managementConfirmations: new Map(), zcodeStarts: new Set(), zcodeRunners: new Map()
-  }
-  Object.setPrototypeOf(stopOrchestrator, Orchestrator.prototype)
+  })
   Orchestrator.prototype.interrupt.call(stopOrchestrator, stopSession.id)
   assert.equal(routedStops, 1)
   assert.equal(stopSession.status, 'cancelling')
@@ -287,19 +299,27 @@ try {
     BUILTIN_AGENTS.find((entry) => entry.id === 'codex')
   ] }, teamDefinition), 'teams can continue through queued input without steer')
 
-  const queueStates = await exerciseClaudeQueuePromotion(Orchestrator, claudeDef)
+  const queueStates = await exerciseClaudeQueuePromotion(Orchestrator, claudeDef, createOrchestrator)
   assert.deepEqual(queueStates, { delivered: [], retried: ['pending'], retryNotice: true })
   console.log('claude interactive protocol: ok')
 } finally {
+  for (const orchestrator of orchestrators) {
+    orchestrator.runners.clear()
+    orchestrator.streamers.clear()
+    orchestrator.protocolRunners.clear()
+    orchestrator.zcodeRunners.clear()
+    orchestrator.disposeAll()
+  }
   await server.close()
+  await rm(fixture, { recursive: true, force: true })
 }
 
-async function exerciseClaudeQueuePromotion(Orchestrator, claudeDef) {
+async function exerciseClaudeQueuePromotion(Orchestrator, claudeDef, createOrchestrator) {
   const run = async (steer) => {
     const session = { id: 'queue-session', status: 'running', config: { agentId: 'claude' }, pendingQueue: [] }
     const queue = [{ id: 'q1', prompt: 'queued follow-up', state: 'pending', attempts: 0 }]
     const notices = []
-    const base = {
+    const base = createOrchestrator({
       isTeamMember: () => false, teamQuestions: new Map(),
       sessions: new Map([[session.id, session]]), queues: new Map([[session.id, queue]]),
       activeQueueItems: new Map(), editingQueueItems: new Map(),
@@ -313,7 +333,7 @@ async function exerciseClaudeQueuePromotion(Orchestrator, claudeDef) {
         notices.push(message)
         base.queues.set(owner.id, base.queues.get(owner.id).map((item) => predicate(item) ? { ...item, state: 'pending' } : item))
       }
-    }
+    })
     Orchestrator.prototype.promoteQueueItem.call(base, session.id, 'q1')
     await new Promise((resolve) => setImmediate(resolve))
     return { state: (base.queues.get(session.id) || []).map((item) => item.state), notices }

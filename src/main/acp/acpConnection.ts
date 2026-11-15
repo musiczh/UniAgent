@@ -25,8 +25,11 @@ const ACP_PROTOCOL_ERROR_FALLBACK_MS = 500
 const ACP_PROCESS_TRACK_INTERVAL_MS = 100
 const ACP_PROCESS_SWEEP_INTERVAL_MS = 50
 const ACP_PROCESS_SWEEP_MIN_MS = 250
-const ACP_PROCESS_SWEEP_DEADLINE_MS = 1_500
 const ACP_PROCESS_SWEEP_EMPTY_SCANS = 3
+const ACP_PROCESS_SCAN_TIMEOUT_MS = 1_000
+// Allow one scan before termination and every required successful empty scan.
+const ACP_PROCESS_SWEEP_DEADLINE_MS = (ACP_PROCESS_SWEEP_EMPTY_SCANS + 1) *
+  (ACP_PROCESS_SCAN_TIMEOUT_MS + ACP_PROCESS_SWEEP_INTERVAL_MS) + ACP_PROCESS_SWEEP_MIN_MS
 
 export class ACPRemoteError extends Error {
   constructor(
@@ -57,6 +60,7 @@ export interface ACPConnectionOptions {
   cwd?: string
   env?: NodeJS.ProcessEnv
   providerLabel: string
+  recoveryScope?: string
   maxFrameBytes?: number
   validateInitialize?: (value: any) => void
   authenticate?: (connection: ACPConnection, value: any) => Promise<void> | void
@@ -122,6 +126,7 @@ export class ACPConnection extends EventEmitter {
   private cwd?: string
   private spawnEnv: NodeJS.ProcessEnv
   private providerLabel: string
+  private recoveryScope: string
   private maxFrameBytes: number
   private validateInitializeHook?: (value: any) => void
   private authenticateHook?: (connection: ACPConnection, value: any) => Promise<void> | void
@@ -168,13 +173,14 @@ export class ACPConnection extends EventEmitter {
     this.cwd = options.cwd
     this.spawnEnv = { ...(options.env ?? process.env) }
     this.providerLabel = options.providerLabel
+    this.recoveryScope = options.recoveryScope || options.providerLabel
     this.maxFrameBytes = options.maxFrameBytes ?? ACP_MAX_FRAME_BYTES
     this.validateInitializeHook = options.validateInitialize
     this.authenticateHook = options.authenticate
   }
 
   start(): void {
-    assertACPStartAllowed()
+    assertACPStartAllowed(this.recoveryScope)
     if (this.child) return
     this.closing = false
     this.failed = false
@@ -193,11 +199,11 @@ export class ACPConnection extends EventEmitter {
       detached: process.platform !== 'win32'
     })
     this.child = child
-    registerACPConnection(this)
+    registerACPConnection(this, this.recoveryScope)
     const processTree = this.createProcessTreeOwner(child)
     this.processTrees.set(child, processTree)
     this.captureSpawnedRoot(processTree)
-    if (processTree.rootIdentity) rememberACPProcesses(processTree.rootIdentity, [...processTree.processes.values()].map(entry => entry.identity))
+    if (processTree.rootIdentity) rememberACPProcesses(processTree.rootIdentity, [...processTree.processes.values()].map(entry => entry.identity), this.recoveryScope)
     child.stdin.on('error', (err) => {
       if (this.child === child && !this.closing) {
         this.fail(new Error(`${this.providerLabel} ACP stdin 失败：${err.message}`))
@@ -271,7 +277,7 @@ export class ACPConnection extends EventEmitter {
   }
 
   async initialize(timeoutMs = RPC_TIMEOUT_MS): Promise<ACPInitialize> {
-    await awaitACPStartup()
+    await awaitACPStartup(this.recoveryScope)
     this.start()
     await flushACPProcessRecords()
     const result = await this.request(
@@ -438,7 +444,7 @@ export class ACPConnection extends EventEmitter {
       const timer = setTimeout(() => {
         for (const owner of owners) this.hardKill(owner.child)
         rejectClose(new Error(`${this.providerLabel} ACP transport did not close`))
-      }, 3000)
+      }, ACP_CLOSE_ESCALATION_MS + ACP_PROCESS_SWEEP_DEADLINE_MS + ACP_PROCESS_SCAN_TIMEOUT_MS)
       void Promise.all(owners.map(async owner => {
         const [, confirmed] = await Promise.all([owner.closed, owner.drained])
         if (!confirmed) throw new Error(`${this.providerLabel} ACP 子进程清理未完成`)
@@ -765,7 +771,7 @@ export class ACPConnection extends EventEmitter {
           encoding: 'utf8',
           env: { LC_ALL: 'C' },
           maxBuffer: 16 * 1024 * 1024,
-          timeout: 1_000
+          timeout: ACP_PROCESS_SCAN_TIMEOUT_MS
         },
         (error, stdout) => {
           if (error) {
@@ -934,7 +940,7 @@ export class ACPConnection extends EventEmitter {
           added = true
         }
       }
-      if (owner.rootIdentity) rememberACPProcesses(owner.rootIdentity, [...owner.processes.values()].map(entry => entry.identity))
+      if (owner.rootIdentity) rememberACPProcesses(owner.rootIdentity, [...owner.processes.values()].map(entry => entry.identity), this.recoveryScope)
       return scan
     }).catch((error): ProcessScan => ({ ok: false, error }))
     return refresh

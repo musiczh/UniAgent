@@ -15,6 +15,7 @@ const supportCache = new Map<string, Promise<ForkSupport>>()
 
 /** Inspect the installed executable; whole-session fork support is insufficient. */
 async function forkSupport(agent: AgentDef): Promise<ForkSupport> {
+  if (agent.adapter === 'qoder') return { afterTurn: false, message: agent.capabilities.sessionForkAtTurn === true, deferGoal: false }
   if (!['codex', 'traex', 'claude'].includes(agent.adapter)) return unsupported
   const info = await stat(agent.bin)
   const key = `${agent.bin}:${info.mtimeMs}:${info.size}`
@@ -83,9 +84,24 @@ async function withHistoryClient<T>(agent: AgentDef, action: (client: AppServerR
   }
 }
 
+export function qoderHistoryForkPoints(events: UAEvent[], nativeEvents: UAEvent[]): HistoryForkPoint[] {
+  return events.flatMap(event => {
+    if (event.type !== 'agent_message' || typeof event.payload.text !== 'string' || !event.payload.text.trim()) return []
+    const candidates = nativeEvents.filter(native => native.type === 'agent_message' && native.payload.text === event.payload.text && typeof native.payload.nativeMessageId === 'string')
+    const exact = candidates.find(native => native.payload.nativeMessageId === event.payload.nativeMessageId)
+    const native = exact || (candidates.length === 1 ? candidates[0] : undefined)
+    return native ? [{ eventSeq: event.seq, kind: 'message' as const, nativeId: native.payload.nativeMessageId }] : []
+  })
+}
+
 /** Only offer positions that map to a native boundary in this exact transcript. */
 export async function historyForkPoints(agent: AgentDef | undefined, nativeId: string, events: UAEvent[]): Promise<HistoryForkPoint[]> {
   if (!agent || !events.length) return []
+  if (agent.adapter === 'qoder') {
+    if (!agent.capabilities.sessionForkAtTurn) return []
+    const history = await loadSessionEvents(agent.id, nativeId, agent.bin)
+    return qoderHistoryForkPoints(events, history.events)
+  }
   if (agent.adapter === 'zcode') {
     const completed = new Set(events.filter(event => event.type === 'turn_completed' && event.state === 'success').map(event => event.payload.turnId))
     const replies = new Map<string, UAEvent>()
@@ -191,4 +207,16 @@ export async function forkHistoryAt(agent: AgentDef, nativeId: string, point: Hi
   const forkedId = response.thread?.id
   if (!forkedId || forkedId === nativeId) throw new Error('原生分叉未返回独立会话，已停止导入')
   return { ...history, nativeId: forkedId, pendingClaudeFork: undefined }
+}
+
+/** Fork without resuming or changing the source thread's configuration. */
+export async function forkNativeSnapshot(agent: AgentDef, nativeId: string, point?: HistoryForkPoint): Promise<string> {
+  const support = await forkSupport(agent)
+  if (!support.deferGoal || point && (!support.afterTurn || point.kind !== 'after-turn')) throw new Error('当前 Agent 版本不能安全冻结此分叉位置，请更新 Agent 后重试')
+  return withHistoryClient(agent, async client => {
+    const result = await client.request<any>('thread/fork', { threadId: nativeId, ephemeral: false,
+      excludeTurns: true, deferGoalContinuation: true, ...(point ? { lastTurnId: point.nativeId } : {}) })
+    if (!result.thread?.id || result.thread.id === nativeId) throw new Error('原生分叉没有返回独立会话')
+    return result.thread.id
+  })
 }

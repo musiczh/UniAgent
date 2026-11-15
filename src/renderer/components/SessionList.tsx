@@ -11,8 +11,12 @@ import { AgentIcon } from './AgentIcon'
 import { Chevron, ClockIcon, FolderIcon, UiIcon } from './Icons'
 import { ViewDropdown } from './ViewDropdown'
 import { isSidebarSessionEligible } from '../sessionVisibility'
+import { sessionDisplayTitle } from '@shared/task'
+import { isTaskTitleEligible } from '@shared/taskTitle'
+import { confirmSessionDeletion } from '../sessionDeletion'
 
-export type ReplyUnreadKind = 'main' | 'side'
+import type { ReplyUnreadKind } from '@shared/sessionAttention'
+export type { ReplyUnreadKind } from '@shared/sessionAttention'
 
 const SESSION_ORDER_KEY = 'ua.sidebar.sessionOrder'
 const AGENT_GROUP_ORDER_KEY = 'ua.sidebar.agentGroupOrder'
@@ -63,9 +67,12 @@ export function SessionList({
   onPin,
   onQuickCreate,
   onOpenRequirement,
+  onRouter, routerSelected,
   requirementsEnabled = false
 }: {
   sessions: Session[]
+  onRouter?: () => void
+  routerSelected?: boolean
   assistantPrivateSessionIds?: string[]
   teamProjects?: TeamProject[]
   agents: AgentDef[]
@@ -76,9 +83,9 @@ export function SessionList({
   onSelect: (id: string) => void
   onArchive: (id: string) => void
   onUnarchive: (id: string) => void
-  onDelete: (id: string) => void
+  onDelete: (id: string, confirmationId?: string) => void | Promise<void>
   onArchiveMany: (ids: string[]) => void
-  onDeleteMany: (ids: string[]) => void
+  onDeleteMany: (ids: string[], confirmations?: Record<string, string>) => void | Promise<void>
   onRename: (id: string, title: string) => void
   onPin: (id: string, pinned: boolean) => void
   onQuickCreate?: (seed: (Partial<Pick<SessionConfig, 'agentId' | 'projectId' | 'requirementId'>> & { teamId?: string })) => void
@@ -114,6 +121,8 @@ export function SessionList({
   // Exit animation: rows tagged here play a distinct archive/delete motion
   // before the underlying archive/delete commits (see runExit).
   const [exiting, setExiting] = useState<Record<string, 'archive' | 'delete'>>({})
+  const deletionLock = useRef(false)
+  const [deletionError, setDeletionError] = useState('')
   const [sessionOrder, setSessionOrder] = useState(() => readOrder(SESSION_ORDER_KEY))
   const [agentGroupOrder, setAgentGroupOrder] = useState(() => readOrder(AGENT_GROUP_ORDER_KEY))
   const [projectGroupOrder, setProjectGroupOrder] = useState(() => readOrder(PROJECT_GROUP_ORDER_KEY))
@@ -291,17 +300,35 @@ export function SessionList({
   // async archive/delete actually removes the row from `active` — clearing it on
   // a timer would spring the row back to full size during the async gap (a flash).
   const EXIT_MS: Record<'archive' | 'delete', number> = { archive: 320, delete: 300 }
-  const runExit = (ids: string[], mode: 'archive' | 'delete', commit: (ids: string[]) => void): void => {
+  const runExit = (ids: string[], mode: 'archive' | 'delete', commit: (ids: string[]) => void | Promise<void>): Promise<void> => {
     if (matchMedia('(prefers-reduced-motion: reduce)').matches) {
-      commit(ids)
-      return
+      return Promise.resolve().then(() => commit(ids))
     }
     setExiting((prev) => {
       const next = { ...prev }
       for (const id of ids) next[id] = mode
       return next
     })
-    setTimeout(() => commit(ids), EXIT_MS[mode])
+    return new Promise<void>(resolve => setTimeout(resolve, EXIT_MS[mode])).then(() => commit(ids))
+  }
+
+  async function deleteRows(ids: string[]): Promise<void> {
+    if (deletionLock.current) return
+    deletionLock.current = true; setDeletionError('')
+    try {
+      const confirmations: Record<string, string> = {}
+      for (const id of ids) {
+        const confirmationId = await confirmSessionDeletion(id)
+        if (!confirmationId) return
+        confirmations[id] = confirmationId
+      }
+      await runExit(ids, 'delete', () => ids.length === 1 ? onDelete(ids[0], confirmations[ids[0]]) : onDeleteMany(ids, confirmations))
+      clearSelection()
+    } catch (error) { setDeletionError(error instanceof Error ? error.message : String(error)) }
+    finally {
+      deletionLock.current = false
+      setExiting(previous => Object.fromEntries(Object.entries(previous).filter(([id, mode]) => !ids.includes(id) || mode !== 'delete')))
+    }
   }
 
   const closeMenu = (): void => setMenu(null)
@@ -361,10 +388,10 @@ export function SessionList({
   const renderTitle = (s: Session): JSX.Element => renaming === s.id ? (
     <input
       className="si-rename"
-      aria-label="会话标题"
+      aria-label={isTaskTitleEligible(s) ? '任务标题' : '会话标题'}
       autoFocus
       maxLength={80}
-      defaultValue={s.title}
+      defaultValue={sessionDisplayTitle(s)}
       onFocus={(e) => e.currentTarget.select()}
       onClick={(e) => e.stopPropagation()}
       onContextMenu={(e) => e.stopPropagation()}
@@ -380,12 +407,12 @@ export function SessionList({
       onBlur={(e) => {
         const title = e.currentTarget.value.trim()
         setRenaming(null)
-        if (title && title !== s.title) onRename(s.id, title)
+        if (title && (isTaskTitleEligible(s) || title !== sessionDisplayTitle(s))) onRename(s.id, title)
       }}
     />
   ) : (
     <span className="si-title" onClick={s.archived ? () => onSelect(s.id) : undefined}>
-      {s.title}
+      {sessionDisplayTitle(s)}
     </span>
   )
   const renderRenameAction = (s: Session): JSX.Element => (
@@ -393,7 +420,7 @@ export function SessionList({
       type="button"
       className="si-act"
       title="修改标题"
-      aria-label="修改会话标题"
+      aria-label={isTaskTitleEligible(s) ? '修改任务标题' : '修改会话标题'}
       onClick={(e) => {
         e.stopPropagation()
         beginRename(s)
@@ -649,12 +676,12 @@ export function SessionList({
         options={[
           { value: 'all', label: '全部' },
           { value: 'byAgent', label: 'Agent' },
-          { value: 'byProject', label: '空间' },
+          { value: 'byProject', label: '项目' },
           ...(requirementsEnabled ? [{ value: 'byRequirement' as const, label: '需求' }] : [])
         ]}
       />
 
-      {(requirementError || (view === 'byRequirement' && requirementLoadError)) && <div className="requirement-error" role="alert">{requirementError || requirementLoadError}</div>}
+      {(deletionError || requirementError || (view === 'byRequirement' && requirementLoadError)) && <div className="requirement-error" role="alert">{deletionError || requirementError || requirementLoadError}</div>}
       {batchMode && (
         <div className="sl-batch-bar">
           <span className="sl-batch-count">已选 {selected.size} 项</span>
@@ -673,10 +700,7 @@ export function SessionList({
             <button
               className="sl-batch-btn danger" disabled={selected.size === 0 || [...selected].some(id => { const session = sessions.find(s => s.id === id); return !session || !canDelete(session) })} title="运行中的专家团需先停止才能删除"
               onClick={() => {
-                if (confirm(`删除选中的 ${selected.size} 个会话？此操作不可撤销。`)) {
-                  runExit([...selected], 'delete', (ids) => onDeleteMany(ids))
-                  clearSelection()
-                }
+                void deleteRows([...selected])
               }}
             >
               删除
@@ -695,6 +719,7 @@ export function SessionList({
       ) : (
         <div className="sl-body">
           {view === 'all' && renderAssistantGroup()}
+          {onRouter && <button className={`sidebar-nav-item ${routerSelected ? 'active' : ''}`} onClick={onRouter}><span className="nav-ic"><UiIcon name="router" /></span>RouterAgent</button>}
           {view !== 'byRequirement' && renderPinnedGroup()}
           {view === 'byRequirement' ? <>
             {requirementGroups.filter(g => g.requirement.status !== 'archived').map(g => renderRequirementGroup(g.requirement, g.list))}
@@ -956,8 +981,7 @@ export function SessionList({
                         aria-label="删除会话" disabled={!canDelete(s)}
                         onClick={(e) => {
                           e.stopPropagation()
-                          if (confirm(`删除会话「${s.title}」？此操作不可撤销。`))
-                            runExit([s.id], 'delete', ([id]) => onDelete(id))
+                          void deleteRows([s.id])
                         }}
                       >
                         <UiIcon name="trash" size={15} />
@@ -1068,8 +1092,7 @@ export function SessionList({
                   className="ctx-item danger" disabled={!canDelete(s!)} title={s!.teamBinding && !canDelete(s!) ? '运行中的专家团需先停止才能删除' : undefined}
                   onClick={() => {
                     closeMenu()
-                    if (confirm(`删除会话「${s!.title}」？此操作不可撤销。`))
-                      runExit([s!.id], 'delete', ([id]) => onDelete(id))
+                    void deleteRows([s!.id])
                   }}
                 >
                   <UiIcon name="trash" size={15} /> 删除
@@ -1158,7 +1181,7 @@ export function groupSessionsByProject(
 ): SidebarProjectGroup[] {
   const fallback: Project = projects.find((project) => project.isDefault) || {
     id: 'default',
-    name: '默认空间',
+    name: '默认项目',
     primaryDirectory: '',
     additionalDirectories: [],
     createdAt: 0,

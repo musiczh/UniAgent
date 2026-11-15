@@ -1,0 +1,10 @@
+project_id = "uniagent-monitor"
+
+[auth]
+enabled = true
+site_url = "https://musiczh.github.io/uniagent-monitor/"
+enable_anonymous_sign_ins = true
+
+[functions.monitor-ingest]
+# The handler validates the user through Auth /user before accepting any data.
+verify_jwt = false

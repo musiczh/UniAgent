@@ -2,6 +2,7 @@ import { parentPort, workerData } from 'node:worker_threads'
 import { performance } from 'node:perf_hooks'
 import { PERFORMANCE_SAMPLE_MS, PerformanceResourceCollector } from './performanceResources'
 import { PerformanceRecorder } from './performanceRecorder'
+import { monitorPerformancePayload } from '../shared/cloudMonitor'
 
 const port = parentPort!
 const collector = new PerformanceResourceCollector(workerData.pid)
@@ -14,6 +15,13 @@ let suspended = false, stopped = false
 let generation = 0
 let flight: Promise<void> | undefined
 let timer: ReturnType<typeof setTimeout>
+let lastCloudSample = 0
+
+function cloudSample(code: string, data: Record<string, unknown>, at = Date.now()): void {
+  if (!workerData.cloudMonitor) return
+  const payload = monitorPerformancePayload(data)
+  if (Object.keys(payload).length) port.postMessage({ kind: 'cloud_sample', code, data: payload, at })
+}
 
 function reset(reason: string): void {
   generation++
@@ -34,6 +42,10 @@ async function tick(): Promise<void> {
       const types = new Map((main?.processes as { pid: number; type: string }[] | undefined)?.map(row => [row.pid, row.type]))
       if (sample.tree) for (const row of sample.tree.processes) row.type = types.get(row.pid) || 'ChildProcess'
       recorder.sample({ ...sample, mainHeartbeatAgeMs: Math.round(performance.now() - heartbeat), main })
+      if (sample.at - lastCloudSample >= 60_000) {
+        cloudSample('resource_sample', { ...sample, mainHeartbeatAgeMs: Math.round(performance.now() - heartbeat), main }, sample.at)
+        lastCloudSample = sample.at
+      }
     } else collector.reset()
   }
 }
@@ -55,6 +67,9 @@ port.on('message', (message) => {
     stopped = true
     clearTimeout(timer)
     void Promise.resolve(flight).then(() => recorder.close()).finally(() => port.close())
-  } else recorder.event(message.kind, message.data)
+  } else {
+    recorder.event(message.kind, message.data)
+    if (['startup','startup-ui','main_stall','renderer_stall','renderer_unresponsive','renderer_gone','frame_stalled'].includes(message.kind)) cloudSample(message.kind, message.data)
+  }
 })
 schedule()

@@ -5,6 +5,7 @@ import { homedir, tmpdir } from 'node:os'
 import { delimiter, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { ACPRunner, type ACPContract } from './acp/acpRunner.ts'
+import { ACPRecoveryError } from './acp/acpProcessLifecycle.ts'
 import type { AgentDef } from '../shared/types.ts'
 import { MCODE_BIN, type MCodeConnectionInput, type MCodeConnectionSnapshot } from '../shared/mcode.ts'
 
@@ -121,7 +122,7 @@ function inspect(): Promise<{ snapshot: MCodeConnectionSnapshot; contract?: ACPC
     } catch (error) {
       const detail = error instanceof Error ? error.message : ''
       if (/authentication required|not authenticated|unauthenticated|login required/i.test(detail)) return publish('needs-auth')
-      return publish('failed', /timeout|timed out|超时/i.test(detail)
+      return publish('failed', error instanceof ACPRecoveryError ? error.message : /timeout|timed out|超时/i.test(detail)
         ? 'MiniMax Code 检测超时，请检查服务状态后重新检测'
         : 'MiniMax Code 检测失败，请检查程序版本、配置与访问权限后重试')
     }

@@ -1,10 +1,10 @@
+import { pendingTaskRequest, finishTaskRequest } from '@shared/taskRequest'
 import { AssistantPicker } from './AssistantPicker'
-import { resolveAgentModel, resolveAgentPermission, resolveModelEffort, resolveModelThinking, supportsModelImages } from '@shared/agentChoices'
+import { resolveAgentModel, resolveAgentPermission, resolveModelEffort, resolveModelThinking, supportsModelImages, withLastAgentChoices } from '@shared/agentChoices'
 import type { AssistantDetail } from '@shared/assistant'
 import type { TeamDefinition, TeamCreateProjectInput } from '@shared/teamTypes'
 import type { Requirement } from '@shared/requirementTypes'
-import { RequirementPicker } from './RequirementPicker'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type {
   AgentDef,
   AgentPref,
@@ -34,6 +34,7 @@ import {
   useAttachments,
   useDismissableDetails,
   retainNativeCandidateIds,
+  getCachedAttachmentPreview,
   useNativeCapabilities
 } from '../hooks'
 import { SlashMenu } from './SlashMenu'
@@ -57,6 +58,9 @@ import { ProjectPicker } from './ProjectPicker'
 import { MarkdownEditor } from './MarkdownEditor'
 import type { ComposerPasteEvent, MarkdownInputHandle } from '../markdownInput'
 import { useRequirements } from '../useRequirements'
+import type { RouterSnapshot } from '@shared/router'
+import { animateSentContent, associateSendOrigin, cancelSendOrigin, captureSendOrigin } from '../conversationMotion'
+import { failRouterSubmission, stageRouterSubmission, useRouterSubmissions } from '../routerSubmissions'
 
 const EFFORT_LABEL: Record<ReasoningEffort, string> = {
   off: '关闭',
@@ -86,6 +90,9 @@ export function resolveRequirementProjectId(
   return projects.some((project) => project.id === projectId) ? projectId : undefined
 }
 
+const ROUTER_DRAFT_KEY = 'ua.router-task-draft'
+const routerDraftSubmissions = new EventTarget()
+
 export function NewTaskPanel({
   agents,
   teams = [], teamUnavailableReasons = {}, onCreateTeam, onManageTeams,
@@ -99,8 +106,11 @@ export function NewTaskPanel({
   promptPrefill,
   onOpenAssistantSettings,
   onOpenSettings,
+  onRouterSubmitted,
+  onRouterSubmitting,
   onRedetect,
-  quickCreateSeed
+  quickCreateSeed,
+  routerMode
 }: {
   agents: AgentDef[]
   teams?: TeamDefinition[]
@@ -112,7 +122,7 @@ export function NewTaskPanel({
   requirementsEnabled?: boolean
   loading?: boolean
   loadError?: string | null
-  onCreate: (
+  onCreate?: (
     config: SessionConfig,
     prompt: string,
     attachments?: Attachment[],
@@ -123,17 +133,21 @@ export function NewTaskPanel({
     config: SessionConfig,
     action: NativeThreadAction
   ) => Promise<Session>
-  onCommitCreatedSession: (session: Session, seed: ComposerDraftSeed | null) => void
+  onCommitCreatedSession?: (session: Session, seed: ComposerDraftSeed | null) => void
   promptPrefill?: { text: string } | null
   onOpenSettings?: () => void
+  onRouterSubmitted?: () => void
+  onRouterSubmitting?: () => void
   onOpenAssistantSettings?: () => void
   onRedetect?: () => void
   quickCreateSeed?: (Partial<Pick<SessionConfig, 'agentId' | 'projectId' | 'requirementId'>> & { teamId?: string }) | null
+  routerMode?: RouterSnapshot
 }): JSX.Element {
+  const routerOnly = !!routerMode
   const available = agents.filter((a) => a.lifecycle?.availability === 'available')
   const enabledAgentIdSet = new Set(enabledAgentIds)
   const installed = available.filter((a) => enabledAgentIdSet.has(a.id))
-  const [executor, setExecutor] = useState<'agent' | 'team'>(() => quickCreateSeed?.teamId || localStorage.getItem('uniagent.mode') === 'team' ? 'team' : 'agent')
+  const [executor, setExecutor] = useState<'agent' | 'team'>(() => !routerOnly && (quickCreateSeed?.teamId || localStorage.getItem('uniagent.mode') === 'team') ? 'team' : 'agent')
   const [teamId, setTeamId] = useState(quickCreateSeed?.teamId || localStorage.getItem('ua.lastTeamId') || '')
   const team = teams.find(t => t.id === teamId)
   const teamLeader = team?.members.find(m => m.id === team.leaderMemberId)?.role
@@ -142,15 +156,27 @@ export function NewTaskPanel({
   useEffect(() => { if (quickCreateSeed) setUseAssistant(false); if (quickCreateSeed?.teamId) { setExecutor('team'); setTeamId(quickCreateSeed.teamId) } else if (quickCreateSeed?.agentId) setExecutor('agent') }, [quickCreateSeed])
   const [agentId, setAgentId] = useState<string>('')
   const [useAssistant, setUseAssistant] = useState(false)
+  const [routeAutomatically, setRouteAutomatically] = useState(routerOnly)
+  const [routerSnapshot, setRouter] = useState<RouterSnapshot>()
+  const router = routerMode || routerSnapshot
+  useEffect(() => {
+    if (routerOnly) return
+    let active = true
+    const refresh = () => void window.uniagent.getRouterSnapshot().then(value => { if (active) setRouter(value) }).catch(() => {})
+    refresh()
+    const stop = window.uniagent.onRouterChanged(refresh)
+    return () => { active = false; stop() }
+  }, [agents, routerOnly])
   const [assistant, setAssistant] = useState<AssistantDetail>()
   const [selectingAssistant, setSelectingAssistant] = useState(false)
   useEffect(() => {
+    if (routerOnly) return
     let active = true
     const refresh = () => void window.uniagent.getPersonalAssistant().then(value => { if (active) setAssistant(value) }).catch(() => {})
     refresh()
     const stop = window.uniagent.onAssistantChanged(refresh)
     return () => { active = false; stop() }
-  }, [])
+  }, [routerOnly])
   const [model, setModel] = useState<string>('')
   const [kimiThinking, setKimiThinking] = useState('')
   const [zcodeThinking, setZcodeThinking] = useState('')
@@ -163,16 +189,43 @@ export function NewTaskPanel({
   // its RIGHT (side-by-side), top-aligned, WITHOUT closing the main popover.
   // Re-clicking collapses it; the other row swaps the side list. Reset on close.
   const [activeSub, setActiveSub] = useState<'model' | 'effort' | 'agent' | 'team' | null>(null)
-  const { requirements, loading: requirementsLoading } = useRequirements()
+  const { requirements, loading: requirementsLoading, error: requirementsError } = useRequirements()
   const [projects, setProjects] = useState<Project[]>([])
   const [projectId, setProjectId] = useState('default')
   const [workspaceChoice, setWorkspaceChoice] = useState<WorkspaceSelection & { projectId: string }>({ projectId: '', mode: 'local', baseRef: 'HEAD' })
+  const [automaticWorkspace, setAutomaticWorkspace] = useState<WorkspaceSelection['mode']>()
+  const [workspaceGeneration, setWorkspaceGeneration] = useState(0)
+  const [defaultWorktree, setDefaultWorktree] = useState<boolean>()
+  const [worktreeSettingsError, setWorktreeSettingsError] = useState('')
+  useEffect(() => {
+    let live = true, version = 0
+    const refresh = async () => {
+      const ticket = ++version
+      try {
+        const settings = await window.uniagent.getAppSettings()
+        if (live && ticket === version) { setDefaultWorktree(settings.defaultTaskWorktree === true); setWorktreeSettingsError('') }
+      } catch { if (live && ticket === version) setWorktreeSettingsError('工作树设置读取失败，请重新打开新建任务。') }
+    }
+    void refresh()
+    const stop = window.uniagent.onUniAgentManagementChanged(resource => { if (resource === 'settings') void refresh() })
+    return () => { live = false; stop() }
+  }, [])
   const [projectGitState, setProjectGitState] = useState<{ projectId: string; info: ProjectGitInfo }>()
   const gitProbeRef = useRef(0)
   const [requirementId, setRequirementId] = useState<string | undefined>(quickCreateSeed?.requirementId)
   // 需求开关关闭时提交不带需求绑定（忽略已选与 quickCreateSeed 的 requirementId）。
   const effectiveRequirementId = requirementsEnabled ? requirementId : undefined
-  const [prompt, setPrompt] = useState<string>('')
+  const [prompt, setPrompt] = useState<string>(() => {
+    try { return routerOnly ? localStorage.getItem(ROUTER_DRAFT_KEY) || '' : '' }
+    catch { return '' }
+  })
+  useEffect(() => {
+    if (!routerOnly) return
+    try {
+      if (prompt) localStorage.setItem(ROUTER_DRAFT_KEY, prompt)
+      else localStorage.removeItem(ROUTER_DRAFT_KEY)
+    } catch { /* Draft storage is optional. */ }
+  }, [routerOnly, prompt])
   const [command, setCommand] = useState<ComposerCommand | null>(null)
   const [goalMaxRounds, setGoalMaxRounds] = useState('')
   const [goalTokenBudget, setGoalTokenBudget] = useState('')
@@ -182,35 +235,41 @@ export function NewTaskPanel({
   const [submitError, setSubmitError] = useState('')
   const submittingRef = useRef(false)
   const agent = installed.find((a) => a.id === agentId)
-  const selectedProject = projects.find((project) => project.id === projectId) || projects.find((project) => project.isDefault)
-  const workspaceMode = workspaceChoice.projectId === selectedProject?.id ? workspaceChoice.mode : 'local'
-  const workspaceBaseRef = workspaceChoice.projectId === selectedProject?.id ? workspaceChoice.baseRef || 'HEAD' : 'HEAD'
+  const selectedProjectId = effectiveRequirementId ? resolveRequirementProjectId(effectiveRequirementId, requirements, projects) : projectId
+  const selectedProject = projects.find((project) => project.id === selectedProjectId) || (!effectiveRequirementId ? projects.find((project) => project.isDefault) : undefined)
+  const scopeError = effectiveRequirementId && (requirementsLoading || requirementsError || !selectedProject || requirements.find(r => r.id === effectiveRequirementId)?.status === 'archived')
+    ? requirementsError || '需求或主项目不可用，请重新选择归属' : ''
+  const projectGitInfo = projectGitState && projectGitState.projectId === selectedProject?.id ? projectGitState.info : undefined
+  const automaticScope = routeAutomatically && !isTeam && !useAssistant
+  const workspaceMode = automaticScope ? automaticWorkspace || (defaultWorktree ? 'worktree' : 'local') : workspaceChoice.projectId === selectedProject?.id ? workspaceChoice.mode : defaultWorktree && projectGitInfo?.canCreateWorktree && projectGitInfo.currentBranch ? 'worktree' : 'local'
+  const workspacePending = defaultWorktree === undefined || !!worktreeSettingsError || !!(!automaticScope && defaultWorktree && workspaceChoice.projectId !== selectedProject?.id && !projectGitInfo)
+  const workspaceBaseRef = !automaticScope && workspaceChoice.projectId === selectedProject?.id ? workspaceChoice.baseRef || 'HEAD' : 'HEAD'
+  const worktreeUnavailable = workspaceMode === 'worktree' && !automaticScope && !projectGitInfo?.canCreateWorktree
   const workspaceRequest = useMemo<WorkspaceSelection | undefined>(() => workspaceMode === 'worktree'
     ? { mode: 'worktree', baseRef: workspaceBaseRef, requestId: crypto.randomUUID() }
-    : undefined, [workspaceMode, workspaceBaseRef, selectedProject?.id, requirementId, agentId, isTeam, teamId])
-  const projectGitInfo = projectGitState && projectGitState.projectId === selectedProject?.id ? projectGitState.info : undefined
-  const preparedWorktree = workspaceRequest && projectGitInfo?.pendingWorktree?.creationRequestId === workspaceRequest.requestId ? projectGitInfo?.pendingWorktree : undefined
+    : undefined, [workspaceMode, workspaceBaseRef, automaticScope, selectedProject?.id, requirementId, agentId, isTeam, teamId, workspaceGeneration])
+  const preparedWorktree = !automaticScope && workspaceRequest && projectGitInfo?.pendingWorktree?.creationRequestId === workspaceRequest.requestId ? projectGitInfo?.pendingWorktree : undefined
   const workdir = preparedWorktree?.state === 'ready' ? preparedWorktree.workdir : selectedProject?.primaryDirectory || window.uniagent.homeDir || ''
 
   async function refreshProjectGitInfo(): Promise<void> {
-    if (!selectedProject) return
+    if (!selectedProject || automaticScope) return
     const generation = ++gitProbeRef.current
     try {
       const info = await window.uniagent.getProjectGitInfo(selectedProject.id, workspaceRequest?.requestId)
       if (generation === gitProbeRef.current) setProjectGitState({ projectId: selectedProject.id, info })
     } catch (error) {
-      if (generation === gitProbeRef.current) setProjectGitState({ projectId: selectedProject.id, info: { branches: [], canCreateWorktree: false, unavailableReason: errorMessage(error) } })
+      if (generation === gitProbeRef.current) setProjectGitState({ projectId: selectedProject.id, info: { branches: [], canCreateWorktree: false, inspectionFailed: true, unavailableReason: errorMessage(error) } })
     }
   }
 
   useEffect(() => {
-    setWorkspaceChoice({ projectId: selectedProject?.id || '', mode: 'local', baseRef: 'HEAD' })
+    setWorkspaceChoice({ projectId: '', mode: 'local', baseRef: 'HEAD' })
   }, [selectedProject?.id, selectedProject?.primaryDirectory])
 
   useEffect(() => {
     void refreshProjectGitInfo()
     return () => { gitProbeRef.current += 1 }
-  }, [selectedProject?.id, selectedProject?.primaryDirectory, workspaceRequest?.requestId])
+  }, [automaticScope, selectedProject?.id, selectedProject?.primaryDirectory, workspaceRequest?.requestId])
   // Persisted last-choice prefs (Doc5 T2); null until loaded.
   const prefsRef = useRef<PrefsData | null>(null)
   const handledPromptPrefillRef = useRef<{ text: string } | null>(null)
@@ -234,6 +293,38 @@ export function NewTaskPanel({
   const previewsRef = useRef(previews)
   attachmentsRef.current = attachments
   previewsRef.current = previews
+  const [routerImagesReady, setRouterImagesReady] = useState(!routerOnly)
+  const routerImagesLoaded = useRef(false)
+  const submittedImages = useRef(new Set<string>())
+  useEffect(() => {
+    if (!routerOnly) return
+    let active = true
+    void Promise.resolve().then(() => window.uniagent.getRouterDraftImages()).then(images => {
+      if (active) { addPickedFiles(images.filter(image => !submittedImages.current.has(image.path))); routerImagesLoaded.current = true }
+    }).catch(() => {}).finally(() => { if (active) setRouterImagesReady(true) })
+    return () => { active = false }
+  }, [routerOnly, addPickedFiles])
+  useLayoutEffect(() => {
+    if (!routerOnly || !routerImagesReady || !routerImagesLoaded.current) return
+    const images = attachments.filter(image => image.kind === 'image').map(image => ({ ...image, previewDataUrl: previews[image.path] }))
+    void window.uniagent.saveRouterDraftImages(images).catch(() => {})
+  }, [routerOnly, routerImagesReady, attachments, previews])
+  useLayoutEffect(() => () => {
+    if (!routerOnly || routerImagesLoaded.current) return
+    const images = attachmentsRef.current.filter(image => image.kind === 'image').map(image => ({ ...image, previewDataUrl: previewsRef.current[image.path] }))
+    if (images.length) void window.uniagent.saveRouterDraftImages(images, true).catch(() => {})
+  }, [routerOnly])
+  useEffect(() => {
+    if (!routerOnly) return
+    const accepted = (event: Event) => {
+      const submitted = (event as CustomEvent<{ prompt: string; images: Attachment[] }>).detail
+      submitted.images.forEach(image => submittedImages.current.add(image.path))
+      setPrompt(current => current === submitted.prompt ? '' : current)
+      setAttachments(current => current.filter(image => image.kind !== 'image' || !submitted.images.some(sent => sent.path === image.path)))
+    }
+    routerDraftSubmissions.addEventListener('accepted', accepted)
+    return () => routerDraftSubmissions.removeEventListener('accepted', accepted)
+  }, [routerOnly, setAttachments])
   const setupInfo: Record<string, { install: string; login: string; docs: string }> = {
     zcode: { install: '按官方说明准备 ZCode 运行时', login: '设置 → Agent → ZCode：填写 API Key 并检测配置', docs: 'https://github.com/zai-org/ZCode' },
     codex: { install: 'npm install -g @openai/codex', login: 'codex login', docs: 'https://developers.openai.com/codex/cli' },
@@ -265,6 +356,14 @@ export function NewTaskPanel({
     [capabilities.candidates, selectedIds]
   )
   const promptRef = useRef(prompt)
+  const routerSubmissions = useRouterSubmissions()
+  const failedInput = routerSubmissions.at(-1)
+  useEffect(() => {
+    if (!routerOnly || !failedInput?.error || promptRef.current || attachmentsRef.current.length) return
+    setPrompt(failedInput.prompt)
+    setAttachments(failedInput.attachments?.map(attachment => ({ ...attachment,
+      previewDataUrl: getCachedAttachmentPreview(attachment.path) })) || [])
+  }, [routerOnly, failedInput])
   const selectedIdsRef = useRef(selectedIds)
   const commandRef = useRef(command)
   const agentIdRef = useRef(agentId)
@@ -295,7 +394,7 @@ export function NewTaskPanel({
     preserveCurrent = false
   ): void {
     if (submittingRef.current) return
-    const pref = prefsRef.current?.lastByAgent?.[nextAgent.id]
+    const pref = withLastAgentChoices(prefsRef.current?.lastByAgent?.[nextAgent.id])
     const nextModelDef = resolveAgentModel(nextAgent,
       preset?.model,
       preserveCurrent ? model : undefined,
@@ -408,6 +507,7 @@ export function NewTaskPanel({
     )
     handledQuickCreateSeedRef.current = claim.claimed
     if (!quickCreateSeed || !claim.shouldApply) return
+    setRouteAutomatically(false)
     setRequirementId(quickCreateSeed?.requirementId)
     const requestedAgentId = quickCreateSeed?.agentId
     const nextAgent = resolveQuickCreateAgent(
@@ -417,7 +517,7 @@ export function NewTaskPanel({
     )
     skipRestoreAgentRef.current = null
     setProjectId(
-      quickCreateSeed.projectId && projects.some((project) => project.id === quickCreateSeed.projectId)
+      !quickCreateSeed.requirementId && quickCreateSeed.projectId && projects.some((project) => project.id === quickCreateSeed.projectId)
         ? quickCreateSeed.projectId
         : resolveRequirementProjectId(quickCreateSeed.requirementId, requirements, projects) || projects.find((project) => project.isDefault)?.id || 'default'
     )
@@ -513,7 +613,7 @@ export function NewTaskPanel({
     setModel((current) =>
       current && agent.models.some((entry) => entry.id === current)
         ? current
-        : resolveAgentModel(agent, prefsRef.current?.lastByAgent[agent.id]?.defaultModel)?.id || ''
+        : resolveAgentModel(agent, withLastAgentChoices(prefsRef.current?.lastByAgent[agent.id]).defaultModel)?.id || ''
     )
     const modes = permissionModesForNewTask(agent)
     setPerm((current) => modes.some((entry) => entry.id === current) ? current : modes[0]?.id)
@@ -526,7 +626,7 @@ export function NewTaskPanel({
       setEffort('')
       return
     }
-    setEffort(cur => resolveModelEffort(modelDef, cur, prefsRef.current?.lastByAgent[agentId]?.defaultEffort) || '')
+    setEffort(cur => resolveModelEffort(modelDef, cur, withLastAgentChoices(prefsRef.current?.lastByAgent[agentId]).defaultEffort) || '')
   }, [model, modelDef])
 
   // A remembered Max choice must never leak onto a model without a Max variant.
@@ -562,7 +662,7 @@ export function NewTaskPanel({
         setWorkspaceChoice({ projectId: project.id, mode: 'local', baseRef: 'HEAD' })
         skipRestoreAgentRef.current = target.id
         setAgentId(target.id)
-        const pref = prefsRef.current?.lastByAgent[target.id]
+        const pref = withLastAgentChoices(prefsRef.current?.lastByAgent[target.id])
         const selected = resolveAgentModel(target, assistant.assistant.defaultModel, pref?.defaultModel)
         setModel(selected?.id || '')
         setEffort(target.capabilities.reasoningEffort ? resolveModelEffort(selected, pref?.defaultEffort) || '' : '')
@@ -570,12 +670,13 @@ export function NewTaskPanel({
         setZcodeThinking(target.adapter === 'zcode' ? resolveModelThinking(selected, pref?.defaultThinking, pref?.defaultEffort) || '' : '')
         setPerm(resolveAgentPermission(target, assistant.assistant.defaultPermissionMode, 'ask'))
         setExecutor('agent'); localStorage.setItem('uniagent.mode', 'session')
-        setUseAssistant(true); setSubmitError('')
+        setUseAssistant(true); setRouteAutomatically(false); setSubmitError('')
       } catch (error) { setSubmitError(errorMessage(error)) }
       finally { submittingRef.current = false; setSelectingAssistant(false) }
       return
     }
     setUseAssistant(enabled)
+    if (enabled) setRouteAutomatically(false)
   }
 
   function handlePaste(e: ComposerPasteEvent): void {
@@ -585,13 +686,18 @@ export function NewTaskPanel({
   }
 
   function resolveSubmissionConfig(): { config: SessionConfig; pref: AgentPref } | null {
+    if (workspacePending) return null
+    if (scopeError) {
+      setSubmitError(scopeError)
+      return null
+    }
     if (!agent || !selectedProject || agent.incompatible) return null
-    if (workspaceMode === 'worktree' && !projectGitInfo?.canCreateWorktree) return null
+    if (worktreeUnavailable) return null
 
     // Agent/model effects run after render, so a quick switch + submit can still
     // observe the previous agent's state. Resolve every outgoing choice against
     // the agent selected for this submission instead of trusting that state.
-    const defaults = prefsRef.current?.lastByAgent[agent.id]
+    const defaults = withLastAgentChoices(prefsRef.current?.lastByAgent[agent.id])
     const chosenModelDef = resolveAgentModel(agent, model, defaults?.defaultModel)
     const chosenModel = chosenModelDef?.id
     const chosenEffort = agent.capabilities.reasoningEffort ? resolveModelEffort(chosenModelDef, effort, defaults?.defaultEffort) : undefined
@@ -603,6 +709,7 @@ export function NewTaskPanel({
     const pref: AgentPref = {
       model: chosenModel,
       effort: chosenEffort,
+      ...(agent.adapter === 'kimi' ? { kimiThinking: chosenThinking } : {}),
       ...(agent.adapter === 'zcode' ? { zcodeThinking: chosenThinking } : {}),
       // Explicit undefined clears any stale pre-negotiation permission preference
       // when PrefsStore merges this object with the previous choice.
@@ -617,11 +724,13 @@ export function NewTaskPanel({
         model: chosenModel,
         modelSource: chosenModelDef?.modelSource,
         effort: agent.adapter === 'zcode' ? undefined : chosenEffort,
+        ...(agent.adapter === 'qoder' ? { qoderContextWindow: chosenModelDef?.qoderContextWindows?.includes(defaults?.qoderContextWindow || 0) ? defaults?.qoderContextWindow : undefined, qoderThinkingDisabled: chosenModelDef?.qoderThinkingDisabled ? defaults?.qoderThinkingDisabled : undefined } : {}),
         ...(agent.adapter === 'kimi' ? { kimiThinking: chosenThinking } : {}),
         ...(agent.adapter === 'zcode' && chosenModelDef?.zcodeSelection ? { zcodeModelSelection: { ...chosenModelDef.zcodeSelection,
           options: { ...chosenModelDef.zcodeSelection.options, reasoningLevel: chosenThinking } } } : {}),
         projectId: selectedProject.id,
-        ...(workspaceRequest ? { workspaceSelection: workspaceRequest } : {}),
+        ...(!useAssistant ? { taskScope: effectiveRequirementId ? { kind: 'requirement' as const, requirementId: effectiveRequirementId } : { kind: 'space' as const, projectId: selectedProject.id } } : {}),
+        workspaceSelection: workspaceRequest || { mode: 'local' },
         requirementId: effectiveRequirementId,
         workdir,
         additionalDirectories: [...selectedProject.additionalDirectories],
@@ -641,15 +750,23 @@ export function NewTaskPanel({
   }
 
   async function submit(): Promise<void> {
+    if (routerOnly && !routerImagesReady) return
+    if (workspacePending) return
     if (submittingRef.current) return
-    if (workspaceMode === 'worktree' && !projectGitInfo?.canCreateWorktree) { setSubmitError(projectGitInfo?.unavailableReason || '请等待分支加载完成'); return }
+    if (scopeError) { setSubmitError(scopeError); return }
+    if (worktreeUnavailable) { setSubmitError(projectGitInfo?.unavailableReason || '请等待分支加载完成'); return }
     if (incompatibleAttachments.length) { setSubmitError('当前执行方不支持部分附件，请移除附件或切换执行方'); return }
     if (isTeam) {
       if (!team || team.status !== 'active' || teamUnavailableReasons[team.id] || !selectedProject || !onCreateTeam) { setSubmitError('请选择已启用的专家团'); return }
       if (command || selectedIds.length) { setSubmitError('专家团不支持单 Agent 原生命令或能力选择；请先移除，正文与附件会保留'); return }
       if (!prompt.trim()) return
       submittingRef.current = true; setSubmitting(true); setSubmitError('')
-      try { await onCreateTeam({ teamId: team.id, spaceId: selectedProject.id, requirementId: effectiveRequirementId, prompt, attachments, ...(workspaceRequest ? { workspaceSelection: workspaceRequest } : {}) }) }
+      try {
+        const input = { teamId: team.id, spaceId: selectedProject.id, requirementId: effectiveRequirementId, taskScope: effectiveRequirementId ? { kind: 'requirement' as const, requirementId: effectiveRequirementId } : { kind: 'space' as const, projectId: selectedProject.id }, prompt, attachments, workspaceSelection: workspaceRequest || { mode: 'local' as const } }
+        const taskRequestId = await pendingTaskRequest(localStorage, { kind: 'team', input })
+        await onCreateTeam({ ...input, taskRequestId })
+        finishTaskRequest(localStorage, taskRequestId)
+      }
       catch (e) { setSubmitError(errorMessage(e)); if (workspaceRequest) await refreshProjectGitInfo() }
       finally { submittingRef.current = false; setSubmitting(false) }
       return
@@ -661,6 +778,42 @@ export function NewTaskPanel({
     )
     const delivery = buildComposerDelivery(command, prompt, outgoingAttachments, selectedIds)
     if (!delivery) return
+    if (routerOnly || routeAutomatically && !useAssistant) {
+      if (!router?.config.enabled || !router.available) { setSubmitError(router?.reason || '请先启用 RouterAgent'); return }
+      if (useAssistant || delivery.kind !== 'turn' || selectedIds.length) { setSubmitError('自动归属支持普通任务输入，请先移除原生命令或能力选择'); return }
+      submittingRef.current = true; setSubmitting(true); setSubmitError('')
+      let submittedId: string | undefined
+      try {
+        const scope = routerOnly && !routeAutomatically ? resolved.config.taskScope! : { kind: 'global' as const }
+        const input = { prompt, attachments: outgoingAttachments, execution: resolved.config, scope }
+        const requestId = await pendingTaskRequest(localStorage, { kind: 'router', input })
+        submittedId = requestId
+        captureSendOrigin(composerBoxRef.current, requestId)
+        stageRouterSubmission({ requestId, routerSessionId: router.sessionId, prompt, attachments: outgoingAttachments })
+        animateSentContent(document.querySelector<HTMLElement>(`[data-client-turn-key="${requestId}"] .bubble`), requestId)
+        onRouterSubmitting?.()
+        await window.uniagent.submitRouterInput({ ...input, requestId })
+        finishTaskRequest(localStorage, requestId)
+        if (routerOnly) {
+          try { if (localStorage.getItem(ROUTER_DRAFT_KEY) === prompt) localStorage.removeItem(ROUTER_DRAFT_KEY) }
+          catch { /* The submitting component may already be unmounted. */ }
+          const images = outgoingAttachments.filter(image => image.kind === 'image')
+          routerDraftSubmissions.dispatchEvent(new CustomEvent('accepted', { detail: { prompt, images } }))
+          await window.uniagent.clearRouterDraftImages(images).catch(() => {})
+        }
+        if (workspaceRequest) setWorkspaceGeneration(current => current + 1)
+        setPrompt(current => current === prompt ? '' : current)
+        setAttachments(current => current.filter(attachment => !outgoingAttachments.includes(attachment)))
+        persistSubmissionPref(resolved.pref)
+        onRouterSubmitted?.()
+      } catch (error) {
+        setSubmitError(errorMessage(error))
+        if (submittedId) { failRouterSubmission(submittedId, errorMessage(error)); cancelSendOrigin(submittedId) }
+      }
+      finally { submittingRef.current = false; setSubmitting(false) }
+      return
+    }
+    if (!onCreate || !onCommitCreatedSession) { setSubmitError('当前入口仅支持分配任务'); return }
     if (delivery.kind === 'goal') {
       try { Object.assign(delivery.action, buildNativeGoalLimits(agent?.adapter, { maxRounds: goalMaxRounds, tokenBudget: goalTokenBudget })) }
       catch (error) { setSubmitError(errorMessage(error)); return }
@@ -680,9 +833,11 @@ export function NewTaskPanel({
     setSubmitError('')
     try {
       if (!onCreateNativeAction && delivery.kind === 'goal') throw new Error('当前无法创建 Goal')
+      const taskRequestId = await pendingTaskRequest(localStorage, { config: resolved.config, delivery })
+      captureSendOrigin(composerBoxRef.current, taskRequestId)
       await completeNewTaskCreation({
         create: () => dispatchNewTaskDelivery(
-          resolved.config,
+          { ...resolved.config, taskRequestId },
           delivery,
           {
             create: onCreate,
@@ -690,12 +845,13 @@ export function NewTaskPanel({
               throw new Error('当前无法创建 Goal')
             })
           }
-        ),
+        ).then(session => { associateSendOrigin(`session:${session.id}`, taskRequestId); return session }),
         kind: delivery.kind,
         submitted: submittedDraft,
         current: currentNewTaskDraft,
         commit: onCommitCreatedSession
       })
+      finishTaskRequest(localStorage, taskRequestId)
     } catch (error: unknown) {
       setSubmitError(errorMessage(error))
       if (workspaceRequest) await refreshProjectGitInfo()
@@ -708,20 +864,23 @@ export function NewTaskPanel({
   async function startReview(draft: NativeReviewDraft): Promise<void> {
     if (submittingRef.current) return
     const resolved = resolveSubmissionConfig()
-    if (!resolved || !onCreateNativeAction) return
+    if (routerOnly || !resolved || !onCreateNativeAction || !onCommitCreatedSession) return
     persistSubmissionPref(resolved.pref)
     submittingRef.current = true
     setSubmitting(true)
     setSubmitError('')
     const submittedDraft = currentNewTaskDraft()
     try {
+      const action = { type: 'review.start' as const, draft }
+      const taskRequestId = await pendingTaskRequest(localStorage, { config: resolved.config, action })
       await completeNewTaskCreation({
-        create: () => onCreateNativeAction(resolved.config, { type: 'review.start', draft }),
+        create: () => onCreateNativeAction({ ...resolved.config, taskRequestId }, action),
         kind: 'review',
         submitted: submittedDraft,
         current: currentNewTaskDraft,
         commit: onCommitCreatedSession
       })
+      finishTaskRequest(localStorage, taskRequestId)
     } catch (error: unknown) {
       setSubmitError(errorMessage(error))
       if (workspaceRequest) await refreshProjectGitInfo()
@@ -766,7 +925,7 @@ export function NewTaskPanel({
     )
   }
 
-  if (available.length === 0) {
+  if (available.length === 0 && !routerOnly) {
     const incompatible = agents.filter((a) => a.incompatible)
     return (
       <div className="new-task first-setup">
@@ -845,9 +1004,10 @@ export function NewTaskPanel({
   const nativeThinking = kimi || agent?.adapter === 'zcode'
   const efforts = nativeThinking ? modelDef?.thinkingOptions || [] : modelDef?.efforts || []
   const thinking = agent?.adapter === 'zcode' ? zcodeThinking : kimiThinking
-  const selectedThinking = resolveModelThinking(modelDef, thinking, prefsRef.current?.lastByAgent[agentId]?.defaultThinking, prefsRef.current?.lastByAgent[agentId]?.defaultEffort)
+  const defaults = withLastAgentChoices(prefsRef.current?.lastByAgent[agentId])
+  const selectedThinking = resolveModelThinking(modelDef, thinking, defaults.defaultThinking, defaults.defaultEffort)
   const effortLabel = (value: string): string => kimi ? value : EFFORT_LABEL[value as ReasoningEffort] || value
-  const selectedEffort = nativeThinking ? selectedThinking : resolveModelEffort(modelDef, effort, prefsRef.current?.lastByAgent[agentId]?.defaultEffort)
+  const selectedEffort = nativeThinking ? selectedThinking : resolveModelEffort(modelDef, effort, defaults.defaultEffort)
   const effortDisabled = (!nativeThinking && !agent?.capabilities.reasoningEffort) || efforts.length === 0
   const modelLabel = modelDef?.label || '无可用模型'
   // 需求补9 — mirror the in-session status bar: fast toggle only for codex models
@@ -861,9 +1021,9 @@ export function NewTaskPanel({
   const mcodeMax = agent?.adapter === 'mcode'
 
   return (
-    <div className="new-task">
-      <div className="drag-region" />
-      <h1 className="hero">一个 App，驱动所有 Coding Agent</h1>
+    <div className={`new-task${routerOnly ? ' router-task-composer' : ''}`}>
+      {!routerOnly && <><div className="drag-region" />
+      <h1 className="hero">一个 App，驱动所有 Coding Agent</h1></>}
       <div className="composer-box big" ref={composerBoxRef}>
         <ComposerCapabilityChips
           command={command}
@@ -906,7 +1066,7 @@ export function NewTaskPanel({
         )}
         <div className="composer-main">
           {command === 'goal' && ['deepseek', 'grok', 'kimi', 'mcode'].includes(agent?.adapter || '') && <NativeGoalOptions provider={agent?.adapter} value={agent?.adapter === 'grok' ? goalTokenBudget : goalMaxRounds} disabled={submitting} onChange={agent?.adapter === 'grok' ? setGoalTokenBudget : setGoalMaxRounds} />}
-          {slashOpen && !isTeam && (
+          {slashOpen && !isTeam && !routerOnly && (
             <SlashMenu
               hits={slashHits}
               totalCount={capabilities.candidates.length}
@@ -920,25 +1080,25 @@ export function NewTaskPanel({
             ref={taRef}
             className="prompt-input"
             placeholder={
-              isTeam ? '描述任务，让专家团一起完成…（⌘⏎ 发送）' : canAttachImages
+              routerOnly ? `描述你想让 Agent 完成的任务…（⌘⏎ 提交${canAttachImages ? '，可粘贴图片' : ''}）` : isTeam ? '描述任务，让专家团一起完成…（⌘⏎ 发送）' : canAttachImages
                 ? '描述你想让 Agent 完成的任务…（/ 唤起 Skill·MCP，⌘⏎ 发送，可粘贴图片）'
                 : '描述你想让 Agent 完成的任务…（/ 唤起 Skill·MCP，⌘⏎ 发送）'
             }
-            disabled={submitting && (isTeam || workspaceMode === 'worktree')}
+            disabled={submitting && (isTeam || workspaceMode === 'worktree' && !routerOnly && !automaticScope)}
             value={prompt}
             onChange={setPrompt}
             onPaste={handlePaste}
             onSelectionChange={onSelectionChange}
             onKeyDown={(e) => {
               if (e.isComposing) return
-              if (!isTeam && onKeyDownSlash(e)) return
+              if (!isTeam && !routerOnly && onKeyDownSlash(e)) return
               if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
                 e.preventDefault()
                 void submit()
               }
             }}
             minHeight={90}
-            autoFocus
+            autoFocus={!routerMode?.requests.some(row => row.state === 'needs_input')}
           />
         </div>
         <div className="config-bar">
@@ -951,7 +1111,7 @@ export function NewTaskPanel({
                   void addSupportedFiles()
                 }}><UiIcon name="paperclip" size={14} /> 添加附件</button>
               )}
-              <NativeActionMenu
+              {!routerOnly && <NativeActionMenu
                 actions={capabilities.actions}
                 disabled={isTeam || !agent || !!agent.incompatible}
                 reviewDisabled={isTeam || submitting || !agent || !!agent.incompatible}
@@ -965,7 +1125,7 @@ export function NewTaskPanel({
                   setReviewDialogOpen(true)
                   composerBoxRef.current?.querySelector('.sb-add')?.removeAttribute('open')
                 }}
-              />
+              />}
               {presets.length > 0 && (
                 <label className="cfg sb-menu-field">
                   <span>任务模板</span>
@@ -980,7 +1140,7 @@ export function NewTaskPanel({
                 </label>
               )}
               {!canAttachImages && !canAttachFiles && presets.length === 0 &&
-                !capabilities.actions.goal && !capabilities.actions.review && !capabilities.actions.plan && (
+                (routerOnly || !capabilities.actions.goal && !capabilities.actions.review && !capabilities.actions.plan) && (
                 <span className="sb-menu-empty">暂无可添加内容</span>
               )}
             </div>
@@ -991,16 +1151,21 @@ export function NewTaskPanel({
             disabled={submitting}
             workspaceSelection={{ mode: workspaceMode, baseRef: workspaceBaseRef }}
             gitInfo={projectGitInfo}
-            onWorkspaceChange={(mode, baseRef) => guardNewTaskConfigurationMutation(submittingRef.current, () => setWorkspaceChoice({ projectId: selectedProject?.id || projectId, mode, baseRef }))}
-            onSelect={(project) => guardNewTaskConfigurationMutation(submittingRef.current, () => setProjectId(project.id))}
+            onWorkspaceChange={(mode, baseRef) => guardNewTaskConfigurationMutation(submittingRef.current, () => automaticScope ? setAutomaticWorkspace(mode) : setWorkspaceChoice({ projectId: selectedProject?.id || projectId, mode, baseRef }))}
+            onSelect={(project) => guardNewTaskConfigurationMutation(submittingRef.current, () => { setRouteAutomatically(false); setProjectId(project.id); setRequirementId(undefined) })}
             onProjectsChange={setProjects}
+            requirements={requirementsEnabled && !useAssistant ? requirements : undefined}
+            requirementId={effectiveRequirementId}
+            requirementsLoading={requirementsLoading}
+            requirementsError={requirementsError}
+            onRequirementSelect={requirement => guardNewTaskConfigurationMutation(submittingRef.current, () => { setRouteAutomatically(false); setRequirementId(requirement.id); if (requirement.projectId) setProjectId(requirement.projectId) })}
+            autoRouting={!isTeam && !useAssistant ? {
+              selected: routeAutomatically,
+              available: !!router?.config.enabled && router.available,
+              reason: router?.reason,
+              onSelect: () => guardNewTaskConfigurationMutation(submittingRef.current, () => { setRequirementId(undefined); setRouteAutomatically(true) })
+            } : undefined}
           />
-
-          {requirementsEnabled && <RequirementPicker value={requirementId} disabled={submitting} onChange={id => guardNewTaskConfigurationMutation(submittingRef.current, () => {
-            setRequirementId(id)
-            const boundProjectId = resolveRequirementProjectId(id, requirements, projects)
-            if (boundProjectId) setProjectId(boundProjectId)
-          })} />}
 
           {!isTeam && permissionModes.length > 0 && (
             <label className="cfg">
@@ -1053,11 +1218,11 @@ export function NewTaskPanel({
             </summary>
             <div className="sb-menu-pop nt-mode-menu">
               <div className="sb-menu-label">执行方</div>
-              <div className="sb-sub-wrap">
+              {!routerOnly && <div className="sb-sub-wrap">
                 <button type="button" className={'sb-menu-item sb-sub-entry ' + (activeSub === 'team' ? 'is-sub-open' : '')} disabled={submitting} aria-expanded={activeSub === 'team'} onClick={() => setActiveSub(s => s === 'team' ? null : 'team')}><UiIcon name="users" size={14} /><span className="sb-entry-body">专家团<small>由 Leader 统一与你沟通</small></span><UiIcon name="chevron-right" size={13} /></button>
-                {activeSub === 'team' && <SubmenuPopover><div className="sb-menu-label">专家团</div>{teams.filter(t => t.status !== 'archived').map(t => <button key={t.id} type="button" className={'sb-menu-item sb-sub-opt ' + (isTeam && t.id === teamId ? 'is-sel' : '')} disabled={submitting || t.status !== 'active' || !!teamUnavailableReasons[t.id]} title={teamUnavailableReasons[t.id]} onClick={() => { if (submittingRef.current) return; setTeamId(t.id); setExecutor('team'); setUseAssistant(false); setSubmitError(''); localStorage.setItem('uniagent.mode', 'team'); localStorage.setItem('ua.lastTeamId', t.id) }}><span className="sb-sub-radio" /><span className="sb-entry-body">{t.name}<small>{teamUnavailableReasons[t.id] || (t.status === 'draft' ? '草稿 · 请先启用' : (t.members.find(m => m.id === t.leaderMemberId)?.role.name || '') + ' · Leader · ' + t.members.length + ' 人')}</small></span></button>)}{!teams.some(t => t.status === 'active') && <div className="sb-menu-label">暂无已启用的专家团</div>}<div className="sb-menu-sep" /><button type="button" className="sb-menu-item" onClick={onManageTeams}><UiIcon name="settings" size={14} />管理专家团</button></SubmenuPopover>}
-              </div>
-              {/* Agent picker — home-only entry row (in-session locks the agent). */}
+                {activeSub === 'team' && <SubmenuPopover><div className="sb-menu-label">专家团</div>{teams.filter(t => t.status !== 'archived').map(t => <button key={t.id} type="button" className={'sb-menu-item sb-sub-opt ' + (isTeam && t.id === teamId ? 'is-sel' : '')} disabled={submitting || t.status !== 'active' || !!teamUnavailableReasons[t.id]} title={teamUnavailableReasons[t.id]} onClick={() => { if (submittingRef.current) return; setTeamId(t.id); setExecutor('team'); setUseAssistant(false); setRouteAutomatically(false); setSubmitError(''); localStorage.setItem('uniagent.mode', 'team'); localStorage.setItem('ua.lastTeamId', t.id) }}><span className="sb-sub-radio" /><span className="sb-entry-body">{t.name}<small>{teamUnavailableReasons[t.id] || (t.status === 'draft' ? '草稿 · 请先启用' : (t.members.find(m => m.id === t.leaderMemberId)?.role.name || '') + ' · Leader · ' + t.members.length + ' 人')}</small></span></button>)}{!teams.some(t => t.status === 'active') && <div className="sb-menu-label">暂无已启用的专家团</div>}<div className="sb-menu-sep" /><button type="button" className="sb-menu-item" onClick={onManageTeams}><UiIcon name="settings" size={14} />管理专家团</button></SubmenuPopover>}
+              </div>}
+              {/* Each new task can choose its execution Agent. */}
               <div className="sb-sub-wrap">
                 <button
                   type="button"
@@ -1076,7 +1241,7 @@ export function NewTaskPanel({
                 {activeSub === 'agent' && (
                   <SubmenuPopover>
                     <div className="sb-menu-label sb-sub-title">Agent</div>
-                    <AssistantPicker enabled={useAssistant && !isTeam} available={!!assistant?.assistant.enabled} disabled={submitting || selectingAssistant} onChange={enabled => void changeAssistant(enabled)} onManage={() => (onOpenAssistantSettings || onOpenSettings)?.()}>
+                    <AssistantPicker visible={!routerOnly} enabled={useAssistant && !isTeam} available={!!assistant?.assistant.enabled} disabled={submitting || selectingAssistant} onChange={enabled => void changeAssistant(enabled)} onManage={() => (onOpenAssistantSettings || onOpenSettings)?.()}>
                     {!installed.length && <span className="sb-menu-empty">没有已启用的 Agent</span>}
                     {installed.map((item) => (
                       <button
@@ -1240,8 +1405,8 @@ export function NewTaskPanel({
           <span className="sb-spacer" />
           <button
             className="btn-send new-task-send-btn"
-            aria-label={submitting ? '创建中' : '开始'}
-            title={submitting ? '创建中…' : '开始（⌘⏎）'}
+            aria-label={submitting ? '创建中' : routerOnly ? '新建任务' : '开始'}
+            title={submitting ? '创建中…' : routerOnly ? '新建任务（⌘⏎）' : '开始（⌘⏎）'}
             disabled={
               (command
                 ? !prompt.trim()
@@ -1249,12 +1414,14 @@ export function NewTaskPanel({
               !workdir ||
               submitting ||
               selectingAssistant ||
-              (workspaceMode === 'worktree' && !projectGitInfo?.canCreateWorktree) ||
+              (routerOnly && (!routerImagesReady || !router?.config.enabled || !router.available)) ||
+              workspacePending ||
+              worktreeUnavailable ||
               (isTeam ? !team || team.status !== 'active' || !!teamUnavailableReasons[team.id] || !prompt.trim() : !agent || agent.incompatible || permissionModes.length === 0)
             }
             onClick={submit}
           >
-            {submitting ? <span className="loading-spinner" aria-hidden /> : <SendIcon />}
+            {submitting ? <span className="loading-spinner" aria-hidden /> : routerOnly ? '新建任务' : <SendIcon />}
           </button>
         </div>
         <ReviewStartDialog
@@ -1264,14 +1431,14 @@ export function NewTaskPanel({
           onSubmit={startReview}
         />
         {!!incompatibleAttachments.length && <div className="attachment-warning" role="alert">当前执行方不支持以下附件，请移除或切换执行方：{incompatibleAttachments.map(a => <button key={a.path} type="button" disabled={submitting} onClick={() => removeAttachment(attachments.indexOf(a))}>移除 {a.name}</button>)}</div>}
-        {submitError && (
+        {(submitError || worktreeSettingsError) && (
           <span className="attachment-warning" role="alert">
-            创建任务失败：{submitError}
+            {submitError ? `创建任务失败：${submitError}` : worktreeSettingsError}
           </span>
         )}
       </div>
       <p className="hint">
-        {isTeam ? 'Leader：' + (teamLeader?.name || '待选择') + ' · 成员按各自角色配置执行 · 开始后执行方锁定' : agent?.adapter === 'zcode'
+        {routerOnly ? !router?.config.enabled ? '请先启用 RouterAgent' : router.reason || (!installed.length ? '暂无可用的执行 Agent，请前往设置检查' : '提交后自动排队 · RouterAgent 仅分配任务') : isTeam ? 'Leader：' + (teamLeader?.name || '待选择') + ' · 成员按各自角色配置执行 · 开始后执行方锁定' : agent?.adapter === 'zcode'
           ? '会话开始后执行方将被锁定 · 模型、思考深度、权限与 Plan 可在轮次间调整。'
           : '会话开始后执行方将被锁定（模型、推理深度、权限可在轮次间调整）。'}
       </p>

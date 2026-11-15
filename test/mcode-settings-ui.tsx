@@ -64,7 +64,7 @@ const missing: MCodeConnectionSnapshot = {
 const needsAuth: MCodeConnectionSnapshot = { ...missing, installed: true, bin: '/native/bin/mcode', version: '0.6.12', status: 'needs-auth', needsLogin: true }
 const ready: MCodeConnectionSnapshot = { ...needsAuth, status: 'ready', needsLogin: false }
 
-function harness(snapshot: MCodeConnectionSnapshot, api: Record<string, unknown> = {}) {
+function harness(snapshot: MCodeConnectionSnapshot, api: Record<string, unknown> = {}, agent = notInstalledAgent) {
   const values: unknown[] = [snapshot]
   const refs: Array<{ current: unknown }> = []
   let redetects = 0
@@ -83,7 +83,7 @@ function harness(snapshot: MCodeConnectionSnapshot, api: Record<string, unknown>
       useEffect() {}
     }
     try {
-      return MCodeSettings({ agent: notInstalledAgent, onRedetect: () => { redetects++ }, installation: <div>installation-details</div>, defaultParameters: <div>default-parameters</div> })
+      return MCodeSettings({ agent, onRedetect: () => { redetects++ }, installation: <div>installation-details</div>, defaultParameters: <div>default-parameters</div> })
     } finally { dispatcher.current = previous }
   }
   const elements = (): ReactElement<any>[] => {
@@ -110,6 +110,11 @@ try {
   assert.match(readyPage.markup(), /default-parameters/)
   assert.match(readyPage.markup(), /连接检测超时/)
   assert.doesNotMatch(readyPage.markup(), /deepseek-step/)
+
+  const expired = harness(ready, {}, { ...notInstalledAgent, installed: true, lifecycle: { ...notInstalledAgent.lifecycle!, availability: 'needs-auth', lastReadyAt: 1 } })
+  assert.match(expired.markup(), /一键登录/, 'confirmed missing auth must override a stale ready snapshot')
+  expired.snapshot({ ...needsAuth, status: 'failed', message: '此前检测未完成' })
+  assert.match(expired.markup(), /一键登录/, 'a previous failed snapshot must not hide confirmed login actions')
 
   const absent = harness(missing)
   assert.match(absent.markup(), /一键安装/)

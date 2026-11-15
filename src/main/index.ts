@@ -1,4 +1,10 @@
-import { APP_NAME, isDistributionAgent } from '../shared/distribution.ts'
+import { QODER_IPC } from '../shared/qoder'
+import { registerSessionDeletionIpc } from './sessionDeletionIpc'
+import { listQoderByok, saveQoderByok, deleteQoderByok } from './qoderByok'
+import { APP_NAME, INTERNAL_DISTRIBUTION, isDistributionAgent } from '../shared/distribution.ts'
+import { cloudMonitorConfig } from '../shared/cloudMonitorConfig'
+import { CloudMonitor } from './cloudMonitor'
+import { FORK_IPC, type ForkRequest } from '../shared/sessionFork'
 import { ClaudeSourceService } from './claudeSourceService'
 import { configureClaudeSourceRuntime, closeClaudeSourceRuntimes } from './claudeSourceRuntime'
 import { CLAUDE_SOURCE_IPC, MODEL_CREDENTIAL_IPC, type ModelSourceClient, type CredentialSelection } from '../shared/claudeSources'
@@ -10,6 +16,7 @@ import { WeixinApi } from './assistant/weixinApi'
 import { WeixinStore } from './assistant/weixinStore'
 import { WEIXIN_IPC, acceptsFeishuAssistant } from '../shared/weixin'
 import { UniAgentManagement } from './assistant/manage'
+import { validateDefinedAppPatch } from '../shared/settingsDefinition'
 import { AppRestartService, RESTART_ARG, type RestartActivity } from './appRestart'
 import { inspectRestartTarget } from './appRestartTarget'
 import { relaunchApp } from './appRelaunch'
@@ -17,11 +24,49 @@ import { MANAGE_CONFIRMATION_PREFIX } from '../shared/uniagentManage'
 import { ManagementDocuments } from './assistant/manageDocuments'
 import { agentInitializationPrompt } from '../shared/agentInitialization'
 import { withAgentDefaults } from '../shared/agentChoices'
+import { parseAssistantConversationSelection, resolveAssistantConversationConfig, type AssistantConversationSelection } from '../shared/assistantConversation'
 import { ASSISTANT_IPC, type AssistantInput, type DocumentEdit, type AssistantDocumentType } from '../shared/assistant'
 import { teamInteractionForUser } from '../shared/teamQuestions'
 import { RequirementStore } from './requirementStore'
+import { resolveAutomationTaskConfig, resolveTaskCreationScope } from './taskScope'
+import { mergeAutomationPatch } from '../shared/automationOwnership'
+import { TaskCreation, taskRegistration, validateTaskAttachments, type TaskCreationRecord, type TaskCreationContext } from './taskCreation'
+import { TASK_IPC, type TaskDecisionAnswer } from '../shared/taskDecisions'
+import { TaskDecisionResolver } from './requestResponseGate'
+import { TaskLifecycleStore } from './taskLifecycleStore'
+import { TaskLifecycleService } from './taskLifecycleService'
+import { registerWorktreeArchiveIpc, WorktreeArchiveRuntime } from './worktreeArchive'
+import { registerSessionWorktreeStatusIpc } from './sessionWorktreeStatus'
+import { WORKTREE_ARCHIVE_IPC } from '../shared/worktreeArchive'
+import { TaskMetadataStore } from './taskMetadataStore'
+import { TaskTitleService } from './taskTitleService'
+import { RouterController } from './router/controller'
+import { RouterContextService } from './router/context'
+import { createRouterStore } from './router/store'
+import { generateDeepSeekTitle } from './taskTitleDeepSeek'
+import { getDeepSeekHost } from './deepseekService'
+import { configureGlobalMemoryContext } from './assistant/context'
+import { ProjectMemoryService } from './projectMemory'
+import { configureProjectMemoryRuntime } from './projectMemoryRuntime'
+import { configureRequirementNavigation } from './requirementNavigation'
+import { PROJECT_MEMORY_IPC, PROJECT_MEMORY_CHANGED, type ProjectMemoryRequest } from '../shared/projectMemory'
+import { routerTargetVersion } from './router/target'
+import { ROUTER_IPC, routerConfig, resolveRouterConfig, type RouterConfig, type RouterInput, type RouterResolution, type GlobalMemoryRequest } from '../shared/router'
+import { ROUTER_REVIEW_IPC, type RouterFeedbackInput, type RouterReviewQuery, type RouterReviewDeletionItem } from '../shared/routerReview'
+import { isSessionBusy } from '../shared/sessionStatus'
+import { bindTaskTitleLocalSourceChanges, bindTaskTitleSourceChanges, taskTitleGeneratorSignature, taskTitleSelectionMatches, taskTitleSessionPolicy, TaskTitleIntegration, TaskTitleTrials, type TaskTitleSelectionChange, type TaskTitleTrialInput } from './taskTitleIntegration'
+import { TaskTitleRuntimePool, type TaskTitleUsage } from './taskTitleRuntime'
+import { TaskGenerationConversations, registerTaskGenerationIpc } from './taskGenerationConversation'
+import { TASK_GENERATION_IPC } from '../shared/taskGeneration'
+import { QuickReplyService } from './quickReplyService'
+import { QUICK_REPLY_SCHEMA } from '../shared/quickReplies'
+import { isTaskTitleEligible } from '../shared/taskTitle'
+import type { TaskTitleGenerationConfig, TaskTitleGeneratorRef } from '../shared/types'
+import { taskTurnRevision, type TaskDecisionInput } from '../shared/taskLifecycle'
+import { projectTaskBoard, type TaskBoardQuery } from '../shared/taskBoard'
 import { RequirementDistiller } from './requirementDistiller'
-import { extractRequirementText, requirementExtractionUnsupported } from './requirementExtractionRuntime'
+import { resolveTaskTitleConfig } from '../shared/taskTitle'
+import { runRequirementCuration } from './requirementCurationRuntime'
 import { configureRequirementRuntime, isRequirementsEnabled, requirementCaller, setRequirementsEnabled } from './requirementRuntime'
 import { REQUIREMENT_IPC, type RequirementInput, type RequirementPatch } from '../shared/requirementTypes'
 import { app, BrowserWindow, ipcMain, dialog, shell, clipboard, nativeImage, Notification, powerSaveBlocker } from 'electron'
@@ -47,8 +92,10 @@ import { listAutomations, setAutomationStatus, getAutomationDetail, updateAutoma
 import { NativeAutomations } from './nativeAutomations'
 import { hydratePathFromLoginShell } from './env'
 import { reconcilePricing } from './pricing'
+import { configureQoderRegionProvider } from './agents'
 import { PrefsStore } from './prefsStore'
 import { AppSettingsStore } from './appSettingsStore'
+import { defaultRecoverySettings } from '../shared/sessionRecovery'
 import { CodexSourceService } from './codexSourceService'
 import { cancelDeepSeekInstall, cancelDeepSeekSignIn, checkDeepSeekConnection, closeDeepSeekHost, configureDeepSeekOnboarding, deepseekSnapshot, installDeepSeek, isDeepSeekMaintenance, readDeepSeekConnection, readDeepSeekReusableConnection, reopenDeepSeekSignIn, saveDeepSeekConnection, signInDeepSeek, signOutDeepSeek } from './deepseekService'
 import { DEEPSEEK_IPC, type DeepSeekConnectionInput } from '../shared/deepseek'
@@ -67,6 +114,7 @@ import { configureCodexAppServerArgsProvider } from './appServerAdapter'
 import { DEFAULT_PROJECT_ID, ProjectStore } from './projectStore'
 import { WorktreeService, parseWorkspaceSelection, sessionUsesWorktree, assertWorktreeNotRemoving } from './worktreeService'
 import { SessionStore } from './sessionStore'
+import { sessionInfoRevealPath } from '../shared/sessionInfo'
 import { setFrameHealthReporter } from './windowFrameHealth'
 import { AgentLifecycleService } from './agentLifecycleService'
 import { IdleAgentUpdater } from './idleAgentUpdater'
@@ -81,6 +129,7 @@ import { FeishuInstaller, type FeishuInstallProgress } from './feishuInstaller'
 import {
   ensureHandoffServer,
   watchHandoffInbox,
+  watchAutomationInbox,
   watchFeishuSendInbox,
   watchTeamInbox,
   watchRequirementInbox,
@@ -111,12 +160,14 @@ import {
   isUuid,
   parseCapabilityExecuteRequest,
   parseCapabilityInventorySyncRequest,
+  parseCapabilityInventoryDetailRequest,
   parseCapabilityPluginActionRequest,
   parseCapabilityPlanRequest,
   parseCapabilityPreviewRequest,
   parseCapabilityScanRequest,
   type CapabilityRollbackCandidate,
   type CapabilityAgentId,
+  type CapabilityProviderId,
   type CapabilityInventorySyncPreparation,
   type CapabilityScanResult,
   type CapabilitySyncJob,
@@ -193,6 +244,8 @@ import type {
 import { parseNativeThreadAction } from '../shared/nativeCapabilities'
 import type { DetailExplanationContext } from '../shared/detailQuickChat'
 import { appNotificationBody, SessionAttentionBadge, shouldShowAppNotification } from './appNotifications'
+import { SessionAttentionStore } from './sessionAttentionStore'
+import type { LegacySessionAttention, ReplyUnreadKind } from '../shared/sessionAttention'
 import { resolveUserDataHome } from './userData'
 import { AgentUpdateStatusChecker } from './agentUpdateStatusChecker'
 import { readonlyGrokInventoryRunner, getGrokInventoryDetail } from './grokInventory'
@@ -263,9 +316,10 @@ const codexConfigMutations = new CodexConfigMutationQueue()
 const codexSources = new CodexSourceService()
 const claudeSources = new ClaudeSourceService()
 const modelCredentials = new ModelCredentials({ codex: () => codexSources.reusableSources(), claude: () => claudeSources.reusableSources(), deepseek: readDeepSeekReusableConnection })
-configureClaudeModelsProvider(models => claudeSources.mergeModels(models))
+configureClaudeModelsProvider(models => claudeSources.refreshModels(models))
 configureClaudeSourceRuntime(config => claudeSources.connection(config))
-claudeSources.on('changed', snapshot => mainWindow?.webContents.send(CLAUDE_SOURCE_IPC.changed, snapshot))
+bindTaskTitleSourceChanges(claudeSources, 'claude', invalidateTaskTitleSelection)
+claudeSources.on('changed', snapshot => { mainWindow?.webContents.send(CLAUDE_SOURCE_IPC.changed, snapshot) })
 kimiOnboarding.onChanged = snapshot => mainWindow?.webContents.send('kimi:setup-changed', snapshot)
 configureDeepSeekOnboarding({
   openBrowser: url => shell.openExternal(url),
@@ -288,15 +342,19 @@ const zcodeInstallation = new ZCodeInstallationService(undefined, reportZCodeSet
 const codexModelSources = new CodexModelSources(codexSources)
 configureCodexModelsProvider(models => codexModelSources.mergeModels(models))
 configureCodexAppServerArgsProvider(config => codexModelSources.runtimeArgs(config))
-codexSources.on('changed', snapshot => mainWindow?.webContents.send(CODEX_SOURCE_IPC.changed, snapshot))
+bindTaskTitleSourceChanges(codexSources, 'codex', invalidateTaskTitleSelection)
+codexSources.on('changed', snapshot => { mainWindow?.webContents.send(CODEX_SOURCE_IPC.changed, snapshot) })
 
-const requirements = new RequirementStore(undefined, () => mainWindow?.webContents.send(REQUIREMENT_IPC.changed))
+let notifyRouterRequirementChanges: (() => void) | undefined
+const requirements = new RequirementStore(undefined, () => { mainWindow?.webContents.send(REQUIREMENT_IPC.changed); publishHandoffCatalog(); notifyRouterRequirementChanges?.() })
 const prefs = new PrefsStore(undefined, (id) => agents.find((agent) => agent.id === id))
 let agentPrefs: PrefsData | undefined
 const getAgentPref = (agentId: string): AgentPref | undefined => (agentPrefs ||= prefs.get()).lastByAgent[agentId]
+configureQoderRegionProvider(() => getAgentPref('qoder')?.qoderRegion || 'cn')
 const resolveSessionConfig = (config: SessionConfig, validate = false): SessionConfig => {
+  const { taskScope: _scope, taskRequestId: _requestId, ...executionConfig } = config
   const agent = agents.find(agent => agent.id === config.agentId)
-  const normalized = claudeSources.normalize(codexModelSources.normalize(withAgentDefaults(agent, config, getAgentPref(config.agentId))))
+  const normalized = claudeSources.normalize(codexModelSources.normalize(withAgentDefaults(agent, executionConfig, getAgentPref(config.agentId))))
   if (validate) {
     codexModelSources.assertReady(normalized)
     claudeSources.assertReady(normalized)
@@ -309,6 +367,7 @@ const resolveSessionConfig = (config: SessionConfig, validate = false): SessionC
 }
 let stopRequirementInbox: (() => void) | undefined
 const sessionStore = new SessionStore(undefined, (config) => resolveSessionConfig(config))
+const taskCreations = new TaskCreation(join(sessionStore.directory(), 'task-inputs'))
 const assertAgentRunReady = (agentId: string): void => {
   if (cliAgentSetup.busy(agentId)) throw new Error('该 Agent 正在安装、登录或检测，请完成后再启动任务')
   if (agentId === 'zcode' && (zcodeConfiguration.isBusy() || zcodeInstallation.isBusy())) throw new Error('ZCode 正在安装或检测配置，请完成后再启动任务')
@@ -324,6 +383,106 @@ const orchestrator = new Orchestrator(
   assertAgentRunReady,
   getAgentPref
 )
+const taskLifecycle = new TaskLifecycleService(new TaskLifecycleStore(join(sessionStore.directory(), 'task-lifecycle')), {
+  session: id => orchestrator.getSessionById(id), busy: id => orchestrator.hasActiveSessionWork(id),
+  pending: id => orchestrator.taskDecisions(id).filter(decision => ['question','approval','plan'].includes(decision.type)).length, reserve: id => orchestrator.reserveTaskMutation(id),
+  turnRevision: id => taskTurnRevision(orchestrator.getSessionById(id)!, orchestrator.loadedSessionEvents(id)),
+  mirrorArchive: (id, archived) => orchestrator.applyTaskArchive(id, archived), publish: session => orchestrator.publishTaskState(session),
+  beforeArchive: session => worktreeArchive.prepare(session)
+})
+const worktreeArchive = new WorktreeArchiveRuntime({
+  session: id => orchestrator.getSessionById(id), busy: id => orchestrator.hasActiveSessionWork(id),
+  turnRevision: id => taskTurnRevision(orchestrator.getSessionById(id)!, orchestrator.loadedSessionEvents(id)),
+  related: session => session.teamBinding ? Object.values(teams.store.project(session.teamBinding.teamProjectId).memberSessions).map(id => orchestrator.getSessionById(id)).filter((s): s is Session => !!s) : [session],
+  send: (session, prompt, inputId) => session.teamBinding ? teams.send(session.teamBinding.teamProjectId, prompt, undefined, inputId) : orchestrator.sendMessage(session.id, prompt, undefined, undefined, false, { routedInputId: inputId }),
+  publish: reviews => mainWindow?.webContents.send(WORKTREE_ARCHIVE_IPC.changed, reviews)
+})
+orchestrator.on('taskTitleInputRecorded', (event: UAEvent) => worktreeArchive.observe(event))
+orchestrator.on('event', (event: UAEvent) => worktreeArchive.observe(event))
+orchestrator.on('statusChange', () => worktreeArchive.wake())
+orchestrator.on('sessionDeleted', (id: string) => worktreeArchive.remove(id))
+let taskTitleConfiguration: TaskTitleGenerationConfig | undefined
+let taskTitleAgentSignature = ''
+let quickRepliesEnabled = false
+const taskTitleRuntime = new TaskTitleRuntimePool()
+const taskGenerationConversations = new TaskGenerationConversations(join(sessionStore.directory(), 'task-generation'), taskId => mainWindow?.webContents.send(TASK_GENERATION_IPC.changed, { taskId }))
+const taskTitles = new TaskTitleService(new TaskMetadataStore(join(sessionStore.directory(), 'task-metadata')), {
+  session: id => orchestrator.getSessionById(id), agents: () => agents, config: () => taskTitleConfiguration,
+  history: id => orchestrator.getEvents(id),
+  release: id => taskTitleRuntime.close('task-summary:' + id),
+  generate: runTaskTitleGeneration, publish: session => orchestrator.publishTaskState(session)
+})
+const taskTitleEvents = new TaskTitleIntegration(taskTitles, id => orchestrator.getSessionById(id), id => orchestrator.loadedSessionEvents(id))
+orchestrator.configureSessionTitleGenerationPolicy(taskTitleSessionPolicy)
+const taskTitleTrials = new TaskTitleTrials(() => agents, runTaskTitleGeneration)
+const quickReplies = new QuickReplyService({
+  session: id => orchestrator.getSessionById(id), agents: () => agents,
+  config: () => ({ enabled: quickRepliesEnabled, model: taskTitleConfiguration }), publish: session => orchestrator.publishTaskState(session),
+  generate: (agent, config, prompt, signal, id) => runTaskTitleGeneration(agent, config, prompt, signal, undefined, id, true)
+})
+const taskTitleTrialSenders = new Set<number>()
+async function runTaskTitleGeneration(agent: AgentDef, config: TaskTitleGeneratorRef, prompt: string, signal: AbortSignal, images?: Attachment[], sessionId?: string, options?: { summary: true } | true, taskId?: string): Promise<string> {
+  const replies = options === true
+  const started = Date.now()
+  let usage: TaskTitleUsage | undefined
+  let status = 'completed', errorCode: string | undefined
+  const generate = () => taskTitleRuntime.generate(sessionId ? (replies ? 'quick-replies:' : 'task-summary:') + sessionId : undefined, agent, config, prompt, signal,
+    { onUsage: value => { usage = value }, ...(replies ? { outputSchema: QUICK_REPLY_SCHEMA }
+      : options ? { outputSchema: { type: 'object', properties: { summary: { type: 'string', maxLength: 2400 } }, required: ['summary'], additionalProperties: false } } : {}) }, images)
+  const task = orchestrator.getSessionById(replies ? sessionId || '' : taskId || '')
+  try { return await (task ? taskGenerationConversations.run({ task, kind: replies ? 'quick-replies' : options ? 'context-summary' : 'title-description',
+    contextId: sessionId, agentName: agent.name, model: config.model, prompt, images, signal }, generate) : generate()) }
+  catch (error) { status = signal.aborted ? 'cancelled' : 'failed'; errorCode = (error as any)?.code || 'task_title_failed'; throw error }
+  finally { logTokenUsage(replies ? 'quick-replies' : 'task-title', status, { agentId: agent.id, model: config.model, modelSource: config.modelSource,
+    elapsedMs: Date.now() - started, ...(usage ? { usage } : {}), ...(errorCode ? { errorCode } : {}) }) }
+}
+function invalidateTaskTitleConfiguration(): void { taskTitles.configurationChanged(); taskTitleTrials.cancelAll(); quickReplies.configurationChanged(); void taskTitleRuntime.close() }
+function invalidateTaskTitleSelection(change: TaskTitleSelectionChange): void {
+  if (taskTitleSelectionMatches(taskTitleConfiguration, change)) { taskTitles.configurationChanged(); quickReplies.configurationChanged(); void taskTitleRuntime.close() }
+  taskTitleTrials.selectionChanged(change)
+}
+orchestrator.on('sessionCreated', (session: Session) => { if (isTaskTitleEligible(session)) taskTitles.store.initialize(session, !!session.titleLocked || session.origin === 'imported') })
+orchestrator.on('taskTitleInputRecorded', (event: UAEvent) => taskTitleEvents.observe(event))
+orchestrator.on('event', (event: UAEvent) => taskTitleEvents.observe(event))
+orchestrator.on('taskInputAccepted', (id: string) => taskTitleEvents.accepted(id))
+orchestrator.on('taskTitleInputRecorded', (event: UAEvent) => quickReplies.observe(event))
+orchestrator.on('event', (event: UAEvent) => quickReplies.observe(event))
+orchestrator.on('taskInputAccepted', (id: string) => quickReplies.accepted(id))
+orchestrator.on('sessionArchived', (id: string) => { quickReplies.remove(id); void taskTitleRuntime.close(id) })
+orchestrator.on('sessionDeleted', (id: string) => { quickReplies.remove(id); void taskTitleRuntime.close(id) })
+orchestrator.on('sessionArchived', (id: string) => taskTitleEvents.remove(id))
+orchestrator.on('sessionDeleted', (id: string) => { taskTitleEvents.remove(id); void taskTitles.store.remove(id).catch(error => recordRuntime('task-title', 'metadata_remove_failed', error, 'warn', id)) })
+orchestrator.on('sessionDeleted', (id: string) => { void taskGenerationConversations.remove(id).catch(error => recordRuntime('task-generation', 'history_remove_failed', error, 'warn', id)) })
+orchestrator.configureTaskArchive((id, archived) => taskLifecycle.archive(id, archived))
+orchestrator.on('taskInputAccepted', (id: string) => {
+  void taskLifecycle.inputAccepted(id).catch(error => {
+    const session = orchestrator.getSessionById(id)
+    if (session) { session.taskState = { phase: session.taskState?.phase || 'active', version: session.taskState?.version || 0, updatedAt: Date.now(), awaitingAcceptance: !!session.taskState?.awaitingAcceptance, error: '任务输入已接受，但业务状态保存待确认：' + String(error) }; orchestrator.publishTaskState(session) }
+  })
+})
+const liveTaskDecisionSources = new Set<string>()
+const noteTaskDecisions = (id: string): void => {
+  if (!orchestrator.getSessionById(id)) return
+  liveTaskDecisionSources.add(id)
+  void taskLifecycle.noteDecisions(id, orchestrator.taskDecisions(id)).catch(error => recordRuntime('task', 'decision_hint_write_failed', error))
+}
+orchestrator.on('event', (event: UAEvent) => {
+  if (event.type === 'approval_request' || event.type === 'error' || event.type === 'turn_completed' || event.type === 'agent_message' && event.payload.delivery === 'async') noteTaskDecisions(event.sessionId)
+})
+orchestrator.on('sideEvent', ({ sessionId, event }: { sessionId: string; event: UAEvent }) => {
+  if (event.type === 'approval_request' || event.type === 'error' || event.type === 'turn_completed' || event.type === 'agent_message' && event.payload.delivery === 'async') noteTaskDecisions(sessionId)
+})
+orchestrator.on('statusChange', ({ sessionId }: { sessionId: string }) => { if (liveTaskDecisionSources.has(sessionId)) noteTaskDecisions(sessionId) })
+orchestrator.on('sessionDeleted', (id: string) => liveTaskDecisionSources.delete(id))
+const taskBoardChanged = (): void => { mainWindow?.webContents.send(TASK_IPC.changed) }
+const deletingSessionIds = new Set<string>()
+for (const name of ['sessionCreated', 'sessionUpdated', 'sessionArchived', 'sessionDeleted', 'statusChange']) orchestrator.on(name, taskBoardChanged)
+orchestrator.on('event', (event: UAEvent) => {
+  if (event.type === 'approval_request' || event.type === 'error' || event.type === 'turn_completed' || event.type === 'agent_message' && event.payload.delivery === 'async') taskBoardChanged()
+})
+orchestrator.on('sideEvent', ({ event }: { event: UAEvent }) => {
+  if (event.type === 'approval_request' || event.type === 'error' || event.type === 'turn_completed' || event.type === 'agent_message' && event.payload.delivery === 'async') taskBoardChanged()
+})
 const comments = new CommentService({
   store: new CommentStore(join(sessionStore.directory(), 'comments')),
   session: id => orchestrator.getSessionById(id), events: id => orchestrator.getEvents(id),
@@ -344,7 +503,9 @@ const comments = new CommentService({
   }
 })
 comments.on('changed', thread => mainWindow?.webContents.send(COMMENT_IPC.changed, thread))
+comments.on('removed', reference => mainWindow?.webContents.send(COMMENT_IPC.removed, reference))
 const detailWindow = new DetailWindow({ owner: orchestrator, main: () => mainWindow, ui: resolveUiPath, ready: awaitSessionAgentReady,
+  theme: () => appSettings.get().theme,
   readFile: async (id, path, options, root) => {
     const workdir = orchestrator.getSessionById(id)?.config.workdir
     return readFileForPreview(typeof root === 'string' && isAbsolute(root) ? root : workdir, path, options)
@@ -353,7 +514,7 @@ const detailWindow = new DetailWindow({ owner: orchestrator, main: () => mainWin
 
 const personalAssistant = new PersonalAssistantService(orchestrator, id => agents.find(a => a.id === id),
   () => mainWindow?.webContents.send(ASSISTANT_IPC.changed), error => recordRuntime('personal-assistant', 'assistant_service_error', error),
-  workdir => projects.ensureProjectForDirectory(workdir), () => personalAssistantDefaultConfig())
+  workdir => projects.ensureProjectForDirectory(workdir), selection => personalAssistantDefaultConfig(selection))
 requirements.configureContext({
   events: id => orchestrator.getEvents(id),
   requirementId: id => orchestrator.getSessionById(id)?.config.requirementId,
@@ -373,35 +534,46 @@ const readRequirementContext = (sessionId: string, request: import('../shared/re
       value.sync.recovering = requirementRecoveryPending
       if (requirementRecoveryPending) value.sync.status = 'pending'
     }
-    if (request.action === 'bootstrap' && value.formatVersion === 2) for (const pending of value.sync.pending) {
-      if (pending.sessionId !== caller.id) requirementDistiller.schedule(caller.config.requirementId!, pending.sessionId, true)
-    }
+    if (request.action === 'sync_task' && value.saved) requirementDistiller.schedule(caller.config.requirementId!, caller.id)
+    if (request.action === 'commit' && !value.unchanged && !value.duplicate) requirementDistiller.schedule(caller.config.requirementId!, caller.id, false, 'reading')
     return value
   })
 }
 configureRequirementRuntime(id => orchestrator.getSessionById(id), readRequirementContext)
 const requirementDistiller = new RequirementDistiller(requirements, {
   session: id => orchestrator.getSessionById(id),
-  unsupported: session => requirementExtractionUnsupported(agents.find(agent => agent.id === session.config.agentId)),
-  extract: (session, prompt, signal) => extractRequirementText(agents.find(agent => agent.id === session.config.agentId)!, session.config, prompt, signal),
+  unsupported: () => {
+    const selected = appSettings.get().requirementCuration
+    if (!selected?.enabled) return '请在设置 · superAgent配置中启用需求后台整理'
+    const resolved = resolveTaskTitleConfig(selected, agents)
+    return !resolved.enabled ? resolved.reason.replace(/标题/g, '整理') : undefined
+  },
+  extract: async (session, prompt, signal, images) => {
+    const selected = appSettings.get().requirementCuration, resolved = resolveTaskTitleConfig(selected, agents)
+    if (!selected?.enabled || !resolved.enabled || !selected.agentId) throw new Error('后台整理配置不可用')
+    const choice = resolved.config!
+    await awaitAgentReady(choice.agentId)
+    return runRequirementCuration(requirements, session.config.requirementId!, agents.find(agent => agent.id === choice.agentId)!, choice, prompt, signal, images, {
+      normalizeCodex: config => { const normalized = codexModelSources.normalize(config); codexModelSources.assertReady(normalized); return normalized }
+    })
+  },
   report: (id, message) => orchestrator.reportRequirementSyncError(id, message)
 })
 
 function validateNativeAutomation(input: NativeAutomationInput): NativeAutomationInput {
-  if (!input || !['name', 'prompt', 'schedule', 'agentId', 'projectId', 'permissionMode'].every(key =>
+  if (!input || !['name', 'prompt', 'schedule', 'agentId', 'permissionMode'].every(key =>
     typeof input[key as keyof NativeAutomationInput] === 'string' && String(input[key as keyof NativeAutomationInput]).trim())) {
-    throw new Error('请填写任务名称、指令、执行计划、Agent、空间和权限')
+    throw new Error('请填写任务名称、指令、执行计划、Agent、归属和权限')
   }
   const agent = agents.find(item => item.id === input.agentId)
   if (!agent || agent.lifecycle?.availability !== 'available' || agentLifecycle.isUpdating(agent.id)) {
     throw new Error('所选 Agent 当前不可用，请等待就绪或重新选择')
   }
-  if (!projects.list().some(project => project.id === input.projectId)) throw new Error('所选空间已不存在，请重新选择')
   if (!agent.capabilities.permissionModes.some(mode => mode.id === input.permissionMode)) throw new Error('所选 Agent 不支持该权限模式')
   if (input.model && (!agent.capabilities.modelSelect || !agent.models.some(model => model.id === input.model))) throw new Error('所选模型已不可用，请重新选择')
   const model = agent.models.find(model => model.id === (input.model || agent.defaultModel))
   if (input.reasoningEffort && !model?.efforts.includes(input.reasoningEffort)) throw new Error('所选模型不支持该推理强度')
-  resolveSessionConfig({ agentId: input.agentId, projectId: input.projectId, workdir: '', model: input.model }, true)
+  resolveSessionConfig(resolveAutomationTaskConfig(input, id => requirements.get(id), id => !!projects.get(id), isRequirementsEnabled()), true)
   return { ...input, name: input.name.trim(), prompt: input.prompt.trim() }
 }
 
@@ -415,10 +587,7 @@ const nativeAutomations = new NativeAutomations({
     await awaitAgentReady(task.agentId)
     if (!isCurrent()) return null
     const input = validateNativeAutomation(task as NativeAutomationInput)
-    const config = resolveSessionConfig({
-      agentId: input.agentId, projectId: input.projectId, workdir: '',
-      model: input.model || undefined, effort: input.reasoningEffort, permissionMode: input.permissionMode
-    }, true)
+    const config = resolveSessionConfig(resolveAutomationTaskConfig(input, id => requirements.get(id), id => !!projects.get(id), isRequirementsEnabled()), true)
     return orchestrator.createSession(config, input.prompt)
   },
   getSession: id => orchestrator.getSessionById(id),
@@ -426,6 +595,11 @@ const nativeAutomations = new NativeAutomations({
   changed: () => mainWindow?.webContents.send(IPC.automationsChanged),
   onError: error => recordRuntime('automations', 'native_schedule_failed', error)
 })
+
+async function createNativeAutomation(input: NativeAutomationInput): Promise<AutomationDetail> {
+  await awaitAgentReady(input?.agentId)
+  return nativeAutomations.create(validateNativeAutomation(input))
+}
 /**
  * 需求一/二/三 — typed surface for the scope-aware review + rewind methods the
  * orchestrator gains in a parallel change. Casting once here lets this IPC shell
@@ -441,6 +615,16 @@ interface RewindCapableOrchestrator {
 }
 const rewindOrchestrator = orchestrator as unknown as RewindCapableOrchestrator
 const appSettings = new AppSettingsStore()
+taskTitleConfiguration = appSettings.get().taskTitleGeneration
+quickRepliesEnabled = appSettings.get().quickRepliesEnabled === true
+let recoverySettings = appSettings.get().sessionRecovery || defaultRecoverySettings()
+let worktreeAutoSync = appSettings.get().autoSyncWorktree === true
+let defaultTaskWorktree = appSettings.get().defaultTaskWorktree === true
+orchestrator.configureWorktreeSync(() => worktreeAutoSync)
+orchestrator.configureWorktreeDeletion(() => projects.list().flatMap(project => [project.primaryDirectory, ...project.additionalDirectories]))
+void orchestrator.configureErrorRecovery(() => recoverySettings).catch(error => {
+  diagnostics.record({ category: 'app_runtime', level: 'error', source: 'recovery', agentId: 'app', code: 'recovery_load_failed', message: '自动恢复记录读取失败，未启用恢复', sample: String(error) })
+})
 setRequirementsEnabled(appSettings.get().requirementsEnabled === true)
 let sleepBlockerId: number | undefined
 const legacyFeishuWorkdir = appSettings.get().feishu?.defaultWorkdir
@@ -463,20 +647,125 @@ const teams = new TeamService(orchestrator, projects, () => agents, undefined, (
   if (validate && requirements.get(resolved.requirementId)?.status === 'archived') throw new Error('所属需求已归档')
   return resolved
 })
+teams.configureDefaultWorktree(() => defaultTaskWorktree)
+teams.configureArchiveCheck(session => worktreeArchive.prepare(session))
+async function runAppTaskCreation<P, T>(requestId: string | undefined, kind: TaskCreationRecord['kind'], payload: P, text: string,
+  execute: (payload: P, context?: TaskCreationContext) => Promise<T>, existing: (record: TaskCreationRecord) => T | Promise<T>): Promise<T> {
+  if (requestId === undefined) return execute(payload)
+  try {
+    return await taskCreations.run(requestId, kind, payload, text, {
+      execute: (record, beforeDispatch) => execute(record.payload as P, { record, beforeDispatch }),
+      existing: async record => existing(record)
+    })
+  } finally {
+    const record = await taskCreations.get(requestId)
+    if (record && orchestrator.getSessionById(record.sessionId)) orchestrator.setTaskRegistration(record.sessionId, taskRegistration(record))
+  }
+}
+
+async function existingCreatedSession(record: TaskCreationRecord): Promise<Session> {
+  await awaitSessionHydration()
+  const existing = orchestrator.getSessionById(record.sessionId)
+  if (existing) return existing
+  // The receipt owns the identity even if the Session index write was interrupted.
+  const payload = record.payload as { config: SessionConfig }
+  await awaitAgentReady(payload.config.agentId)
+  const config = resolveSessionConfig(await personalAssistant.prepareConfig(payload.config), true)
+  return orchestrator.registerTaskSession(config, record.inputText, record.sessionId, taskRegistration(record))
+}
+
+const routerContext = new RouterContextService({ projects: () => projects.list(), requirements: () => isRequirementsEnabled() ? requirements.listAsync() : Promise.resolve([]),
+  routing: id => requirements.readRouting(id),
+  overview: (id, document, offset) => requirements.readOverview(id, document, { limit: 16000, offset }), sessions: () => orchestrator.managedSessions(),
+  events: id => orchestrator.getEvents(id), seed: session => taskTitles.store.current(session).seed })
+let projectMemory: ProjectMemoryService
+const router: RouterController = new RouterController(createRouterStore(join(sessionStore.directory(),'router','router.sqlite'),
+  app.isPackaged ? join(process.resourcesPath, 'tokenizers', 'deepseek-v4') : join(app.getAppPath(), 'resources', 'tokenizers', 'deepseek-v4')), {
+  appVersion: () => app.getVersion(),
+  projectMemory: (sessionId, args) => projectMemory.forSession(sessionId, args as ProjectMemoryRequest),
+  currentProjectMemory: row => projectMemory.isCurrent(row),
+  memoryChanged: () => mainWindow?.webContents.send(PROJECT_MEMORY_CHANGED),
+  reviewSaved: async feedback => { await cloudMonitor.feedback(feedback) },
+  agents:()=>agents,config:()=>appSettings.get().router,saveConfig:config=>{appSettings.set({router:config})},orchestrator,
+  extractMemory:(config,prompt,signal)=>generateDeepSeekTitle(config,prompt,signal,getDeepSeekHost,()=>{}),
+  generateDescription:(config,prompt,signal)=>generateDeepSeekTitle(config,prompt,signal,getDeepSeekHost,()=>{}),
+  generateRouting:(config,prompt,signal)=>generateDeepSeekTitle(config,prompt,signal,getDeepSeekHost,()=>{},[],{maxOutputChars:20000,maxTokens:16384}),
+  changed:()=>{mainWindow?.webContents.send(ROUTER_IPC.changed);taskBoardChanged();void feishuBridge.syncRouterRequests().catch(error=>recordRuntime('feishu','routing_sync_failed',error))},error:error=>recordRuntime('router','router_operation_failed',error),
+  beforeDispatch:(request,session)=>feishuBridge.prepareRoutedSession(request,session),
+  objects:()=>routerContext.objects(),
+  routing: requirements,
+  referenceObject: id => routerContext.reference(id),
+  newTask:async(request,decision,execution)=>{
+    let requirementId=decision.requirementId
+    if(decision.action==='create_requirement_and_task'){
+      if(!isRequirementsEnabled())throw new Error('需求功能已停用')
+      if(!projects.get(decision.projectId))throw new Error('所属空间不存在')
+      requirementId=(await requirements.createForOperation(request.requestId,{name:decision.requirementName!,projectId:decision.projectId})).id
+    }
+    const {projectId:_projectId,requirementId:_requirementId,...executionConfig}=execution
+    const config:SessionConfig={...executionConfig,taskScope:requirementId?{kind:'requirement',requirementId}:{kind:'space',projectId:decision.projectId!}}
+    const payload={config,prompt:request.prompt,attachments:request.attachments}
+    return runAppTaskCreation(request.requestId,'message',payload,request.prompt,async(saved,context)=>{
+      await validateTaskAttachments(saved.attachments)
+      return createWorkspaceSession(saved.config,decision.title||saved.prompt,async(runtime,id)=>{
+        if(!id||!context)throw new Error('router_creation_identity_required')
+        await context.beforeDispatch()
+        orchestrator.setTaskRegistration(id,taskRegistration(context.record))
+        const session=orchestrator.getSessionById(id)!
+        await feishuBridge.prepareRoutedSession(request,session)
+        await orchestrator.acceptRoutedInput(id,request.requestId,saved.prompt,saved.attachments,routerTargetVersion(session),request.feishu?'feishu':'app')
+        return session
+      },{kind:'message',prompt:saved.prompt,attachments:saved.attachments},context)
+    },existingCreatedSession)
+  },
+  recoverTask:async request=>{
+    const record=await taskCreations.get(request.requestId)
+    return record?existingCreatedSession(record):undefined
+  }
+},join(sessionStore.directory(),'router'))
+projectMemory = new ProjectMemoryService(router.store, { project: id => projects.get(id), session: id => orchestrator.getSessionById(id),
+  events: id => orchestrator.getEvents(id), changed: () => mainWindow?.webContents.send(PROJECT_MEMORY_CHANGED) })
+configureRequirementNavigation({ project: id => projects.get(id), code: (project,links) => router.store.memoryReferences(project,links) })
+configureProjectMemoryRuntime(async session => {
+  try { await router.prepareProjectMemory(session) }
+  catch (error) { recordRuntime('project-memory','project_memory_prepare_failed',error); orchestrator.appendSystemNotice(session.id,'本轮项目记忆暂不可用，任务继续执行；需要时请重试读取。') }
+})
+notifyRouterRequirementChanges = () => router.sourcesChanged()
+orchestrator.on('event',(event:UAEvent)=>{routerContext.observe(event);void router.event(event).catch(error=>recordRuntime('router','router_event_failed',error))})
+orchestrator.on('sessionCreated',(session:Session)=>router.trackSession(session))
+configureGlobalMemoryContext(async(id,config)=>{try{return await router.memoryContext(id,config)}catch(error){recordRuntime('router','global_memory_context_failed',error);orchestrator.appendSystemNotice(id,'本轮全局记忆暂不可用，请检查 Router 存储。');return ''}})
+
 async function createWorkspaceSession(
   input: SessionConfig,
   title: string,
   create: (config: SessionConfig, reservedSessionId?: string) => Session | Promise<Session>,
-  task?: Session['worktreeTask']
+  task?: Session['worktreeTask'],
+  registration?: TaskCreationContext
 ): Promise<Session> {
+  if (input.taskScope) {
+    if (input.taskScope.kind === 'requirement' && !isRequirementsEnabled()) throw new Error('需求功能已停用')
+    await ensureRequirementOwnership()
+    input = resolveTaskCreationScope(input, id => requirements.get(id), id => !!projects.get(id))
+  }
   if (input.worktree !== undefined) throw new Error('工作树绑定只能由主进程创建')
-  const selection = parseWorkspaceSelection(input.workspaceSelection)
+  let selection = parseWorkspaceSelection(input.workspaceSelection)
   const { workspaceSelection: _selection, ...plainConfig } = input
   const config = resolveSessionConfig(plainConfig, true)
+  const priorTree = registration && orchestrator.getSessionById(registration.record.sessionId)?.config.worktree
+  if (!selection && priorTree) selection = { mode: 'worktree', baseRef: priorTree.baseRef, requestId: priorTree.creationRequestId }
+  const sourceProject = projects.get(config.projectId)
+  if (!selection && sourceProject && !config.initializationTargetAgentId && !config.managedPurpose) {
+    selection = await worktrees.defaultSelection(sourceProject, selection, defaultTaskWorktree, registration?.record.requestId)
+  }
   // 建会话绑定校验：功能关闭时不接受需求绑定，避免重开开关后悄悄激活。
   if (config.requirementId && !isRequirementsEnabled()) throw new Error('需求功能已停用')
   await awaitAgentReady(config.agentId)
-  if (selection?.mode !== 'worktree') return create(config)
+  if (selection?.mode !== 'worktree') {
+    if (!registration) return create(config)
+    const { record } = registration
+    orchestrator.registerTaskSession(config, title, record.sessionId, taskRegistration(record))
+    return create(config, record.sessionId)
+  }
   if (config.initializationTargetAgentId) throw new Error('初始化任务不能创建工作树')
   if (agentLifecycle.isUpdating(config.agentId)) throw new Error('agent_update_in_progress')
   if (requirements.get(config.requirementId)?.status === 'archived') throw new Error('所选需求已归档，请重新选择')
@@ -491,16 +780,17 @@ async function createWorkspaceSession(
     return pending.promise
   }
   const promise = (async (): Promise<Session> => {
-    let session = orchestrator.listSessions().find(item => !item.teamBinding && item.config.worktree?.creationRequestId === key)
-    if (session && (session.config.projectId !== project.id || session.config.agentId !== config.agentId || session.config.requirementId !== config.requirementId || session.config.worktree?.baseRef !== selection.baseRef)) {
+    let session = registration ? orchestrator.getSessionById(registration.record.sessionId) : orchestrator.listSessions().find(item => !item.teamBinding && item.config.worktree?.creationRequestId === key)
+    if (session && (session.config.projectId !== project.id || session.config.agentId !== config.agentId || session.config.requirementId !== config.requirementId || !registration && selection.baseRef !== 'HEAD' && session.config.worktree?.baseRef !== selection.baseRef)) {
       throw new Error('工作树创建请求与草稿不一致，请重新选择工作方式')
     }
     if (session && session.status !== 'draft') return session
+    if (session) orchestrator.assertUserSessionEnabled(session.id)
     if (!session) {
       const worktree = await worktrees.allocate(project, selection)
-      session = orchestrator.reserveWorktreeSession({ ...config, worktree }, title, task)
+      session = orchestrator.reserveWorktreeSession({ ...config, worktree }, title, registration ? undefined : task, registration?.record.sessionId, registration && taskRegistration(registration.record))
     }
-    if (task) {
+    if (task && !registration) {
       if (!session.worktreeTask) orchestrator.updateWorktreeTask(session.id, task)
       void runWorktreeTask(session.id)
       return structuredClone(session)
@@ -553,6 +843,8 @@ function runWorktreeTask(sessionId: string): Promise<void> {
     try {
       orchestrator.updateWorktreeTask(sessionId, task)
       await awaitAgentReady(session.config.agentId)
+      if (orchestrator.getSessionById(sessionId) !== session || session.status !== 'draft') return
+      orchestrator.assertUserSessionEnabled(sessionId)
       if (session.config.worktree.state !== 'ready') {
         const tree = { ...session.config.worktree, state: 'creating' as const }
         delete tree.lastError
@@ -599,7 +891,7 @@ const idleAgentUpdater = new IdleAgentUpdater({
     mainWindow?.webContents.send(IPC.lifecycleProgress, { agentId: '*', phase: 'completed', message: '闲时更新检查完成' })
   }
 })
-// 后台更新状态检查：只查版本，不安装更新；结果用于外部列表的三态展示。
+// 后台更新状态检查：只查版本，不安装更新；结果用于外部列表的状态展示。
 const agentUpdateStatusChecker = new AgentUpdateStatusChecker({
   file: join(resolveUserDataHome(), 'agent-update-status.json'),
   lifecycle: agentLifecycle,
@@ -637,6 +929,10 @@ function projectRoles(): AgentRole[] {
   return migrated
 }
 const e2eEnabled = app.commandLine.hasSwitch('ua-e2e') && app.commandLine.hasSwitch('remote-debugging-port')
+const cloudMonitor = new CloudMonitor({ root: sessionStore.directory(),
+  config: app.isPackaged && !e2eEnabled ? cloudMonitorConfig : { ...cloudMonitorConfig, publishableKey: '' },
+  appVersion: app.getVersion(), distribution: INTERNAL_DISTRIBUTION ? 'internal' : 'public',
+  enabledAt: Math.floor(Date.now() - process.uptime() * 1000) })
 // Only the fully isolated packaged automation acceptance may mutate local fixtures.
 const e2eLocalAutomationPassthrough =
   e2eEnabled && process.env.UA_E2E_AUTOMATION_PASSTHROUGH === '1'
@@ -647,13 +943,34 @@ const e2eHistoryCalls = new Map<string, number>()
 // enabled with credentials; index.ts wires it into the orchestrator event fan-out
 // below and starts/stops it from settings changes + one-click install.
 const feishuThreads = new FeishuThreadStore()
-const feishuBridge = new FeishuBridge({
+const feishuBridge: FeishuBridge = new FeishuBridge({
   orchestrator,
+  router: {
+    status: () => { const config = routerConfig(appSettings.get().router); return { enabled: config.enabled, ...resolveRouterConfig(config, agents) } },
+    request: id => router.store.request(id),
+    topic: (botAppId, chatId, rootId, parentId, threadId) => router.store.feishuTopic(botAppId, chatId, rootId, parentId, threadId),
+    requests: async () => {
+      const [recent, pending] = await Promise.all([router.store.requests(), router.store.pending()])
+      return [...new Map([...recent, ...pending].map(request => [request.requestId, request])).values()]
+    },
+    submit: async input => { await startupProtocolSettled; return router.submit(input) },
+    resolve: input => router.resolve(input), cancel: (id, version) => router.cancel(id, version), retry: (id, version) => router.retry(id, version),
+    replaceCard: (id, expectedCardId, cardMessageId) => router.store.replaceFeishuCard(id, expectedCardId, cardMessageId)
+  },
+  onOpenSession: id => {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      createWindow()
+      mainWindow?.once('ready-to-show', () => mainWindow?.webContents.send(IPC.appNotificationOpenSession, id))
+    } else {
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.show(); mainWindow.focus(); mainWindow.webContents.send(IPC.appNotificationOpenSession, id)
+    }
+  },
   teams,
   threadStore: feishuThreads,
   acceptsSession: session => acceptsFeishuAssistant(session.config) && !assistantFeishuThreads.bySession(session.id) &&
     (!!feishuThreads.bySession(session.id) || !session.config.assistantSnapshot || !appSettings.get().assistantFeishu?.enabled),
-  assistantCommand: (id, command, requestId) => personalAssistant.commands.execute(id, command, requestId),
+  assistantCommand: (id, command, requestId, selection) => personalAssistant.commands.execute(id, command, requestId, selection),
   getAgents: () => agents,
   getSettings: () => appSettings.get().feishu,
   saveNotificationTarget: target => {
@@ -686,15 +1003,13 @@ const feishuBridge = new FeishuBridge({
   onSessionCreated: (session) => { mainWindow?.webContents.send(IPC.sessionCreated, session) },
   onSessionUpdated: session => mainWindow?.webContents.send(IPC.sessionUpdated, { session })
 })
-async function personalAssistantDefaultConfig(): Promise<SessionConfig> {
+async function personalAssistantDefaultConfig(input?: AssistantConversationSelection): Promise<SessionConfig> {
+  const selection = parseAssistantConversationSelection(input)
   const { assistant } = await personalAssistant.store.detail()
-  await awaitAgentReady(assistant.defaultAgentId)
-  const agent = agents.find(a => a.id === assistant.defaultAgentId)
-  if (!agent) throw new Error('个人助手默认 Agent 当前不可用，请到设置重新选择')
-  if (assistant.defaultModel && !agent.models.some(model => model.id === assistant.defaultModel)) throw new Error('个人助手默认模型已不可用，请到设置重新选择')
-  if (assistant.defaultPermissionMode && !agent.capabilities.permissionModes.some(mode => mode.id === assistant.defaultPermissionMode)) throw new Error('个人助手默认权限已不可用，请到设置重新选择')
-  return personalAssistant.prepareConfig({ useAssistant: true, agentId: agent.id, model: assistant.defaultModel,
-    permissionMode: assistant.defaultPermissionMode || agent.capabilities.permissionModes.find(mode => mode.id === 'ask')?.id || agent.capabilities.permissionModes[0]?.id || 'read-only', workdir: '' })
+  const agentId = selection?.agentId || assistant.defaultAgentId
+  await awaitAgentReady(agentId)
+  const agent = agents.find(a => a.id === agentId)
+  return personalAssistant.prepareConfig(resolveAssistantConversationConfig(assistant, agent, getAgentPref(agentId), selection))
 }
 const assistantFeishuThreads = new FeishuThreadStore(join(resolveUserDataHome(), 'assistants', 'feishu'),
   () => mainWindow?.webContents.send(ASSISTANT_IPC.privateSessionsChanged))
@@ -705,7 +1020,7 @@ const assistantFeishuBridge = new FeishuBridge({
   getSettings: () => appSettings.get().assistantFeishu,
   getAgentPref,
   acceptsSession: session => acceptsFeishuAssistant(session.config) && !!session.config.assistantSnapshot && !session.teamBinding && !session.handoffId && !feishuThreads.bySession(session.id),
-  assistantCommand: (id, command, requestId) => personalAssistant.commands.execute(id, command, requestId),
+  assistantCommand: (id, command, requestId, selection) => personalAssistant.commands.execute(id, command, requestId, selection),
   createAssistantSession: async (prompt, attachments, bind, assertCurrent) => {
     const config = await personalAssistantDefaultConfig()
     return createWorkspaceSession(config, prompt, runtime => {
@@ -738,8 +1053,8 @@ const assistantWeixinBridge = new WeixinBridge({
       return session
     })
   },
-  command: async (id, command, requestId) => {
-    const session = await personalAssistant.commands.execute(id, command, requestId)
+  command: async (id, command, requestId, selection) => {
+    const session = await personalAssistant.commands.execute(id, command, requestId, selection)
     mainWindow?.webContents.send(IPC.sessionCreated, session)
     return session
   },
@@ -786,7 +1101,7 @@ const capabilitySync = new CapabilitySyncService(
   process.env.UNIAGENT_CAPABILITY_HOME || undefined,
   process.env.UNIAGENT_CAPABILITY_DATA || undefined,
   undefined,
-  (['codex', 'traex'] as const).filter(id => isDistributionAgent(id))
+  (['codex', 'traex', 'qoder'] as const).filter(id => isDistributionAgent(id))
 )
 const nativeCapabilityService = new NativeCapabilityService(undefined, { discoverZCode: (workdir, sessionId) => orchestrator.discoverZCodeCapabilities(workdir, sessionId) })
 const managementDocuments = new ManagementDocuments({ requirements: () => requirements.list(), sessions: () => orchestrator.managedSessions(),
@@ -856,6 +1171,8 @@ const appRestart = new AppRestartService(join(resolveUserDataHome(), 'app-restar
 })
 const uniagentManagement = new UniAgentManagement({
   appRestart,
+  saveRouter: (config,version) => router.saveConfig(config,version),
+  recoveryErrors: async () => (await orchestrator.getRecoveryErrors()).map(error => ({value:error.key,label:error.label,agentId:error.agentId})),
   orchestrator, teams, agents: () => agents, roles: () => buildAgentRoleCatalog(projectRoles(),agents),
   saveRole: saveUniAgentRole, deleteRole: deleteUniAgentRole,
   appSettings: () => appSettings.get(), patchSettings: patchAppSettings,
@@ -909,7 +1226,10 @@ const uniagentManagement = new UniAgentManagement({
   updateAgent: async id => { if (cliAgentSetup.busy(id) || id === 'kimi' && kimiOnboarding.busy) throw new Error('请先完成或取消该 Agent 的安装与登录'); await awaitAgentReady(id); await agentLifecycle.updateOne(id,agentId => orchestrator.hasActiveAgentSessions(agentId)); agents = agentLifecycle.snapshot(); publishHandoffCatalog(); return agents.find(agent => agent.id === id)! },
   changed: resource => mainWindow?.webContents.send(ASSISTANT_IPC.manageChanged,resource)
 })
-personalAssistant.configureManagement(async (scope,request) => { await awaitSessionHydration(); await appRestartRecovery; return uniagentManagement.call(scope,request) })
+personalAssistant.configureManagement(
+  async (scope,request) => { await awaitSessionHydration(); await appRestartRecovery; return uniagentManagement.call(scope,request) },
+  async (scope,request) => { await awaitSessionHydration(); await appRestartRecovery; return uniagentManagement.callSettings(scope,request) }
+)
 
 let capabilityRecoveryFlight: Promise<void> | null = null
 let startupSessionHydration: Promise<void> | null = null
@@ -1066,6 +1386,15 @@ async function awaitSessionHydration(): Promise<void> {
   if (hydration) await hydration
 }
 
+let requirementOwnershipFlight: Promise<void> | undefined
+async function ensureRequirementOwnership(): Promise<void> {
+  if (!isRequirementsEnabled()) return
+  await awaitSessionHydration()
+  requirementOwnershipFlight ??= requirements.migrateProjectBindings(orchestrator.listSessions(), new Set(projects.list().map(project => project.id)))
+    .catch(error => { requirementOwnershipFlight = undefined; throw error })
+  await requirementOwnershipFlight
+}
+
 function projectHasActiveSession(projectId: string): boolean {
   return orchestrator.listSessions().some((session) =>
     session.config.projectId === projectId &&
@@ -1077,7 +1406,7 @@ async function awaitAgentReady(agentId: string): Promise<void> {
   await awaitSessionHydration()
   if (startupHandoffReady) await startupHandoffReady
   // Grok is probed over ACP, so it settles on the protocol barrier instead.
-  const isProtocolAgent = agentId === 'grok' || agentId === 'kimi' || agentId === 'deepseek' || agentId === 'mcode' || agentId === 'zcode' || agentId === 'nika'
+  const isProtocolAgent = agentId === 'qoder' || agentId === 'grok' || agentId === 'kimi' || agentId === 'deepseek' || agentId === 'mcode' || agentId === 'zcode' || agentId === 'nika'
   const readiness = isProtocolAgent ? startupProtocolSettled : startupCoreReady
   if (readiness) await readiness
   if (isProtocolAgent && !agents.some((agent) => agent.id === agentId)) {
@@ -1104,12 +1433,13 @@ async function createTeamProject(
   input: TeamCreateProjectInput,
   beforeStart?: (project: TeamProject) => void,
   initialTurn?: TeamInitialTurn,
-  background = false
+  background = false,
+  registration?: TaskCreationContext
 ): Promise<TeamProject> {
   const definition = teams.store.team(input.teamId)
   if (input.requirementId && !isRequirementsEnabled()) throw new Error('需求功能已停用')
   await awaitAgentsReady(definition.members.map(m => m.role.agentId))
-  return teams.create(input, beforeStart, initialTurn, background)
+  return teams.create(input, beforeStart, initialTurn, background, registration)
 }
 
 async function respondUniAgentRequest(sessionId: string, requestId: string, answer: unknown, source?: 'mcp'): Promise<void> {
@@ -1301,12 +1631,12 @@ async function resolveNativeTurnSelection(
   return nativeCapabilityService.resolveSelection(agent, workdir, selection, sessionId)
 }
 
-// 选中即评论 — normalize the renderer-supplied bubble decorations so only the
-// quote/comment cards + instruction text reach the orchestrator (no untrusted
-// extra fields ride along into the persisted transcript).
+// Normalize renderer display metadata and its message reconciliation identity;
+// source and execution fields remain owned by the main process.
 function sanitizeTurnBubble(bubble: unknown): TurnBubbleInput | undefined {
   if (!bubble || typeof bubble !== 'object') return undefined
-  const dto = bubble as { comments?: unknown; displayText?: unknown }
+  const dto = bubble as { comments?: unknown; displayText?: unknown; clientTurnKey?: unknown }
+  const clientTurnKey = typeof dto.clientTurnKey === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(dto.clientTurnKey) ? dto.clientTurnKey : undefined
   const comments = Array.isArray(dto.comments)
     ? dto.comments
         .filter((item): item is BubbleComment =>
@@ -1316,8 +1646,9 @@ function sanitizeTurnBubble(bubble: unknown): TurnBubbleInput | undefined {
         .map((item) => ({ quote: String(item.quote), comment: String(item.comment) }))
     : []
   const displayText = typeof dto.displayText === 'string' && dto.displayText ? dto.displayText : undefined
-  if (!comments.length && displayText === undefined) return undefined
+  if (!comments.length && displayText === undefined && !clientTurnKey) return undefined
   return {
+    ...(clientTurnKey ? { clientTurnKey } : {}),
     ...(comments.length ? { comments } : {}),
     ...(displayText === undefined ? {} : { displayText })
   }
@@ -1447,7 +1778,18 @@ function publicCapabilityPlan(plan: CapabilitySyncPlan): CapabilitySyncPlan {
  * whenever a preset or role is saved/removed.
  */
 function publishHandoffCatalog(): void {
-  writeHandoffCatalog(agents, presets.list(), buildAgentRoleCatalog(projectRoles(), agents), projects.list())
+  refreshTaskTitleAgentConfiguration()
+  writeHandoffCatalog(agents, presets.list(), buildAgentRoleCatalog(projectRoles(), agents), projects.list(), isRequirementsEnabled() ? requirements.list() : [])
+}
+
+function refreshTaskTitleAgentConfiguration(): void {
+  taskTitleTrials.agentsChanged()
+  const signature = taskTitleGeneratorSignature(taskTitleConfiguration, agents)
+  if (signature === taskTitleAgentSignature) return
+  taskTitleAgentSignature = signature
+  taskTitles.configurationChanged()
+  quickReplies.configurationChanged()
+  void taskTitleRuntime.close()
 }
 
 function saveUniAgentRole(role: AgentRole) {
@@ -1460,13 +1802,35 @@ function saveUniAgentRole(role: AgentRole) {
 }
 function deleteUniAgentRole(id: string) { const saved = roles.remove(id); publishHandoffCatalog(); return buildAgentRoleCatalog(saved,agents) }
 function patchAppSettings(patch: AppSettingsPatch) {
+  validateDefinedAppPatch(patch as Record<string,unknown>)
+  if (patch.requirementCuration) {
+    const selected = { ...appSettings.get().requirementCuration, ...patch.requirementCuration }
+    if (selected.enabled) {
+      const resolved = resolveTaskTitleConfig(selected as import('../shared/types').TaskTitleGenerationConfig, agents)
+      if (!resolved.enabled) throw new Error(resolved.reason)
+    }
+  }
   const next = appSettings.set(patch)
+  if ('requirementCuration' in patch && next.requirementCuration?.enabled) {
+    for (const requirement of requirements.list()) void requirementDistiller.resume(requirement.id).catch(error => recordRuntime('agent', 'requirement_resume_failed', error))
+  }
+  if ('defaultTaskWorktree' in patch) defaultTaskWorktree = next.defaultTaskWorktree === true
+  if ('autoSyncWorktree' in patch) worktreeAutoSync = next.autoSyncWorktree === true
+  if ('taskTitleGeneration' in patch) { taskTitleConfiguration = next.taskTitleGeneration; invalidateTaskTitleConfiguration() }
+  if ('quickRepliesEnabled' in patch) { quickRepliesEnabled = next.quickRepliesEnabled === true; quickReplies.configurationChanged() }
+  if (patch.sessionRecovery) {
+    recoverySettings = next.sessionRecovery || defaultRecoverySettings()
+    orchestrator.recoverySettingsChanged()
+  }
   if ('feishu' in patch) { if (next.feishu?.enabled) void startFeishuBridgeWhenReady().catch(() => {}); else void feishuBridge.stop() }
   if ('assistantFeishu' in patch) { if (next.assistantFeishu?.enabled) void startFeishuBridgeWhenReady(assistantFeishuBridge).catch(() => {}); else void assistantFeishuBridge.stop() }
   if ('autoCheckUpdate' in patch) configureAppUpdateChecks(false)
   if ('autoUpdateAgentsWhenIdle' in patch) configureIdleAgentUpdates()
   if ('preventSleep' in patch) configurePreventSleep(next.preventSleep ?? false)
-  if ('requirementsEnabled' in patch) setRequirementsEnabled(next.requirementsEnabled === true)
+  if ('requirementsEnabled' in patch) { setRequirementsEnabled(next.requirementsEnabled === true); publishHandoffCatalog() }
+  if ('theme' in patch) {
+    for (const window of BrowserWindow.getAllWindows()) window.webContents.send(ASSISTANT_IPC.manageChanged, 'settings')
+  }
   return next
 }
 async function listManagedInventories() {
@@ -1664,10 +2028,30 @@ function showAppNotification(sessionId: string, body: string): void {
 }
 
 const failedNotificationSessions = new Set<string>()
+const sessionAttentionStore = new SessionAttentionStore(join(resolveUserDataHome(), 'session-attention.json'))
+let sessionAttentionReady: Promise<void> | undefined
+let sessionAttentionLoaded = false
 const sessionBadge = new SessionAttentionBadge(
   text => { if (process.platform === 'darwin') app.dock?.setBadge(text) },
-  () => !!mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused() && mainWindow.isVisible() && !mainWindow.isMinimized()
+  () => !!mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused() && mainWindow.isVisible() && !mainWindow.isMinimized(),
+  snapshot => {
+    mainWindow?.webContents.send(IPC.sessionAttentionChanged, snapshot)
+    if (sessionAttentionLoaded) void sessionAttentionStore.save(sessionBadge.serialize()).catch(error => recordRuntime('session', 'attention_save_failed', error))
+  }
 )
+
+function restoreSessionAttention(): Promise<void> {
+  return sessionAttentionReady ||= (async () => {
+    await startupSessionHydration
+    sessionBadge.restore(await sessionAttentionStore.load(), orchestrator.managedSessions(), badgeOwnerId)
+    for (const id of sessionBadge.pendingSessionIds()) {
+      sessionBadge.reconcileRequests(id, await orchestrator.getEvents(id), 'main')
+      sessionBadge.reconcileRequests(id, orchestrator.getSideEvents(id), 'side')
+    }
+    sessionAttentionLoaded = true
+    await sessionAttentionStore.save(sessionBadge.serialize())
+  })()
+}
 
 // A team's member sessions never render as their own sidebar row: the Leader
 // session row represents the whole team. Attention on a member must therefore be
@@ -1677,6 +2061,7 @@ let teamRowIds = new Map<string, string>()
 function refreshTeamRowIds(): void {
   // Shallow view: indexing must not clone whole team projects on every change.
   teamRowIds = teamRowSessionIds(teams.store.projectList())
+  sessionBadge.remapOwners(badgeOwnerId)
 }
 teams.on('changed', refreshTeamRowIds)
 refreshTeamRowIds()
@@ -1692,12 +2077,6 @@ function badgeOwnerId(sessionId: string): string {
   return badgeOwner(orchestrator.getSessionById(sessionId))?.id || sessionId
 }
 
-function forgetBadgeSession(sessionId: string): void {
-  sessionBadge.removeSession(sessionId)
-  const ownerId = badgeOwnerId(sessionId)
-  if (ownerId !== sessionId) sessionBadge.removeSession(ownerId)
-}
-
 // Fan-out orchestrator events to the renderer.
 handoffTaskStore.on('end', (event: import('../shared/types').UAEvent) => {
   void orchestrator.recordHandoffEnd(event).catch(error => recordRuntime('handoff', 'handoff_end_event_failed', error))
@@ -1706,6 +2085,7 @@ orchestrator.on('eventsReset', (snapshot: ZCodeEventsSnapshot) => {
   mainWindow?.webContents.send(ZCODE_IPC.eventsReset, snapshot)
 })
 orchestrator.on('sessionCreated', (session: Session) => {
+  sessionBadge.handleSession(session, badgeOwner(session))
   if (session.teamBinding) mainWindow?.webContents.send(IPC.sessionCreated, session)
   const id = session.handoffId
   if (!id || !handoffTaskStore.isActive(id)) return
@@ -1714,9 +2094,9 @@ orchestrator.on('sessionCreated', (session: Session) => {
   handoffSessions.set(id, session.id)
   writeHandoffResult(id, { status: session.status, text: '', sessionId: session.id, ...handoffTargetMetadata(session) })
 })
-orchestrator.on('sessionArchived', (sessionId: string) => forgetBadgeSession(sessionId))
+orchestrator.on('sessionArchived', (sessionId: string) => sessionBadge.archiveSession(sessionId))
 orchestrator.on('sessionDeleted', (sessionId: string) => {
-  forgetBadgeSession(sessionId)
+  sessionBadge.removeSession(sessionId)
   handoffTaskStore.removeSession(sessionId)
   handoffWaits.delete(sessionId)
   for (const [taskId, targetId] of handoffSessions) {
@@ -1728,6 +2108,7 @@ const uiEvents = new UIEventBatcher(events => {
 })
 orchestrator.on('event', (ev) => {
   performanceMonitor?.event()
+  if (ev.payload?.recoveryIntermediate || ev.payload?.automaticRecovery) { uiEvents.push(ev); return }
   const owner = orchestrator.getSessionById(ev.sessionId)
   sessionBadge.handleEvent(ev, badgeOwner(owner))
   const requirementId = owner?.config.requirementId
@@ -1881,6 +2262,8 @@ orchestrator.on('sideEvent', (p: { sessionId: string; event: unknown }) => {
   }
 })
 orchestrator.on('sideStatus', (p: { sessionId: string; status: string }) => {
+  const session = orchestrator.getSessionById(p.sessionId)
+  sessionBadge.handleStatus(session, p.status, badgeOwner(session), 'side')
   mainWindow?.webContents.send(IPC.sideStatus, p)
 })
 orchestrator.on('sideState', (p: { sessionId: string; state: SideChatState }) => {
@@ -1907,8 +2290,8 @@ orchestrator.on('detailStatus', (p: { sessionId: string; status: string }) => {
   mainWindow?.webContents.send(IPC.detailStatus, p)
 })
 orchestrator.on('sessionUpdated', (update) => {
+  sessionBadge.handleSession(update.session, badgeOwner(update.session))
   void comments.syncPermissions(update.session).catch(error => recordRuntime('comments', 'permission_sync_failed', error))
-  if (update.session.archived || isToolSession(update.session)) forgetBadgeSession(update.session.id)
   mainWindow?.webContents.send(IPC.sessionUpdated, update)
   feishuBridge.handleSessionUpdated(update.session)
   assistantFeishuBridge.handleSessionUpdated(update.session)
@@ -1949,6 +2332,7 @@ orchestrator.on('agentUpdate', (update: AgentContractUpdate) => {
 // 跨 Agent 迁移诊断: push each newly recorded (or bumped) diagnostic so the
 // sidebar entry can badge it live without a poll.
 diagnostics.on('diagnostic', (entry) => {
+  cloudMonitor.diagnostic(entry)
   mainWindow?.webContents.send(IPC.diagnostic, entry)
 })
 capabilitySync.on('progress', (job: CapabilitySyncJob) => {
@@ -1964,6 +2348,7 @@ capabilitySync.on('progress', (job: CapabilitySyncJob) => {
 })
 agentLifecycle.on('progress', (progress) => {
   agents = agentLifecycle.snapshot().filter(agent => agent.lifecycle?.detectionStatus !== 'detecting' || agent.lifecycle.availability === 'available')
+  refreshTaskTitleAgentConfiguration()
   mainWindow?.webContents.send(IPC.lifecycleProgress, progress)
   if (progress.phase === 'failed') {
     recordRuntime('agent-lifecycle', 'agent_lifecycle_failed', progress.message, 'error', undefined, progress.agentId)
@@ -1973,6 +2358,23 @@ agentLifecycle.on('progress', (progress) => {
 
 function registerIpc(): void {
   detailWindow.register()
+  ipcMain.handle(IPC.sessionAttentionGet, async (event, legacy: LegacySessionAttention) => {
+    assertTrustedCapabilitySyncIpc(event)
+    if (!legacy || typeof legacy !== 'object' || !legacy.unread || typeof legacy.unread !== 'object' || Array.isArray(legacy.unread) ||
+      !legacy.pending || typeof legacy.pending !== 'object' || Array.isArray(legacy.pending) ||
+      Object.values(legacy.unread).some(source => source !== 'main' && source !== 'side') ||
+      Object.values(legacy.pending).some(keys => !Array.isArray(keys) || keys.some(key => typeof key !== 'string'))) throw new Error('无效未读迁移数据')
+    await restoreSessionAttention()
+    if (sessionBadge.needsLegacyImport()) {
+      const histories = new Map<string, readonly UAEvent[]>()
+      for (const session of orchestrator.managedSessions()) if (legacy.unread[session.id] && !session.archived && !isToolSession(session) && !session.config.managedPurpose) {
+        histories.set(session.id, await orchestrator.getEvents(session.id))
+      }
+      sessionBadge.importLegacy(legacy, orchestrator.managedSessions(), (id, source: ReplyUnreadKind) => source === 'side' ? orchestrator.getSideEvents(id) : histories.get(id) || [], badgeOwnerId)
+      await sessionAttentionStore.flush()
+    }
+    return sessionBadge.snapshot()
+  })
   ipcMain.handle(IPC.sessionBadgeVisible, (event, sessionId: unknown) => {
     assertTrustedCapabilitySyncIpc(event)
     let visible: string | null = null
@@ -2002,14 +2404,73 @@ function registerIpc(): void {
       assertTrustedCapabilitySyncIpc(event)
       if (typeof sessionId !== 'string' || !sessionId.trim()) throw new Error('invalid_session_id')
       await awaitSessionHydration()
+      if(orchestrator.getSessionById(sessionId)?.config.managedPurpose==='router')throw new Error('Router 固定会话请使用专用入口操作')
       orchestrator.assertUserSessionEnabled(sessionId)
       return listener(event, sessionId, ...args)
     })
   }
+  ipcMain.handle(ROUTER_IPC.snapshot,async event=>{assertTrustedCapabilitySyncIpc(event);return router.snapshot()})
+  ipcMain.handle(ROUTER_IPC.draftImages,async(event,action,images)=>{assertTrustedCapabilitySyncIpc(event);return router.store.draftImages(action,images)})
+  ipcMain.handle(ROUTER_REVIEW_IPC.list, async (event, query?: RouterReviewQuery) => { assertTrustedCapabilitySyncIpc(event); return router.reviewList(query) })
+  ipcMain.handle(ROUTER_REVIEW_IPC.deletion, async (event, ids?: string[]) => { assertTrustedCapabilitySyncIpc(event); return router.reviewDeletion(ids) })
+  ipcMain.handle(ROUTER_REVIEW_IPC.delete, async (event, items: RouterReviewDeletionItem[]) => { assertTrustedCapabilitySyncIpc(event); return router.deleteReviews(items) })
+  ipcMain.handle(ROUTER_REVIEW_IPC.detail, async (event, id: string, attemptId?: string, includeTrace = false) => { assertTrustedCapabilitySyncIpc(event); const { trace, ...detail } = await router.reviewDetail(id, attemptId, includeTrace); return detail })
+  ipcMain.handle(ROUTER_REVIEW_IPC.save, async (event, input: RouterFeedbackInput) => { assertTrustedCapabilitySyncIpc(event); return router.saveReview(input) })
+  ipcMain.handle(ROUTER_REVIEW_IPC.targets, async event => { assertTrustedCapabilitySyncIpc(event); await awaitSessionHydration(); return router.reviewTargets() })
+  ipcMain.handle(ROUTER_REVIEW_IPC.dismiss, async (event, id: string, attemptId: string) => { assertTrustedCapabilitySyncIpc(event); return router.dismissReview(id, attemptId) })
+  ipcMain.handle(ROUTER_REVIEW_IPC.copy, async (event, id?: string) => { assertTrustedCapabilitySyncIpc(event); const result = await router.copyReview(id); clipboard.writeText(result.prompt); return { directory: result.directory, count: result.count } })
+  ipcMain.handle(ROUTER_IPC.open,async event=>{assertTrustedCapabilitySyncIpc(event);await awaitSessionHydration();await startupProtocolSettled;return router.open()})
+  ipcMain.handle(ROUTER_IPC.newSession,async(event,sessionId: string)=>{assertTrustedCapabilitySyncIpc(event);await awaitSessionHydration();await startupProtocolSettled;if(typeof sessionId!=='string')throw new Error('invalid_router_session');return router.newSession(sessionId)})
+  ipcMain.handle(ROUTER_IPC.saveConfig,async(event,config:RouterConfig,version:number)=>{assertTrustedCapabilitySyncIpc(event);return router.saveConfig(config,version)})
+  ipcMain.handle(ROUTER_IPC.submit,async(event,input:RouterInput)=>{
+    assertTrustedCapabilitySyncIpc(event);await awaitSessionHydration();await validateTaskAttachments(input.attachments);return router.submit(input)
+  })
+  ipcMain.handle(ROUTER_IPC.resolve,async(event,input:RouterResolution)=>{assertTrustedCapabilitySyncIpc(event);await validateTaskAttachments(input.attachments);return router.resolve(input)})
+  ipcMain.handle(ROUTER_IPC.cancel,async(event,id:string,version:number)=>{assertTrustedCapabilitySyncIpc(event);return router.cancel(id,version)})
+  ipcMain.handle(ROUTER_IPC.memory,async(event,input:GlobalMemoryRequest)=>{assertTrustedCapabilitySyncIpc(event);return router.memory(input)})
+  ipcMain.handle(PROJECT_MEMORY_IPC,async(event,projectId:string,input:ProjectMemoryRequest)=>{assertTrustedCapabilitySyncIpc(event);await awaitSessionHydration();return projectMemory.request(projectId,input)})
+  ipcMain.handle(ROUTER_IPC.interrupt,async event=>{assertTrustedCapabilitySyncIpc(event);return router.interrupt()})
   const teamHandle = (channel: string, action: (...args: any[]) => unknown) => ipcMain.handle(channel, async (event, ...args) => {
     assertTrustedCapabilitySyncIpc(event)
     await awaitSessionHydration()
     return action(...args)
+  })
+  registerWorktreeArchiveIpc(ipcMain, worktreeArchive, { trusted: assertTrustedCapabilitySyncIpc, hydrate: awaitSessionHydration })
+  registerSessionWorktreeStatusIpc(ipcMain, { trusted: assertTrustedCapabilitySyncIpc, hydrate: awaitSessionHydration, session: id => orchestrator.getSessionById(id), inspect: tree => worktrees.inspectStatus(tree) })
+  registerTaskGenerationIpc(ipcMain, taskGenerationConversations, { trusted: assertTrustedCapabilitySyncIpc, hydrate: awaitSessionHydration, session: id => orchestrator.getSessionById(id) })
+  handleUserSessionMutation(TASK_IPC.decisions, async (_event, id: string) => {
+    await orchestrator.getEvents(id)
+    await taskLifecycle.noteDecisions(id, orchestrator.taskDecisions(id)).catch(error => recordRuntime('task', 'decision_hint_write_failed', error))
+    return orchestrator.taskDecisions(id)
+  })
+  ipcMain.handle(TASK_IPC.board, async (event, query: TaskBoardQuery = {}) => {
+    assertTrustedCapabilitySyncIpc(event)
+    await awaitSessionHydration()
+    const requests = await router.store.requests()
+    return projectTaskBoard(orchestrator.listSessions().filter(session => !deletingSessionIds.has(session.id)), id => orchestrator.taskDecisions(id), query, session => {
+      try { return teams.binding(session.id).leader } catch { return false }
+    }, requests)
+  })
+  handleUserSessionMutation(TASK_IPC.state, async (_event, id: string) => {
+    await orchestrator.getEvents(id)
+    const session = orchestrator.getSessionById(id)
+    if (session) {
+      const failed = !!session.taskState?.error
+      await taskLifecycle.store.retry(session)
+      if (failed) { await taskLifecycle.inputAccepted(id); taskLifecycle.store.publish(session); orchestrator.publishTaskState(session) }
+    }
+    return taskLifecycle.snapshot(id)
+  })
+  handleUserSessionMutation(TASK_IPC.decide, async (_event, id: string, input: TaskDecisionInput) => {
+    await orchestrator.getEvents(id)
+    await taskLifecycle.noteDecisions(id, orchestrator.taskDecisions(id))
+    return taskLifecycle.decide(id, input)
+  })
+  const taskDecisionResolver = new TaskDecisionResolver()
+  handleUserSessionMutation(TASK_IPC.resolve, async (_event, id: string, input: TaskDecisionAnswer) => {
+    const session = orchestrator.getSessionById(id)
+    if (!session || session.readOnly || session.archived) throw new Error('当前任务不可处理决策')
+    return taskDecisionResolver.resolve(id, input, () => orchestrator.taskDecisions(id), (requestId, answer) => respondUniAgentRequest(id, requestId, answer))
   })
   teamHandle(TEAM_IPC.catalog, () => teams.catalog())
   teamHandle(TEAM_IPC.save, (input: TeamDefinitionInput) => teams.saveTeam(input))
@@ -2029,7 +2490,19 @@ function registerIpc(): void {
     return prepared
   })
   teamHandle(TEAM_IPC.createProject, async (input: TeamCreateProjectInput) => {
-    return createTeamProject(input, undefined, undefined, true)
+    return runAppTaskCreation(input.taskRequestId, 'team', input, input.prompt, async (payload, registration) => {
+      const { taskRequestId: _requestId, ...plainInput } = payload
+      input = plainInput
+      await validateTaskAttachments(input.attachments)
+      if (input.taskScope) {
+        if (input.taskScope.kind === 'requirement' && !isRequirementsEnabled()) throw new Error('需求功能已停用')
+        await ensureRequirementOwnership()
+        const config = resolveTaskCreationScope({ agentId: '', workdir: '', projectId: input.spaceId, taskScope: input.taskScope }, id => requirements.get(id), id => !!projects.get(id))
+        const { taskScope: _scope, ...plain } = input
+        input = { ...plain, spaceId: config.projectId!, requirementId: config.requirementId }
+      }
+      return createTeamProject(input, undefined, undefined, true, registration)
+    }, record => teams.store.project(record.teamProjectId))
   })
   teamHandle(TEAM_IPC.send, (id: string, prompt: string, attachments?: Attachment[]) => teams.send(id, prompt, attachments))
   teamHandle(TEAM_IPC.stop, (id: string) => teams.stop(id))
@@ -2061,9 +2534,11 @@ function registerIpc(): void {
     if (!isCliSetupId(id) || orchestrator.hasActiveAgentSessions(id) || agentLifecycle.isUpdating(id)) throw new Error('请先结束该 Agent 的任务或更新')
     return cliAgentSetup.install(id)
   })
-  ipcMain.handle('agent-setup:login', (_event, id: CliSetupId, input: CliSetupInput) => {
+  ipcMain.handle('agent-setup:login', async (_event, id: CliSetupId, input: CliSetupInput) => {
     if (!isCliSetupId(id) || orchestrator.hasActiveAgentSessions(id) || agentLifecycle.isUpdating(id)) throw new Error('请先结束该 Agent 的任务或更新')
-    return cliAgentSetup.signIn(id, input)
+    const result = await cliAgentSetup.signIn(id, input)
+    if (result.phase === 'idle') invalidateTaskTitleSelection({ agentId: id, modelSource: { kind: 'native' } })
+    return result
   })
   ipcMain.handle('agent-setup:cancel', (_event, id: CliSetupId) => cliAgentSetup.cancel(id))
   
@@ -2262,10 +2737,20 @@ function registerIpc(): void {
       }
       const action: NativeThreadAction = parseNativeThreadAction(value)
       if (action.type !== 'goal.set' && action.type !== 'review.start') throw new Error('新会话只支持设置 Goal 或启动 Review')
-      await awaitAgentReady(config.agentId)
-      if (agentLifecycle.isUpdating(config.agentId)) throw new Error('agent_update_in_progress')
-      return createWorkspaceSession(await personalAssistant.prepareConfig(config), action.type === 'goal.set' ? action.objective : 'Review', (runtime, reservedId) =>
-        orchestrator.createNativeActionSession(runtime, action, undefined, reservedId), { kind: 'native', action })
+      return runAppTaskCreation(config.taskRequestId, 'native', { config, action }, action.type === 'goal.set' ? action.objective : 'Review', async (payload, context) => {
+        const { config, action } = payload
+        await awaitAgentReady(config.agentId)
+        if (agentLifecycle.isUpdating(config.agentId)) throw new Error('agent_update_in_progress')
+        const agent = agents.find(item => item.id === config.agentId)
+        if (agent?.capabilities[action.type === 'goal.set' ? 'nativeGoal' : 'nativeReview'] !== true) throw new Error('当前执行方不支持该原生任务类型')
+        return createWorkspaceSession(await personalAssistant.prepareConfig(config), action.type === 'goal.set' ? action.objective : 'Review', async (runtime, reservedId) => {
+          if (context) {
+            await context.beforeDispatch()
+            orchestrator.setTaskRegistration(context.record.sessionId, taskRegistration(context.record))
+          }
+          return orchestrator.createNativeActionSession(runtime, action, undefined, reservedId)
+        }, { kind: 'native', action }, context)
+      }, existingCreatedSession)
     }
   )
   handleUserSessionMutation(
@@ -2296,14 +2781,13 @@ function registerIpc(): void {
   )
   ipcMain.handle(IPC.capabilityInventoryDetail, (event, value: unknown) =>
     capabilitySyncIpc(event, async () => {
-      const input = value as { id?: unknown }
-      if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some((key) => key !== 'id') || typeof input.id !== 'string' || input.id.length === 0 || input.id.length > 512) throw new Error('invalid_selection')
+      const input = parseCapabilityInventoryDetailRequest(value)
       if (input.id.startsWith('grok:')) {
         const grok = agents.find(agent => agent.adapter === 'grok')
         if (!grok) throw new Error('capability_inventory_unavailable')
         if (!input.id.startsWith('grok:files:')) return getGrokInventoryDetail(grok.bin,input.id,grokInventoryOptions())
       }
-      return getAgentToolDetail(input.id, agentToolInventoryOptions())
+      return getAgentToolDetail(input.id, agentToolInventoryOptions(), input.loadMcpTools === true)
     })
   )
   ipcMain.handle(IPC.capabilityInventoryManage, (event, value: unknown) =>
@@ -2322,9 +2806,9 @@ function registerIpc(): void {
   ipcMain.handle(IPC.capabilityMutationPlanRemove, (event, value: unknown) =>
     capabilitySyncIpc(event, () => {
       const input = value as { target?: unknown; selections?: unknown }
-      if (!input || !['codex', 'traex'].includes(String(input.target)) || !Array.isArray(input.selections) ||
+      if (!input || !['codex', 'traex', 'qoder'].includes(String(input.target)) || !Array.isArray(input.selections) ||
           input.selections.length > 1000 || input.selections.some((id) => typeof id !== 'string')) throw new Error('invalid_selection')
-      return capabilitySync.planRemoval(input.target as 'codex' | 'traex', input.selections as string[]).then(publicCapabilityPlan)
+      return capabilitySync.planRemoval(input.target as CapabilityProviderId, input.selections as string[]).then(publicCapabilityPlan)
     })
   )
   ipcMain.handle(IPC.capabilityPluginAction, (event, value: unknown) =>
@@ -2382,6 +2866,12 @@ function registerIpc(): void {
 
   ipcMain.handle(ASSISTANT_IPC.detail, async event => { assertTrustedCapabilitySyncIpc(event); return personalAssistant.store.detail() })
   ipcMain.handle(ASSISTANT_IPC.workspace, async event => { assertTrustedCapabilitySyncIpc(event); return personalAssistant.workspace() })
+  ipcMain.handle(ASSISTANT_IPC.openAppConversation, async event => {
+    assertTrustedCapabilitySyncIpc(event)
+    if (isQuitting) throw new Error('应用正在退出')
+    await awaitSessionHydration()
+    return personalAssistant.commands.openAppConversation()
+  })
   ipcMain.handle(ASSISTANT_IPC.feishu, event => { assertTrustedCapabilitySyncIpc(event); return assistantFeishuState() })
   ipcMain.handle(WEIXIN_IPC.state, event => { assertTrustedCapabilitySyncIpc(event); return assistantWeixinBridge.getState() })
   ipcMain.handle(WEIXIN_IPC.login, async event => { assertTrustedCapabilitySyncIpc(event); await awaitSessionHydration(); return assistantWeixinBridge.login() })
@@ -2465,11 +2955,12 @@ function registerIpc(): void {
     mainWindow?.webContents.send(ASSISTANT_IPC.changed)
     return value
   })
-  handleUserSessionMutation(ASSISTANT_IPC.command, async (event, sessionId: string, command: 'new' | 'clear', requestId: string) => {
+  handleUserSessionMutation(ASSISTANT_IPC.command, async (event, sessionId: string, command: 'new' | 'clear', requestId: string, selection?: AssistantConversationSelection) => {
     assertTrustedCapabilitySyncIpc(event)
+    if (orchestrator.getSessionById(sessionId)?.config.assistantChannel === 'app') return personalAssistant.commands.execute(sessionId, command, requestId, selection)
     return assistantWeixinBridge.owns(sessionId)
-      ? assistantWeixinBridge.executeCommandFromApp(sessionId, command, requestId)
-      : assistantFeishuBridge.executeAssistantCommandFromApp(sessionId, command, requestId)
+      ? assistantWeixinBridge.executeCommandFromApp(sessionId, command, requestId, selection)
+      : assistantFeishuBridge.executeAssistantCommandFromApp(sessionId, command, requestId, selection)
   })
 
   ipcMain.handle(
@@ -2483,48 +2974,59 @@ function registerIpc(): void {
       activatePlan?: boolean
     ) => {
       assertTrustedCapabilitySyncIpc(event)
-      const assistantConfig = await personalAssistant.prepareConfig(config)
-      const effectiveConfig = activatePlan === true
-        ? { ...assistantConfig, collaborationMode: 'plan' as const }
-        : assistantConfig
-      const selection = parseNativeTurnSelectionRequest(value)
-      return createWorkspaceSession(effectiveConfig, prompt, async (runtimeConfig, reservedSessionId) => {
-        if (agentLifecycle.isUpdating(runtimeConfig.agentId)) throw new Error('agent_update_in_progress')
-        if (runtimeConfig.initializationTargetAgentId && (runtimeConfig.permissionMode !== 'ask' || runtimeConfig.initializationTargetAgentId === runtimeConfig.agentId)) {
-          throw new Error('invalid_initialization_config')
-        }
-        const jobId = runtimeConfig.initializationTargetAgentId ? appSettings.beginInitialization(runtimeConfig.initializationTargetAgentId) : undefined
-        try {
-          const nativeContext = await resolveNativeTurnSelection(runtimeConfig.agentId, runtimeConfig.workdir, selection).catch(error => {
-            if (runtimeConfig.worktree && selection?.candidateIds.length) throw new Error('工作树已创建，请在新目录重新选择技能或插件后发送')
+      const payload = { config, prompt, attachments, value, activatePlan }
+      if(config.managedPurpose)throw new Error('管理会话只能从专用入口创建')
+      return runAppTaskCreation(config.taskRequestId, 'message', payload, prompt, async (payload, context) => {
+        const { config, prompt, attachments, value, activatePlan } = payload
+        await validateTaskAttachments(attachments)
+        if (!prompt.trim() && !attachments?.length) throw new Error('请输入任务内容或添加附件')
+        const assistantConfig = await personalAssistant.prepareConfig(config)
+        const effectiveConfig = activatePlan === true
+          ? { ...assistantConfig, collaborationMode: 'plan' as const }
+          : assistantConfig
+        const selection = parseNativeTurnSelectionRequest(value)
+        return createWorkspaceSession(effectiveConfig, prompt, async (runtimeConfig, reservedSessionId) => {
+          if (agentLifecycle.isUpdating(runtimeConfig.agentId)) throw new Error('agent_update_in_progress')
+          if (runtimeConfig.initializationTargetAgentId && (runtimeConfig.permissionMode !== 'ask' || runtimeConfig.initializationTargetAgentId === runtimeConfig.agentId)) {
+            throw new Error('invalid_initialization_config')
+          }
+          const jobId = runtimeConfig.initializationTargetAgentId ? appSettings.beginInitialization(runtimeConfig.initializationTargetAgentId) : undefined
+          try {
+            const nativeContext = await resolveNativeTurnSelection(runtimeConfig.agentId, runtimeConfig.workdir, selection).catch(error => {
+              if (runtimeConfig.worktree && selection?.candidateIds.length) throw new Error('工作树已创建，请在新目录重新选择技能或插件后发送')
+              throw error
+            })
+            if (requirements.get(runtimeConfig.requirementId)?.status === 'archived') {
+              throw new Error('所选需求已归档，请先恢复需求或重新选择')
+            }
+            if (runtimeConfig.requirementId && !isRequirementsEnabled()) {
+              throw new Error('需求功能已停用')
+            }
+            // Persist jobId in SessionConfig before Orchestrator dispatches the first turn.
+            // A very fast terminal event can therefore settle the durable job even if
+            // attachInitialization has not written its secondary session index yet.
+            if (context) {
+              await context.beforeDispatch()
+              orchestrator.setTaskRegistration(context.record.sessionId, taskRegistration(context.record))
+            }
+            const session = orchestrator.createSession(
+              jobId ? { ...runtimeConfig, initializationJobId: jobId } : runtimeConfig,
+              prompt,
+              attachments,
+              undefined,
+              nativeContext,
+              activatePlan === true ? 'plan' : undefined,
+              undefined,
+              reservedSessionId
+            )
+            if (jobId) appSettings.attachInitialization(jobId, session.id)
+            return session
+          } catch (error) {
+            if (jobId) appSettings.settleInitialization(jobId, false)
             throw error
-          })
-          if (requirements.get(runtimeConfig.requirementId)?.status === 'archived') {
-            throw new Error('所选需求已归档，请先恢复需求或重新选择')
           }
-          if (runtimeConfig.requirementId && !isRequirementsEnabled()) {
-            throw new Error('需求功能已停用')
-          }
-          // Persist jobId in SessionConfig before Orchestrator dispatches the first turn.
-          // A very fast terminal event can therefore settle the durable job even if
-          // attachInitialization has not written its secondary session index yet.
-          const session = orchestrator.createSession(
-            jobId ? { ...runtimeConfig, initializationJobId: jobId } : runtimeConfig,
-            prompt,
-            attachments,
-            undefined,
-            nativeContext,
-            activatePlan === true ? 'plan' : undefined,
-            undefined,
-            reservedSessionId
-          )
-          if (jobId) appSettings.attachInitialization(jobId, session.id)
-          return session
-        } catch (error) {
-          if (jobId) appSettings.settleInitialization(jobId, false)
-          throw error
-        }
-      }, { kind: 'message', prompt, attachments, selection, activatePlan: activatePlan === true })
+        }, { kind: 'message', prompt, attachments, selection, activatePlan: activatePlan === true }, context)
+      }, existingCreatedSession)
     }
   )
 
@@ -2609,21 +3111,60 @@ function registerIpc(): void {
     await awaitSessionHydration()
     return orchestrator.listSessions()
   })
-  ipcMain.handle(REQUIREMENT_IPC.list, event => {
+  ipcMain.handle(REQUIREMENT_IPC.list, async event => {
     assertTrustedCapabilitySyncIpc(event)
     // 关闭时返回空列表（不抛错）：useRequirements 无条件调用，抛错会点亮错误横幅。
-    return isRequirementsEnabled() ? requirements.list() : []
+    if (!isRequirementsEnabled()) return []
+    await ensureRequirementOwnership()
+    return requirements.list()
   })
   ipcMain.handle(REQUIREMENT_IPC.create, (event, input: RequirementInput) => {
     assertTrustedCapabilitySyncIpc(event)
     if (!isRequirementsEnabled()) throw new Error('需求功能已停用')
+    if (input?.projectId !== undefined && !projects.get(input.projectId)) throw new Error('所选空间不存在')
     return requirements.create(input)
+  })
+  ipcMain.handle(REQUIREMENT_IPC.overview, (event, id: string, documentId?: string, query?: import('../shared/requirementTypes').RequirementOverviewQuery) => {
+    assertTrustedCapabilitySyncIpc(event)
+    if (!isRequirementsEnabled()) throw new Error('需求功能已停用')
+    if (typeof id !== 'string') throw new Error('需求 ID 无效')
+    const session = orchestrator.listSessions().find(session => session.config.requirementId === id && !session.readOnly && !['running', 'queued', 'awaiting-approval', 'cancelling'].includes(session.status))
+    if (session) requirementDistiller.scheduleReading(id, session.id, query?.refresh)
+    return requirements.readOverview(id, documentId, query)
+  })
+  ipcMain.handle(REQUIREMENT_IPC.curation, async (event, id: string, action: string = 'read') => {
+    assertTrustedCapabilitySyncIpc(event)
+    if (!isRequirementsEnabled() || !requirements.get(id)) throw new Error('需求不可用')
+    if (!['read','retry','retryFailed','pause','organize'].includes(action)) throw new Error('整理操作无效')
+    if (action !== 'read') await awaitSessionHydration()
+    if (action === 'pause') await requirementDistiller.pause(id)
+    if (action === 'retry') await requirementDistiller.resume(id, true)
+    if (action === 'retryFailed') await requirementDistiller.retryFailed(id)
+    if (action === 'organize') {
+      await requirements.organizeExisting(id)
+      const sessions = orchestrator.listSessions().filter(session => session.config.requirementId === id && !session.readOnly)
+      for (const session of sessions) requirementDistiller.schedule(id, session.id, true)
+      if (sessions[0]) requirementDistiller.schedule(id, sessions[0].id, true, 'reading')
+    }
+    return requirements.readCuration(id)
+  })
+  ipcMain.handle(REQUIREMENT_IPC.curationConversation, async (event, id: string) => {
+    assertTrustedCapabilitySyncIpc(event)
+    if (typeof id !== 'string' || !isRequirementsEnabled() || !requirements.get(id)) throw new Error('需求不可用')
+    return requirements.readCurationConversation(id)
+  })
+  ipcMain.handle(REQUIREMENT_IPC.storage, async (event, id: string, token?: string) => {
+    assertTrustedCapabilitySyncIpc(event)
+    if (!isRequirementsEnabled() || !requirements.get(id)) throw new Error('需求不可用')
+    if (token !== undefined && (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token))) throw new Error('清理预览无效')
+    return requirements.maintainStorage(id, token)
   })
   ipcMain.handle(REQUIREMENT_IPC.update, async (event, id: string, patch: RequirementPatch) => {
     assertTrustedCapabilitySyncIpc(event)
     if (!isRequirementsEnabled()) throw new Error('需求功能已停用')
     await awaitSessionHydration()
     if (!patch || typeof patch !== 'object') throw new Error('需求更新无效')
+    if (patch.projectId !== undefined && !projects.get(patch.projectId)) throw new Error('所选空间不存在')
     const assertRenameIdle = (): void => {
       if (orchestrator.listSessions().some(s => s.config.requirementId === id && ['running', 'queued', 'awaiting-approval', 'cancelling'].includes(s.status))) {
         throw new Error('需求仍有运行中或排队中的会话，请结束后再改名')
@@ -2728,7 +3269,10 @@ function registerIpc(): void {
     const session = orchestrator.getSessionById(sessionId)
     if (!session?.config.worktree) throw new Error('没有待创建的工作树任务')
     if (session.teamBinding) { void teams.prepareWorktreeProject(session.teamBinding.teamProjectId); return }
-    if (!session.worktreeTask) return prepareWorktreeDraft(sessionId)
+    if (!session.worktreeTask) {
+      if (session.worktreeTaskError && session.config.worktree.state === 'ready') return orchestrator.retryWorktreePreparation(sessionId)
+      return prepareWorktreeDraft(sessionId)
+    }
     void runWorktreeTask(sessionId)
   })
   ipcMain.handle(IPC.createProject, (event, input: ProjectInput): Project => {
@@ -2876,7 +3420,22 @@ function registerIpc(): void {
   })
   ipcMain.handle(IPC.getSessionRuntimeState, async (_e, sessionId: string, includeEvents = true) => {
     await awaitSessionAgentReady(sessionId)
-    return orchestrator.getSessionRuntimeState(sessionId, includeEvents !== false)
+    const state = await orchestrator.getSessionRuntimeState(sessionId, includeEvents !== false)
+    if (includeEvents !== false) sessionBadge.reconcileRequests(sessionId, state.events, 'main')
+    return state
+  })
+  ipcMain.handle(IPC.getSessionInfo, async (event, sessionId: unknown) => {
+    assertTrustedCapabilitySyncIpc(event)
+    if (typeof sessionId !== 'string' || !sessionId.trim()) throw new Error('invalid_session_id')
+    await awaitSessionHydration()
+    return orchestrator.getSessionInfo(sessionId)
+  })
+  ipcMain.handle(IPC.revealSessionInfoFile, async (event, sessionId: unknown, fieldId: unknown) => {
+    assertTrustedCapabilitySyncIpc(event)
+    if (typeof sessionId !== 'string' || !sessionId.trim() || typeof fieldId !== 'string') throw new Error('invalid_session_info_request')
+    await awaitSessionHydration()
+    const info = await orchestrator.getSessionInfo(sessionId)
+    shell.showItemInFolder(sessionInfoRevealPath(info, fieldId))
   })
   ipcMain.handle(IPC.refreshNativeSession, async (_e, sessionId: string) => {
     await awaitSessionAgentReady(sessionId)
@@ -2893,28 +3452,23 @@ function registerIpc(): void {
   // G2-4: archive / unarchive / permanently delete a session.
   handleUserSessionMutation(IPC.archiveSession, async (_e, sessionId: string) => {
     await awaitSessionHydration()
-    if (orchestrator.getSessionById(sessionId)?.teamBinding) { const binding = teams.binding(sessionId); if (!binding.leader) throw new Error('team_member_read_only'); teams.archive(binding.p.id); return orchestrator.getSessionById(sessionId) }
+    if (orchestrator.getSessionById(sessionId)?.teamBinding) { const binding = teams.binding(sessionId); if (!binding.leader) throw new Error('team_member_read_only'); await teams.archive(binding.p.id); return orchestrator.getSessionById(sessionId) }
     return orchestrator.setArchived(sessionId, true)
   })
   handleUserSessionMutation(IPC.unarchiveSession, async (_e, sessionId: string) => {
     await awaitSessionHydration()
-    if (orchestrator.getSessionById(sessionId)?.teamBinding) { const binding = teams.binding(sessionId); if (!binding.leader) throw new Error('team_member_read_only'); teams.archive(binding.p.id, false); return orchestrator.getSessionById(sessionId) }
+    if (orchestrator.getSessionById(sessionId)?.teamBinding) { const binding = teams.binding(sessionId); if (!binding.leader) throw new Error('team_member_read_only'); await teams.archive(binding.p.id, false); return orchestrator.getSessionById(sessionId) }
     return orchestrator.setArchived(sessionId, false)
   })
-  ipcMain.handle(IPC.deleteSession, async (event, sessionId: unknown) => {
-    assertTrustedCapabilitySyncIpc(event)
-    if (typeof sessionId !== 'string' || !sessionId.trim()) throw new Error('invalid_session_id')
-    await awaitSessionHydration()
-    const team = teams.catalog().projects.find(p => Object.values(p.memberSessions).includes(sessionId))
-    if (team) { if (team.memberSessions[team.team.leaderMemberId] !== sessionId) throw new Error('team_member_read_only'); teams.deleteProject(team.id); return }
-    orchestrator.assertUserSessionEnabled(sessionId)
-    await orchestrator.deleteSession(sessionId)
-  })
+  registerSessionDeletionIpc(ipcMain, { assertTrusted: assertTrustedCapabilitySyncIpc, hydrate: awaitSessionHydration,
+    orchestrator, teams, deletingIds: deletingSessionIds, changed: taskBoardChanged })
 
   // 需求4: rename + pin/unpin a session.
   handleUserSessionMutation(IPC.renameSession, async (_e, sessionId: string, title: string) => {
     await awaitSessionHydration()
     if (orchestrator.getSessionById(sessionId)?.teamBinding) { const binding = teams.binding(sessionId); if (!binding.leader) throw new Error('team_member_read_only'); teams.rename(binding.p.id, title); return orchestrator.getSessionById(sessionId) }
+    const session = orchestrator.getSessionById(sessionId)
+    if (session && isTaskTitleEligible(session) && !session.readOnly) { await taskTitles.rename(sessionId, title); return session }
     return orchestrator.renameSession(sessionId, title)
   })
   handleUserSessionMutation(IPC.pinSession, async (_e, sessionId: string, pinned: boolean) => {
@@ -3036,6 +3590,26 @@ function registerIpc(): void {
       })
     }
   )
+
+  ipcMain.handle(FORK_IPC.preflight, async (event, request: ForkRequest) => {
+    assertTrustedCapabilitySyncIpc(event)
+    await awaitAgentsReady([request.sourceAgentId, request.targetAgentId])
+    await awaitSessionHydration()
+    return orchestrator.forkJobs.preflight(request)
+  })
+  ipcMain.handle(FORK_IPC.start, async (event, planId: string) => {
+    assertTrustedCapabilitySyncIpc(event); return orchestrator.forkJobs.start(planId)
+  })
+  ipcMain.handle(FORK_IPC.get, (event, id: string) => { assertTrustedCapabilitySyncIpc(event); return orchestrator.forkJobs.get(id) })
+  ipcMain.handle(FORK_IPC.list, async event => { assertTrustedCapabilitySyncIpc(event); await awaitSessionHydration(); return orchestrator.forkJobs.list() })
+  ipcMain.handle(FORK_IPC.cancel, (event, id: string) => { assertTrustedCapabilitySyncIpc(event); return orchestrator.forkJobs.cancel(id) })
+  ipcMain.handle(FORK_IPC.retry, (event, id: string, allowMissing: boolean, targetModel?: string) => { assertTrustedCapabilitySyncIpc(event); return orchestrator.forkJobs.retry(id, allowMissing === true, targetModel) })
+  ipcMain.handle(FORK_IPC.reveal, async (event, id: string) => {
+    assertTrustedCapabilitySyncIpc(event)
+    const job = await orchestrator.forkJobs.get(id)
+    if (!job) throw new Error('历史资料不存在')
+    shell.showItemInFolder(join(job.archivePath, 'AGENTS.md'))
+  })
 
   // Doc10: reconstruct before/after file contents for the side-by-side review.
   ipcMain.handle(IPC.reviewGetFilePair, async (event, req: ReviewFilePairReq) => {
@@ -3176,17 +3750,18 @@ function registerIpc(): void {
 
   handleUserSessionMutation(COMMENT_IPC.list, (_e, id) => comments.list(id))
   handleUserSessionMutation(COMMENT_IPC.create, (_e, id, selection) => comments.create(id, selection))
-  handleUserSessionMutation(COMMENT_IPC.send, (_e, owner, id, text, model) => comments.send(owner, id, text, model))
+  handleUserSessionMutation(COMMENT_IPC.send, (_e, owner, id, text, model, clientTurnKey) => comments.send(owner, id, text, model, sanitizeTurnBubble({ clientTurnKey })?.clientTurnKey))
   handleUserSessionMutation(COMMENT_IPC.stop, (_e, owner, id) => comments.stop(owner, id))
+  handleUserSessionMutation(COMMENT_IPC.remove, (_e, owner, id) => comments.remove(owner, id))
   handleUserSessionMutation(COMMENT_IPC.respond, (_e, owner, id, request, answer) => comments.respond(owner, id, request, answer))
 
   // 选中即评论 / 详情 — ephemeral detail-branch chat explaining a text selection.
   handleUserSessionMutation(IPC.detailExplain, async (_e, sessionId: string, context: DetailExplanationContext) => {
     return detailWindow.open(sessionId, context)
   })
-  handleUserSessionMutation(IPC.detailSend, async (_e, sessionId: string, prompt: string, attachments?: Attachment[]) => {
+  handleUserSessionMutation(IPC.detailSend, async (_e, sessionId: string, prompt: string, attachments?: Attachment[], bubble?: TurnBubbleInput) => {
     await awaitSessionAgentReady(sessionId)
-    return orchestrator.sendDetailMessage(sessionId, prompt, attachments)
+    return orchestrator.sendDetailMessage(sessionId, prompt, attachments, sanitizeTurnBubble(bubble))
   })
   handleUserSessionMutation(IPC.detailInterrupt, async (_e, sessionId: string) => {
     return orchestrator.interruptDetail(sessionId)
@@ -3358,8 +3933,7 @@ function registerIpc(): void {
   })
   ipcMain.handle(IPC.createAutomation, async (event, input: NativeAutomationInput) => {
     assertTrustedCapabilitySyncIpc(event)
-    await awaitAgentReady(input?.agentId)
-    return nativeAutomations.create(validateNativeAutomation(input))
+    return createNativeAutomation(input)
   })
   ipcMain.handle(
     IPC.setAutomationStatus,
@@ -3407,7 +3981,7 @@ function registerIpc(): void {
         await awaitAgentReady(patch.agentId || previous.agentId)
         const current = nativeAutomations.get(task.id)
         if (!current) return false
-        validateNativeAutomation({ ...current, ...patch } as NativeAutomationInput)
+        validateNativeAutomation(mergeAutomationPatch(current as NativeAutomationInput, patch))
         return nativeAutomations.update(task.id, patch)
       }
       if (e2eEnabled && !e2eLocalAutomationPassthrough) return true
@@ -3430,6 +4004,22 @@ function registerIpc(): void {
   )
 
   // Doc5 T2: per-agent last-choice preferences.
+  const qoderByokAgent = () => {
+    const agent = agents.find(agent => agent.id === 'qoder')
+    if (!agent?.installed || agent.incompatible) throw new Error('请先完成 Qoder 安装和连接检测')
+    return agent
+  }
+  ipcMain.handle(QODER_IPC.byokList, event => { assertTrustedCapabilitySyncIpc(event); return listQoderByok(qoderByokAgent().bin) })
+  ipcMain.handle(QODER_IPC.byokSave, async (event, input) => {
+    assertTrustedCapabilitySyncIpc(event)
+    if (orchestrator.hasActiveAgentSessions('qoder')) throw new Error('Qoder 有任务正在运行，请结束后再修改来源')
+    await saveQoderByok(qoderByokAgent().bin, input); await refreshDetectedAgent('qoder')
+  })
+  ipcMain.handle(QODER_IPC.byokDelete, async (event, input) => {
+    assertTrustedCapabilitySyncIpc(event)
+    if (orchestrator.hasActiveAgentSessions('qoder')) throw new Error('Qoder 有任务正在运行，请结束后再删除来源')
+    await deleteQoderByok(qoderByokAgent().bin, input); await refreshDetectedAgent('qoder')
+  })
   ipcMain.handle(IPC.getPrefs, async (event) => {
     assertTrustedCapabilitySyncIpc(event)
     if (startupCoreReady) await startupCoreReady
@@ -3443,6 +4033,12 @@ function registerIpc(): void {
     return next
   })
   ipcMain.handle(IPC.getAppSettings, (event) => { assertTrustedCapabilitySyncIpc(event); return appSettings.get() })
+  ipcMain.handle(IPC.getRecoveryErrors, (event) => { assertTrustedCapabilitySyncIpc(event); return orchestrator.getRecoveryErrors() })
+  ipcMain.handle(IPC.cancelRecovery, (event, sessionId: string) => {
+    assertTrustedCapabilitySyncIpc(event)
+    if (typeof sessionId !== 'string') throw new Error('无效会话')
+    return orchestrator.cancelErrorRecovery(sessionId)
+  })
   
   ipcMain.handle(CODEX_SOURCE_IPC.get, async event => {
     assertTrustedCapabilitySyncIpc(event)
@@ -3520,7 +4116,22 @@ function registerIpc(): void {
   }
   ipcMain.handle(IPC.setAppSettings, (event, patch: AppSettingsPatch) => {
     assertTrustedCapabilitySyncIpc(event)
+    if('router' in patch)throw new Error('Router 配置请通过专用配置入口保存')
     return patchAppSettings(patch)
+  })
+  ipcMain.handle(IPC.testTaskTitleGeneration, async (event, input: TaskTitleTrialInput) => {
+    assertTrustedCapabilitySyncIpc(event)
+    const owner = event.sender.id
+    if (!taskTitleTrialSenders.has(owner)) {
+      taskTitleTrialSenders.add(owner)
+      event.sender.once('destroyed', () => { taskTitleTrialSenders.delete(owner); taskTitleTrials.cancel(owner) })
+      event.sender.on('did-start-navigation', (_event, _url, _inPlace, isMainFrame) => { if (isMainFrame) taskTitleTrials.cancel(owner) })
+    }
+    return taskTitleTrials.run(owner, input)
+  })
+  ipcMain.handle(IPC.cancelTaskTitleGenerationTest, (event, id: string) => {
+    assertTrustedCapabilitySyncIpc(event)
+    taskTitleTrials.cancel(event.sender.id, id)
   })
   ipcMain.handle(IPC.getAppVersion, (event) => {
     assertTrustedCapabilitySyncIpc(event)
@@ -4206,7 +4817,8 @@ function sendMcpPayloadToFeishu(req: FeishuSendReq): void {
 
 app.whenReady().then(() => {
   startupTimings.backendLoadedMs = Math.round(process.uptime() * 1000)
-  performanceMonitor = new PerformanceMonitor(sessionStore.directory(), () => ({ ...orchestrator.performanceStats(), ...uiEvents.stats() }))
+  performanceMonitor = new PerformanceMonitor(sessionStore.directory(), () => ({ ...orchestrator.performanceStats(), ...uiEvents.stats() }),
+    (kind, data, at) => cloudMonitor.performance(kind, data, at))
   setFrameHealthReporter((kind, data) => performanceMonitor?.record(kind, data))
   registerIpc()
   // Render the app shell immediately. Slow login-shell startup, crash recovery,
@@ -4244,6 +4856,8 @@ app.whenReady().then(() => {
     setImmediate(async () => {
       try {
         await orchestrator.loadPersisted()
+        await taskLifecycle.store.hydrate(orchestrator.managedSessions())
+        await taskTitles.store.hydrate(orchestrator.managedSessions())
         startupTimings.sessionsHydratedMs = Math.round(process.uptime() * 1000)
         await teams.recover()
         startupTimings.teamsRecoveredMs = Math.round(process.uptime() * 1000)
@@ -4253,6 +4867,7 @@ app.whenReady().then(() => {
       }
     })
   }))
+  void restoreSessionAttention().catch(error => recordRuntime('session', 'attention_restore_failed', error))
   void startupSessionHydration.then(async () => {
     if (!isRequirementsEnabled()) return
     for (const session of orchestrator.listSessions()) {
@@ -4264,6 +4879,9 @@ app.whenReady().then(() => {
         await requirements.setBackgroundStatus(id, { status: 'failed', reason: '来源恢复未完成，现有快照可能尚未包含最近输入' }).catch(() => {})
       }
     }
+    const curation = appSettings.get().requirementCuration
+    if (curation?.enabled && curation.agentId) await awaitAgentReady(curation.agentId)
+    for (const requirement of requirements.list()) await requirementDistiller.resume(requirement.id)
   }).finally(() => { requirementRecoveryPending = false }).catch(() => {})
   // Make the handoff endpoint available early; its inbox is drained only after
   // Agent discovery, when queued tasks can be routed safely. Keep this failure
@@ -4299,7 +4917,7 @@ app.whenReady().then(() => {
     return detection
   })
   const coreDetection = detectionFlights.then((flight) => flight.core)
-  const protocolDetection = Promise.all([detectionFlights.then((flight) => flight.protocol), acpRecovery]).then(([snapshot]) => snapshot)
+  const protocolDetection = Promise.all([detectionFlights.then((flight) => flight.protocol), acpRecovery.catch(() => undefined)]).then(([snapshot]) => snapshot)
 
   startupCoreReady = Promise.all([startupSessionHydration, coreDetection])
     .then(([, detected]) => {
@@ -4331,6 +4949,9 @@ app.whenReady().then(() => {
       })
       return agents
     })
+  void startupCoreReady.then(() => taskTitles.recover(orchestrator.managedSessions()))
+    .catch(error => recordRuntime('task-title', 'recovery_failed', error, 'warn'))
+  void Promise.all([startupCoreReady,startupProtocolSettled]).then(()=>router.recover()).catch(error=>recordRuntime('router','router_recovery_failed',error))
   void startupCoreReady.catch(() => {
     mainWindow?.webContents.send(IPC.lifecycleProgress, {
       agentId: '*',
@@ -4378,6 +4999,7 @@ app.whenReady().then(() => {
       return agents
     })
 
+  void Promise.allSettled([startupCoreReady, startupProtocolSettled, capabilityRecoveryFlight]).then(() => cloudMonitor.start())
   void Promise.all([startupCoreReady, startupProtocolSettled, capabilityRecoveryFlight]).then(() => {
     startupTimings.initializedMs = Math.round(process.uptime() * 1000)
     performanceMonitor?.record('startup', startupTimings)
@@ -4393,6 +5015,7 @@ app.whenReady().then(() => {
   void Promise.all([startupHandoffReady, startupSessionHydration, startupProtocolSettled])
     .then(() => {
       watchHandoffInbox(materializeHandoff)
+      watchAutomationInbox(createNativeAutomation)
       watchFeishuSendInbox(sendMcpPayloadToFeishu)
       watchTeamInbox((req, signal) => teams.handleTool(req.token, req.tool, req.args, signal))
     })
@@ -4422,7 +5045,7 @@ app.whenReady().then(() => {
       mainWindow?.webContents.send(IPC.lifecycleProgress, { agentId: '*', phase: 'failed', message: '启动更新失败，可稍后重试' })
     })
   }).catch(() => { /* session hydration failure is already surfaced above */ })
-  // 后台刷新 Agent 更新状态：外部列表只暴露「可用 / 异常 / 可更新」，更新结论
+  // 后台刷新 Agent 更新状态：外部列表展示更新结论，更新状态
   // 必须在后台保持真实，不能依赖用户手动点「重新探测」。按间隔节流，避免每次
   // 启动都访问各家注册表；检查本身静默，不阻塞启动，也不打断任何界面。
   void startupProtocolSettled.then(() => {
@@ -4478,7 +5101,8 @@ app.on('before-quit', (event) => {
   requirementDistiller.dispose()
   isQuitting = true
   detailWindow.close()
-  const restartClosing = Promise.allSettled([appRestart.close(), comments.close()])
+  worktreeArchive.close()
+  const restartClosing = Promise.allSettled([appRestart.close(), comments.close(), taskLifecycle.store.flush(), taskTitles.close(), taskTitleTrials.close(), quickReplies.close(), taskTitleRuntime.close(), router.close(), sessionAttentionStore.flush()]).then(() => taskGenerationConversations.close())
   const acpClosing = closeACPConnections().catch(error => recordRuntime('acp', 'shutdown_failed', error, 'warn'))
   configurePreventSleep(false)
   assistantFeishuInstaller?.cancel()
@@ -4498,5 +5122,5 @@ app.on('before-quit', (event) => {
   const weixinClosing = assistantWeixinBridge.close()
   // Electron does not await before-quit promises. Restore Codex configuration
   // and clean up only the helpers owned by this application before exiting.
-  void Promise.allSettled([restartClosing, acpClosing, weixinClosing, cliAgentSetup.close(), cancelMCodeOperation(),  zcodeInstallation.cancel(), assistantFeishuInstallFlight?.catch(() => {}), sessionFeishuInstallFlight?.catch(() => {}), uniagentManagement.close(), personalAssistant.close(), kimiOnboarding.close(), closeKimiLoginAttempts(), closeKimiWebServices(), closeDeepSeekHost(), codexSources.close(), closeClaudeSourceRuntimes(), grokQuota.close(), agentQuota.close(), orchestrator.closeZCodeRuntime(), orchestrator.closeSessionLogs(), performanceMonitor?.close()]).finally(() => { appQuitReady = true; app.quit() })
+  void Promise.allSettled([restartClosing, acpClosing, weixinClosing, cliAgentSetup.close(), cancelMCodeOperation(),  zcodeInstallation.cancel(), assistantFeishuInstallFlight?.catch(() => {}), sessionFeishuInstallFlight?.catch(() => {}), uniagentManagement.close(), personalAssistant.close(), kimiOnboarding.close(), closeKimiLoginAttempts(), closeKimiWebServices(), closeDeepSeekHost(), codexSources.close(), closeClaudeSourceRuntimes(), grokQuota.close(), agentQuota.close(), orchestrator.closeZCodeRuntime(), orchestrator.closeSessionLogs(), performanceMonitor?.close(), cloudMonitor.close()]).finally(() => { appQuitReady = true; app.quit() })
 })

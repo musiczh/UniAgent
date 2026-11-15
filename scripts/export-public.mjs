@@ -16,7 +16,7 @@ const internalFiles = new Set([
   'test/release-workflow.test.mjs'
 ])
 const rootFiles = new Set(['package.json', 'pnpm-lock.yaml', 'tsconfig.json', 'electron.vite.config.ts', 'LICENSE', '.gitignore'])
-const sourceDirectories = ['src/', 'native/', 'build/', 'resources/', 'patches/', 'scripts/', 'test/']
+const sourceDirectories = ['src/', 'native/', 'build/', 'resources/', 'patches/', 'scripts/', 'test/', 'supabase/', 'monitor/']
 const privateHost = /(?:https?:\/\/[^\s'"<>)]*(?:code\.byted\.org|bnpm\.byted\.org|kaboo\.bytedance\.net|bytedance\.larkoffice\.com|ida-app\.bytedance\.net|nika\.fan)|@bytedance-dev\/bonsai-codex)/i
 
 /** Remove only explicitly delimited source regions; malformed/nested markers fail closed. */
@@ -79,7 +79,7 @@ export function publicSource(text, path) {
     .replace(/(['"])UniAgent\1/g, (_match, quote) => quote + PUBLIC_APP_NAME + quote)
   // Requirement metadata belongs to the project format and is shared by both editions.
   // Only its application-level default home changes with the distribution.
-  if (/^(?:src\/main|test)\/requirement/.test(path)) {
+  if (/^(?:src\/main|test)\/requirement/.test(path) || path === 'test/workspace-browser-data.ts') {
     text = text.replace("resolveUserDataHome(join(homedir(), '.uniagent-public'))", "resolveUserDataHome(join(homedir(), '.uniagent-public'))")
   } else if (!['src/main/kimiInstallation.ts', 'test/kimi-installation.ts'].includes(path)) {
     text = text.replace(/(['"])\.uniagent(?=\1|\/)/g, '$1.uniagent-public')
@@ -103,7 +103,7 @@ export function publicPackage(value, version = value.version) {
   }
 }
 
-const publicReadme = `# UniAgent Public\n\nmacOS 多 Agent 桌面工作台。支持 Codex、Claude Code、Grok、Kimi Code、DeepSeek Harness、MiniMax Code 和 ZCode，保留各家原生协议、账号和能力。\n\n官网：https://musiczh.github.io/UniAgent/\n\n下载：https://github.com/musiczh/UniAgent/releases/latest\n\n将 \`UniAgent Public.app\` 拖入 Applications，可与内网 \`UniAgent.app\` 同时安装。应用 ID、UniAgent 会话与设置、缓存和更新源彼此独立。本机原生 Agent 程序、配置、历史、Skills 和登录态继续共用；修改原生配置会同时影响两版。UniAgent 托管服务的连接配置、运行状态与输入账本仍各自保存。\n\n## 开发\n\n需要 Node.js 20+、pnpm 9+、Xcode Command Line Tools。\n\n\`\`\`bash\npnpm install --frozen-lockfile --registry=https://registry.npmjs.org\npnpm dev\npnpm test\npnpm run pack\n\`\`\`\n\n会话、工具与插件、团队、飞书助手、定时任务、评论和本机用量沿用同一套公共实现。各 Agent 的安装、登录与模型计费由对应官方服务提供；API Key 只在专用设置表单输入。\n\n公开源码由维护者的统一研发主线生成。外部贡献请提交 PR，维护者回流主线后同步，避免生成结果覆盖贡献。\n\nMIT License；第三方通知见应用内许可证资源。\n`
+const publicReadme = `# UniAgent Public\n\nmacOS 多 Agent 桌面工作台。支持 Codex、Claude Code、Grok、Kimi Code、DeepSeek Harness、MiniMax Code、ZCode 和 Qoder，保留各家原生协议、账号和能力。\n\n官网：https://musiczh.github.io/UniAgent/\n\n下载：https://github.com/musiczh/UniAgent/releases/latest\n\n将 \`UniAgent Public.app\` 拖入 Applications，可与内网 \`UniAgent.app\` 同时安装。应用 ID、UniAgent 会话与设置、缓存和更新源彼此独立。本机原生 Agent 程序、配置、历史、Skills 和登录态继续共用；修改原生配置会同时影响两版。UniAgent 托管服务的连接配置、运行状态与输入账本仍各自保存。\n\n## 开发\n\n需要 Node.js 20+、pnpm 9+、Xcode Command Line Tools。\n\n\`\`\`bash\npnpm install --frozen-lockfile --registry=https://registry.npmjs.org\npnpm dev\npnpm test\npnpm run pack\n\`\`\`\n\n会话、工具与插件、团队、飞书助手、定时任务、评论和本机用量沿用同一套公共实现。各 Agent 的安装、登录与模型计费由对应官方服务提供；API Key 只在专用设置表单输入。\n\n公开源码由维护者的统一研发主线生成。外部贡献请提交 PR，维护者回流主线后同步，避免生成结果覆盖贡献。\n\nMIT License；第三方通知见应用内许可证资源。\n`
 
 export async function exportPublic({ sourceRoot = root, destination, ref = 'HEAD', workingTree = false, version } = {}) {
   if (!destination) throw new Error('Public export requires an empty destination directory')

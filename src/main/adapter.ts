@@ -28,8 +28,10 @@ import type {
 } from '../shared/types'
 import { isHiddenAgentWarning } from '../shared/agentWarnings'
 import { startTokenSpeedTelemetry, type TokenSpeedTelemetry } from './tokenSpeedTelemetry'
+import { SdkWorkerClient } from './sdkWorkerClient'
 import { ClaudeSdkClient, claudeSdkLaunch } from './claudeSdk'
 import { updateClaudeTaskPlan } from './claudeTaskPlan'
+import { ROUTER_SYSTEM_PROMPT, routerRole } from '../shared/router'
 import type { GoalState } from '../shared/nativeCapabilities'
 
 /**
@@ -37,7 +39,7 @@ import type { GoalState } from '../shared/nativeCapabilities'
  * Emits 'event' (UAEvent) and 'done' ({ nativeSessionId? }).
  */
 export class TurnRunner extends EventEmitter {
-  private sdk?: ClaudeSdkClient
+  protected sdk?: SdkWorkerClient
   private sdkKey?: string
   private sdkActive = false
   private sdkSerial = 0
@@ -54,18 +56,18 @@ export class TurnRunner extends EventEmitter {
   private child: ChildProcessWithoutNullStreams | null = null
   private buf = ''
   private seqRef: { n: number }
-  private nativeSessionId?: string
+  protected nativeSessionId?: string
   private forkSourceId?: string
   // Set when the user interrupts, so the terminal 'done' is flagged as a hard
   // stop and the orchestrator won't auto-drain the queue (G2-9).
-  private interrupted = false
+  protected interrupted = false
 
   // ---- Claude SDK token-level streaming ----
   // SDK partial messages emit per-token
   // `content_block_delta` events. We accumulate them per content block and
   // coalesce into ~1 UI update per frame, mirroring AppServerRunner, so replies
   // grow in place instead of arriving in one shot.
-  private claudePartial = false
+  protected claudePartial = false
   private claudeMsgId = ''
   // Streamed text block ids of the current message, consumed in order by the
   // completed assistant text blocks (the CLI may split them one per message).
@@ -73,15 +75,15 @@ export class TurnRunner extends EventEmitter {
   private claudeReplyOrdinal = 0
   private claudeFinalCandidate?: { id: string; text: string }
   private claudeTools = new Map<string, { name: string; input: any }>()
-  private claudeRequests = new Map<string, { wireId: string; toolName: string; input: any; suggestions?: any[]; kind?: string }>()
-  private claudeCompact = false
-  private claudeCompactDone = false
-  private claudeWorkdir = ''
-  private claudeFileEvents: UAEvent[] = []
+  protected claudeRequests = new Map<string, { wireId: string; toolName: string; input: any; suggestions?: any[]; kind?: string }>()
+  protected claudeCompact = false
+  protected claudeCompactDone = false
+  protected claudeWorkdir = ''
+  protected claudeFileEvents: UAEvent[] = []
   private assistantConfig?: SessionConfig
   private preparingAssistant = false
   private claudeSourceRuntime?: ClaudeSourceRuntime
-  private claudeResultFailed = false
+  protected claudeResultFailed = false
   private claudeRole?: SessionConfig['roleSnapshot']
   private claudeBuiltinCommands = new Set<string>()
   private claudeSubagents = new Map<string, UASubAgent>()
@@ -95,19 +97,19 @@ export class TurnRunner extends EventEmitter {
   private flushTimer: ReturnType<typeof setTimeout> | null = null
   private static readonly FLUSH_MS = 50
   // Model id for this turn (Doc5 T1) — used to price the usage footer.
-  private modelId?: string
+  protected modelId?: string
   // Latest main-thread Claude API call; its input is the real context occupancy.
   private claudeLastCall?: { usage: any; model?: string }
 
   constructor(
-    private sessionId: string,
+    protected sessionId: string,
     seqRef: { n: number }
   ) {
     super()
     this.seqRef = seqRef
   }
 
-  private emitEvent(e: Omit<UAEvent, 'sessionId' | 'seq' | 'ts'>): void {
+  protected emitEvent(e: Omit<UAEvent, 'sessionId' | 'seq' | 'ts'>): void {
     const ev: UAEvent = {
       sessionId: this.sessionId,
       seq: this.seqRef.n++,
@@ -116,6 +118,25 @@ export class TurnRunner extends EventEmitter {
     }
     if (ev.type === 'file_change') this.claudeFileEvents.push(ev)
     this.emit('event', ev)
+  }
+
+  protected prepareSdkProjection(config: SessionConfig, compact = false): void {
+    this.interrupted = false
+    this.claudeResultFailed = false
+    this.claudePartial = true
+    this.claudeCompact = compact
+    this.claudeCompactDone = false
+    this.claudeFileEvents = []
+    this.claudeFinalCandidate = undefined
+    this.claudeLastCall = undefined
+    this.claudeTextIds = []
+    this.claudeWorkdir = config.workdir
+    this.modelId = config.model
+  }
+
+  protected sdkResultUsage(result: any): any {
+    return normalizeClaudeUsage(result.usage, this.modelId, this.claudeSourceRuntime ? undefined : result.total_cost_usd,
+      this.claudeLastCall, this.claudeSourceRuntime ? undefined : result.modelUsage)
   }
 
   interrupt(): void {
@@ -220,6 +241,14 @@ export class TurnRunner extends EventEmitter {
 
   hasPendingRequests(): boolean {
     return this.claudeRequests.size > 0
+  }
+
+  protected setSdkSubagentHistoryId(taskId: string, nativeHistoryId: string): void {
+    const previous = this.claudeSubagents.get(taskId)
+    if (!previous) return
+    const agent = { ...previous, nativeHistoryId }
+    this.claudeSubagents.set(taskId, agent)
+    this.emitEvent({ type: 'subagent', payload: { id: `claude-task-${taskId}`, agents: [agent] } })
   }
 
   getSubAgentItems(agentThreadId: string): UAEvent[] {
@@ -382,7 +411,7 @@ export class TurnRunner extends EventEmitter {
     this.claudeTextIds = []
     this.claudeWorkdir = config.workdir
     this.assistantConfig = config
-    this.claudeRole = config.roleSnapshot
+    this.claudeRole = routerRole(config) || config.roleSnapshot
     this.modelId = config.model || agent.defaultModel
     if (this.sdkIdleTimer) clearTimeout(this.sdkIdleTimer)
     let runtime: ClaudeSourceRuntime | undefined
@@ -403,7 +432,7 @@ export class TurnRunner extends EventEmitter {
         const source = this.claudeSourceRuntime
         const args = [...launch.args, ...(source?.args || [])]
         const sdkLaunch = claudeSdkLaunch(agent.bin, config.workdir, args,
-          { ...process.env, ...nativeCredentialEnv('claude'), ...launch.env, ...source?.env, ...this.sdkTelemetry?.env }, config.roleSnapshot)
+          { ...process.env, ...nativeCredentialEnv('claude'), ...launch.env, ...source?.env, ...this.sdkTelemetry?.env }, routerRole(config) || config.roleSnapshot)
         sdkLaunch.initializeTimeoutMs = 10_000
         this.sdk = new ClaudeSdkClient(sdkLaunch)
         const sdk = this.sdk
@@ -545,7 +574,7 @@ export class TurnRunner extends EventEmitter {
     this.scheduleClaudeIdleClose()
   }
 
-  private async confirmClaudeGoal(sdk: ClaudeSdkClient, result: any): Promise<void> {
+  private async confirmClaudeGoal(sdk: SdkWorkerClient, result: any): Promise<void> {
     if (!this.sdkGoal || this.sdkGoal.status !== 'active' || this.sdkGoal.autonomous || this.claudeResultFailed || !(result.num_turns > 0 || result.usage?.output_tokens > 0)) return
     try {
       const state = await sdk.request('command', '/goal')
@@ -563,11 +592,11 @@ export class TurnRunner extends EventEmitter {
     }
   }
 
-  private scheduleClaudeIdleClose(): void {
+  protected scheduleClaudeIdleClose(isActive: () => boolean = () => this.sdkActive): void {
     if (this.sdkIdleTimer) clearTimeout(this.sdkIdleTimer)
     this.sdkIdleTimer = setTimeout(() => {
-      if (this.sdkActive) return
-      if (this.claudeRequests.size || [...this.claudeSubagents.values()].some(agent => ['running', 'pendingInit'].includes(agent.status))) this.scheduleClaudeIdleClose()
+      if (isActive()) return
+      if (this.claudeRequests.size || [...this.claudeSubagents.values()].some(agent => ['running', 'pendingInit'].includes(agent.status))) this.scheduleClaudeIdleClose(isActive)
       else void this.disposeClaudeSdk()
     }, 60_000)
     this.sdkIdleTimer.unref()
@@ -625,14 +654,15 @@ export class TurnRunner extends EventEmitter {
     const { cmd, args, env, appendedPrompt } = buildCommand(agent, config, prompt, resumeId, attachments, this.sessionId, fork)
     this.modelId = config.model || agent.defaultModel
     this.emitEvent({ type: 'system_notice', payload: {
-      text: `启动: ${cmd} ${args.map(arg => {
+      text: config.managedPurpose === 'router' ? `启动: ${cmd} exec [RouterAgent 专用工具配置]` : `启动: ${cmd} ${args.map(arg => {
         const token = teamRuntime(this.sessionId)?.token
         const memoryToken = assistantMcpEnv(this.sessionId).UNIAGENT_ASSISTANT_TOKEN
         const safe = token ? arg.split(token).join('[team capability]') : arg
         return memoryToken ? safe.split(memoryToken).join('[assistant capability]') : safe
       }).join(' ')}`, kind: 'launch', label: agent.name, model: config.model || agent.defaultModel, effort: config.effort, appendedPrompt
     } })
-    args.push(...(telemetry?.args || []))
+    const optionEnd = args.indexOf('--')
+    args.splice(optionEnd < 0 ? args.length : optionEnd, 0, ...(telemetry?.args || []))
     const child = spawn(cmd, args, { cwd: config.workdir, env: { ...process.env, ...nativeCredentialEnv(agent.adapter), ...env, ...telemetry?.env }, stdio: ['pipe','pipe','pipe'] })
     this.child = child
     child.stdin.on('error', () => {})
@@ -812,7 +842,7 @@ export class TurnRunner extends EventEmitter {
   }
 
   // ---- Claude Code --output-format stream-json (NDJSON) ----
-  private parseClaude(o: any): void {
+  protected parseClaude(o: any): void {
     if (typeof o.parent_tool_use_id === 'string' && o.parent_tool_use_id &&
         ['assistant', 'user', 'stream_event'].includes(o.type)) {
       const id = this.claudeChildTools.get(o.parent_tool_use_id) || o.parent_tool_use_id
@@ -979,7 +1009,7 @@ export class TurnRunner extends EventEmitter {
         this.claudeResultFailed = o.is_error === true || o.subtype !== 'success'
         if (this.claudeResultFailed) {
           const message = typeof o.result === 'string' && o.result || (Array.isArray(o.errors) ? o.errors.filter((value: unknown) => typeof value === 'string').join('\n') : '')
-          this.emitEvent({ type: 'error', state: 'failed', payload: { message: (message || 'Claude 回合未成功完成，请检查模型权限、额度或网络').slice(0, 2000) } })
+          this.emitEvent({ type: 'error', state: 'failed', payload: { message: (message || 'Claude 回合未成功完成，请检查模型权限、额度或网络').slice(0, 2000), recoveryDelivery: 'accepted' } })
         }
         if (o.subtype === 'success' && o.is_error !== true && this.claudeFinalCandidate) {
           this.emitEvent({
@@ -992,7 +1022,7 @@ export class TurnRunner extends EventEmitter {
           type: 'system_notice',
           payload: {
             kind: 'usage',
-            usage: normalizeClaudeUsage(o.usage, this.modelId, this.claudeSourceRuntime ? undefined : o.total_cost_usd, this.claudeLastCall, this.claudeSourceRuntime ? undefined : o.modelUsage),
+            usage: this.sdkResultUsage(o),
             cost: this.claudeSourceRuntime ? undefined : o.total_cost_usd,
             durationMs: o.duration_ms
           }
@@ -1097,7 +1127,7 @@ export class TurnRunner extends EventEmitter {
   }
 
   /** Finalize any blocks still pending when the process closes. */
-  private flushDeltas(): void {
+  protected flushDeltas(): void {
     this.clearFlushTimer()
     for (const id of [...this.dirty]) this.flushBlockFinal(id)
     this.dirty.clear()
@@ -1315,7 +1345,8 @@ function claudePermission(mode: PermissionMode): string {
   }
 }
 
-function developerInstructions(config: SessionConfig, sessionId?: string): string {
+export function developerInstructions(config: SessionConfig, sessionId?: string): string {
+  if (config.managedPurpose === 'router') return ROUTER_SYSTEM_PROMPT
   return [
     uniAgentSessionInstructions(),
     assistantIdentity(config.assistantSnapshot),
@@ -1343,6 +1374,11 @@ function traexRoleToolFlags(config: SessionConfig): string[] {
 }
 
 /** CLI flags for project roots beyond the primary working directory. */
+export function agentAdditionalDirectories(config: SessionConfig): string[] {
+  return normalizedAdditionalDirectories(config.workdir, [...(config.additionalDirectories || []),
+    ...(config.worktree ? [config.worktree.repositoryRoot, config.worktree.gitCommonDirectory] : [])])
+}
+
 export function additionalDirectoryArgs(primary: string, directories: readonly string[] | undefined): string[] {
   return normalizedAdditionalDirectories(primary, directories).flatMap((directory) => ['--add-dir', directory])
 }
@@ -1370,6 +1406,7 @@ export function buildCommand(
   fork?: ClaudeForkOrigin,
   interactiveClaude = false
 ): { cmd: string; args: string[]; env: Record<string, string>; appendedPrompt?: string } {
+  if (config.managedPurpose === 'router') config = { ...config, roleSnapshot: routerRole(config) }
   if (fork && (agent.adapter !== 'claude' || resumeId || !fork.sessionId || !fork.messageId)) {
     throw new Error('原生消息分叉参数不匹配，已停止续写')
   }
@@ -1385,6 +1422,8 @@ export function buildCommand(
       : prompt
 
   if (agent.adapter === 'codex' || agent.adapter === 'traex') {
+    const mcpArgs = handoffMcpArgs(agent.adapter, callerSessionId)
+    if (agent.adapter === 'traex' && config.managedPurpose === 'router' && !mcpArgs.some(arg => arg.startsWith('mcp_servers.uniagent-router.command='))) throw new Error('RouterAgent 会话工具资格已失效，请重新打开路由会话')
     // Plan mode has no native exec equivalent (codex Plan Mode lives on the
     // streaming app-server; traex exec rejects --permission-mode plan). Degrade
     // gracefully by constraining the turn with a plan-oriented instruction
@@ -1397,7 +1436,7 @@ export function buildCommand(
     // rides on -c model_reasoning_effort.
     if (resumeId) {
       const args = ['exec', 'resume', resumeId, '--json', '--skip-git-repo-check']
-      args.push(...additionalDirectoryArgs(config.workdir, config.additionalDirectories))
+      args.push(...additionalDirectoryArgs(config.workdir, agentAdditionalDirectories(config)))
       if (agent.capabilities.modelSelect && config.model) args.push('-m', config.model)
       if (agent.capabilities.reasoningEffort) args.push(...effortFlags(agent, config.effort))
       args.push(...fastFlags(agent, config.fastMode))
@@ -1408,8 +1447,9 @@ export function buildCommand(
         args.push('--dangerously-bypass-approvals-and-sandbox')
       }
       // Doc11: inject the handoff MCP server so a resumed turn can also 交接 tasks.
-      args.push(...handoffMcpArgs(agent.adapter, callerSessionId))
+      args.push(...mcpArgs)
       for (const img of images) args.push('-i', img)
+      if (agent.adapter === 'traex' && images.length) args.push('--')
       args.push(execPrompt)
       return { cmd: agent.bin, args, env, appendedPrompt: instructions }
     }
@@ -1427,10 +1467,11 @@ export function buildCommand(
     args.push('-c', `developer_instructions=${JSON.stringify(instructions)}`)
     if (agent.adapter === 'traex') args.push(...traexRoleToolFlags(config))
     // Doc11: inject the handoff MCP server (create_uniagent_task) into the turn.
-    args.push(...handoffMcpArgs(agent.adapter, callerSessionId))
+    args.push(...mcpArgs)
     args.push('-C', config.workdir)
-    args.push(...additionalDirectoryArgs(config.workdir, config.additionalDirectories))
+    args.push(...additionalDirectoryArgs(config.workdir, agentAdditionalDirectories(config)))
     for (const img of images) args.push('-i', img)
+    if (agent.adapter === 'traex' && images.length) args.push('--')
     args.push(execPrompt)
     return { cmd: agent.bin, args, env, appendedPrompt: instructions }
   }
@@ -1477,7 +1518,7 @@ export function buildCommand(
     args.push('--permission-mode', claudePermission(permissionMode))
     if (resumeId) args.push('--resume', resumeId)
     if (fork) args.push('--resume', fork.sessionId, '--fork-session', '--resume-session-at', fork.messageId)
-    const additionalDirectories = normalizedAdditionalDirectories(config.workdir, config.additionalDirectories)
+    const additionalDirectories = agentAdditionalDirectories(config)
     if (additionalDirectories.length) args.push('--add-dir', ...additionalDirectories)
     // Doc11: inject the handoff MCP server so claude turns can 交接 tasks too.
     args.push(...handoffMcpArgs(agent.adapter, callerSessionId))

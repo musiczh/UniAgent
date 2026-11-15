@@ -56,7 +56,7 @@ export async function deleteOwnedGrokFork(id: string, bin: string, env: NodeJS.P
   const connection = new ACPConnection({bin,args:['--no-auto-update','agent','--no-leader','stdio'],cwd:record.cwd,env:{...process.env,...env},providerLabel:'Grok'})
   try {
     const initialize = await connection.initialize()
-    if (!grokCapabilityAvailable(grokNativeHandshake(initialize),'fork')) throw new Error('当前版本尚未验证 Grok 分叉清理')
+    if (!grokCapabilityAvailable(grokNativeHandshake(initialize),'fork')) throw new Error('Grok 协议握手未通过，无法清理分叉')
     const exists = async (): Promise<boolean> => {
       let cursor: string | undefined, found = false
       const cursors = new Set<string>()
@@ -123,7 +123,7 @@ export async function forkBetaSession(
   let createdId: string | undefined
   try {
     const initialize = await connection.initialize()
-    if (!grokCapabilityAvailable(grokNativeHandshake(initialize),'fork')) throw new Error('当前 Grok 版本未验证原生分叉，稳定 ACP 的 session/fork 仍属于 UNSTABLE。')
+    if (!grokCapabilityAvailable(grokNativeHandshake(initialize),'fork')) throw new Error('Grok 协议握手未通过，无法创建原生分叉。')
     const root = ledgerRoot(extraEnv)
     await mkdir(root,{recursive:true,mode:0o700})
     const path = join(root,`${randomUUID()}.json`)

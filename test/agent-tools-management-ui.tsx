@@ -37,9 +37,9 @@ assert(!panel.includes('统一查看与管理各 Agent'))
 assert(!panel.includes('排查日志'))
 const logs = renderToStaticMarkup(createElement(AgentCapabilitiesPanel, { onOpenSync() {}, agents, logOnly: true, onBack() {} }))
 assert(logs.includes('工具能力排查日志'))
-assert(logs.includes('返回通用'))
+assert(logs.includes('返回开发者选项'))
 assert(!logs.includes('跨 Agent 对比'))
-console.log('agent-tools-management-ui: registered Agent selector, source tooltip, link action and general-settings log view passed')
+console.log('agent-tools-management-ui: registered Agent selector, source tooltip, link action and developer-settings log view passed')
 
 const layout = await renderEventStream([], 'idle', 'tool-management-layout', {
   setup: `
@@ -124,3 +124,70 @@ assert(layout.arrow.left - layout.picks[0].right <= 14)
 assert(layout.picks[1].left - layout.arrow.right <= 14)
 assert(Math.abs((layout.picks[1].top + layout.picks[1].bottom - layout.caret.top - layout.caret.bottom) / 2) < 1)
 console.log('agent-tools-management-ui: themed selection, keyboard, panel-contained batch actions, compact comparison and hidden types passed')
+
+for (const mode of ['mcp', 'skill', 'skill-source']) {
+  const result = await renderEventStream([], 'idle', `tool-detail-${mode}`, {
+    screenshot: process.env.UNIAGENT_TOOL_DETAIL_PREVIEW === '1' ? {
+      path: `${process.cwd()}/docs/mockups/agent-tools-${mode}-detail-2026-10-29.png`, width: 1600, height: 900
+    } : undefined,
+    setup: `
+      import {AgentCapabilitiesPanel} from './src/renderer/components/AgentCapabilitiesPanel';
+      import {UiIcon} from './src/renderer/components/Icons';
+      import {DISTRIBUTION_SETTINGS_CATEGORIES} from './src/shared/settingsNavigation';
+      document.getElementById('root').style.display='none';
+      const home='/Users/bytedance';
+      const skill=(name,shared)=>({id:'codex:'+name,agentId:'codex',kind:'skill',name,scope:shared?'shared':'agent',owner:shared?'shared':'user',origin:shared?'shared':'codex user directory',fingerprint:'a'.repeat(64),manageable:true,removal:'skill',copyable:false,status:'available',entryPath:home+(shared?'/.agents/skills/':'/.codex/skills/')+name,location:home+(shared?'/.agents/skills/':'/.codex/skills/')+name,manifestPath:home+(shared?'/.agents/skills/':'/.codex/skills/')+name+'/SKILL.md'});
+      const items=[skill('android-cli',true),skill('capcode',false),{id:'codex:reader',agentId:'codex',kind:'mcp',name:'wechat-reader',scope:'agent',owner:'user',origin:'codex user directory',fingerprint:'a'.repeat(64),manageable:true,copyable:false,status:'available'}];
+      window.uniagent={onCapabilityInventoryChanged:()=>()=>{},onCapabilitySyncProgress:()=>()=>{},capabilitySyncGetJobSnapshot:async()=>({}),capabilityInventoryList:async()=>({inventories:[{agentId:'codex',available:true,writable:true,status:'available',revision:'fixture',items}],scannedAt:1}),capabilityInventoryDetail:async id=>{
+        if(window.__failDetail)throw new Error('/secret/runtime unavailable');
+        const item=items.find(item=>item.id===id);
+        return item.kind==='mcp'?{id,name:item.name,kind:'mcp',openable:false,sourcePath:home+'/.codex/config.toml',manifestFile:'config.toml',manifestText:JSON.stringify({transport:'stdio',command:'uvx',args:['[redacted]'],enabled:true,env:{WECHAT_READER_TOKEN:'[redacted]'}},null,2)}:{id,name:item.name,kind:'skill',openable:true,folderPath:item.location,manifestFile:'SKILL.md',manifestText:'---\\nname: '+item.name+'\\ndescription: Orchestrates Android development tasks including project creation, deployment, SDK management, and environment diagnostics.\\n---\\n# Android CLI Specialist\\n\\nThis skill provides instructions for using the Android CLI tool.\\n\\n## Capabilities\\n\\n- Create and run Android projects\\n- Manage connected devices and emulators\\n- Inspect the Android SDK and development environment\\n',files:[]};
+      }};
+      const fixture=document.body.appendChild(document.createElement('div'));
+      fixture.id='detail-fixture';fixture.className='main-panel settings-panel';fixture.style.cssText='position:fixed;inset:0;display:flex;flex-direction:column';
+      createRoot(fixture).render(React.createElement(React.Fragment,null,
+        React.createElement('div',{className:'main-panel-head settings-head',style:{padding:'14px 20px'}},React.createElement('button',{className:'settings-back'},React.createElement(UiIcon,{name:'back',size:15})),React.createElement('span',{className:'main-panel-title'},'设置')),
+        React.createElement('div',{className:'settings-inner'},React.createElement('nav',{className:'set-nav'},DISTRIBUTION_SETTINGS_CATEGORIES.map(category=>React.createElement('button',{key:category.id,className:'set-nav-item '+(category.id==='capabilities'?'active':'')},React.createElement('span',{className:'ic'},React.createElement(UiIcon,{name:category.icon,size:16})),React.createElement('span',{className:'lbl'},category.label)))),React.createElement(AgentCapabilitiesPanel,{embedded:true,agents:[{id:'codex',name:'Codex'}],onOpenSync(){}}))));
+    `,
+    inspect: `(async()=>{
+      const wait=async probe=>{const until=Date.now()+5000;while(!probe()){if(Date.now()>until)throw new Error('Detail fixture timed out');await new Promise(resolve=>setTimeout(resolve,10));}};
+      const fixture=document.getElementById('detail-fixture');
+      const open=name=>[...fixture.querySelectorAll('.capability-row')].find(row=>row.querySelector('.cap-nm').textContent===name).click();
+      const mode=${JSON.stringify(mode)};
+      const name=mode==='mcp'?'wechat-reader':'android-cli';
+      await wait(()=>fixture.querySelectorAll('.capability-row').length===3);open(name);
+      await wait(()=>fixture.querySelector('.cd-body')?.textContent.includes(mode==='mcp'?'uvx':'Android CLI Specialist'));
+      const trigger=()=>fixture.querySelector('[aria-label="查看来源位置"]');
+      const paths=()=>fixture.querySelector('.cd-paths');
+      const defaultCollapsed=paths().hidden&&getComputedStyle(paths()).display==='none';
+      const noDuplicateOrigin=!fixture.querySelector('.cd-origin');
+      const status=fixture.querySelector('.cd-status').getBoundingClientRect(),icon=trigger().getBoundingClientRect();
+      const besideStatus=icon.left>=status.right&&icon.left-status.right<=12;
+      trigger().click();await wait(()=>!paths().hidden);
+      const expandedLabels=[...paths().querySelectorAll('dt')].map(el=>el.textContent);
+      trigger().click();await wait(()=>paths().hidden);
+      if(mode==='mcp'){
+        fixture.querySelector('.cd-x').click();window.__failDetail=true;open(name);
+        await wait(()=>fixture.querySelector('.cd-body [role="alert"]'));
+        if(!fixture.querySelector('.cd-body').textContent.includes('读取详情失败')||fixture.textContent.includes('/secret/runtime'))throw new Error('Detail errors must be visible and safe');
+        fixture.querySelector('.cd-x').click();window.__failDetail=false;open(name);
+        await wait(()=>fixture.querySelector('.cd-code')?.textContent.includes('uvx'));
+      }else{
+        fixture.querySelector('.cd-x').click();open('capcode');
+        await wait(()=>fixture.querySelector('.cd-name')?.textContent==='capcode');
+        if(trigger().getAttribute('aria-expanded')!=='false')throw new Error('New item must reset collapsed source details');
+        fixture.querySelector('.cd-x').click();open(name);
+        await wait(()=>fixture.querySelector('.cd-name')?.textContent===name&&!fixture.querySelector('.panel-loading'));
+      }
+      if(mode==='skill-source'){trigger().click();await wait(()=>!paths().hidden);}
+      await new Promise(resolve=>setTimeout(resolve,220));
+      return {defaultCollapsed,noDuplicateOrigin,besideStatus,expandedLabels,body:fixture.querySelector('.cd-body').textContent};
+    })()`
+  })
+  assert.equal(result.defaultCollapsed, true)
+  assert.equal(result.noDuplicateOrigin, true)
+  assert.equal(result.besideStatus, true)
+  assert.deepEqual(result.expandedLabels, mode === 'mcp' ? ['配置文件'] : ['读取位置', '实际源目录', '原始指令文件'])
+  assert(result.body.includes(mode === 'mcp' ? 'uvx' : 'Android CLI Specialist'))
+}
+console.log('agent-tools-management-ui: MCP content, safe load errors, collapsed source disclosure and item switching passed')

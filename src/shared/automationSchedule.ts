@@ -1,5 +1,8 @@
+import { isChinaWorkday } from './chinaWorkCalendar.ts'
+
+export type AutomationDayMode = 'all' | 'workday' | 'non-workday'
 export type ScheduleDay = 'MO' | 'TU' | 'WE' | 'TH' | 'FR' | 'SA' | 'SU'
-export type ScheduleFrequency = 'daily' | 'weekly' | 'monthly' | 'custom'
+export type ScheduleFrequency = 'once' | 'daily' | 'weekly' | 'monthly' | 'custom'
 
 export interface ParsedSchedule {
   ok: boolean
@@ -11,13 +14,24 @@ export interface ParsedSchedule {
   minute: number
   days: Set<ScheduleDay>
   monthDays: Set<number>
+  onceAt?: number
   raw: string
 }
 
 const SCHEDULE_DAYS: ScheduleDay[] = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU']
 
-export function nextScheduleRuns(schedule: ParsedSchedule, count = 3, from = new Date()): Date[] {
+export function matchesAutomationDay(date: Date, dayMode: AutomationDayMode = 'all'): boolean | null {
+  if (dayMode === 'all') return true
+  const workday = isChinaWorkday(date)
+  return workday === null ? null : dayMode === 'workday' ? workday : !workday
+}
+
+export function nextScheduleRuns(schedule: ParsedSchedule, count = 3, from = new Date(), dayMode: AutomationDayMode = 'all'): Date[] {
   if (!schedule.ok || schedule.freq === 'custom' || count < 1) return []
+  if (schedule.freq === 'once') {
+    return dayMode === 'all' && schedule.onceAt !== undefined && schedule.onceAt > from.getTime()
+      ? [new Date(schedule.onceAt)] : []
+  }
   const runs: Date[] = []
   const jsDay: ScheduleDay[] = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA']
   for (let offset = 0; offset < 1100 && runs.length < count; offset += 1) {
@@ -26,7 +40,11 @@ export function nextScheduleRuns(schedule: ParsedSchedule, count = 3, from = new
     if (candidate <= from || candidate.getHours() !== schedule.hour || candidate.getMinutes() !== schedule.minute) continue
     if (schedule.freq === 'daily' ||
         (schedule.freq === 'weekly' && schedule.days.has(jsDay[candidate.getDay()])) ||
-        (schedule.freq === 'monthly' && schedule.monthDays.has(candidate.getDate()))) runs.push(candidate)
+        (schedule.freq === 'monthly' && schedule.monthDays.has(candidate.getDate()))) {
+      const matches = matchesAutomationDay(candidate, dayMode)
+      if (matches === null) break
+      if (matches) runs.push(candidate)
+    }
   }
   return runs
 }
@@ -80,10 +98,23 @@ function numberSet(value: string, min: number, max: number): Set<number> | null 
   return result.size ? result : null
 }
 
-/** Parse the RRULE and five/six-field cron subset represented by the editor. */
+/** Parse one-off instants and the RRULE / five/six-field cron subset represented by the editor. */
 export function parseScheduleExpression(expression: string): ParsedSchedule {
   const raw = expression.trim()
   if (!raw) return invalidSchedule(raw)
+
+  if (raw.startsWith('ONCE:')) {
+    const match = /^ONCE:(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-]\d{2}:\d{2})$/.exec(raw)
+    if (!match) return invalidSchedule(raw)
+    const [, day, h, m, s = '00', fraction = '', zone] = match
+    const calendar = new Date(`${day}T00:00:00Z`)
+    const onceAt = Date.parse(`${day}T${h}:${m}:${s}${fraction ? `.${fraction}` : ''}${zone}`)
+    if (!Number.isFinite(onceAt) || !Number.isFinite(calendar.getTime()) || calendar.toISOString().slice(0, 10) !== day ||
+        Number(h) > 23 || Number(m) > 59 || Number(s) > 59) return invalidSchedule(raw)
+    const date = new Date(onceAt)
+    return { ...invalidSchedule(raw), ok: true, freq: 'once', onceAt,
+      hour: date.getHours(), minute: date.getMinutes(), second: date.getSeconds() }
+  }
 
   if (/^(?:RRULE:)?FREQ=/i.test(raw)) {
     const fields = new Map<string, string>()

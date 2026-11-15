@@ -192,7 +192,7 @@ export async function manageBetaCapabilityInventory(value: unknown, options: Bet
     const current = await grokInventoryFromOptions(bin, grokOptions)
     if (!current.available || current.status === 'unsupported') throw new Error('capability_inventory_unavailable')
     if (current.status === 'invalid') throw new Error('grok_inventory_invalid')
-    if (request.expectedRevision !== undefined && request.expectedRevision !== current.revision) throw new Error('grok_inventory_stale')
+    if ('expectedRevision' in request && request.expectedRevision !== undefined && request.expectedRevision !== current.revision) throw new Error('grok_inventory_stale')
     if ('id' in request) {
       const entry = current.items.find((item) => item.id === request.id)
       if (!entry || !entry.manageable) throw new Error('grok_inventory_readonly')

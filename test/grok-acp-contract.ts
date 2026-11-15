@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { ACPConnection } from '../src/main/acp/acpConnection.ts'
+import { ACPRecoveryError } from '../src/main/acp/acpProcessLifecycle.ts'
 import {
   GrokACPRunner,
   GROK_PERMISSION_MODES,
@@ -16,7 +17,8 @@ import {
 import { buildTextPromptBlocks } from '../src/main/acp/acpPromptBlocks.ts'
 import { normalizeQuestions, encodeAnswer } from '../src/shared/questions.ts'
 import { normalizeGrokSubagentNotification } from '../src/shared/subAgentLifecycle.ts'
-import type { AgentDef } from '../src/shared/types.ts'
+import { configureRequirementRuntime, requirementCaller, requirementMcpEnv, setRequirementsEnabled } from '../src/main/requirementRuntime'
+import type { AgentDef, Session } from '../src/shared/types.ts'
 
 // Break caught: Grok cannot be registered as a first-class adapter.
 const grokAgent: AgentDef = {
@@ -366,6 +368,10 @@ async function waitFor(
 // Break caught: the Grok runner loses negotiated state or normalizes streamed
 // frames differently from the existing UniAgent session contract.
 const runnerFake = await createRunnerFake()
+setRequirementsEnabled(true)
+configureRequirementRuntime(id => ['local-grok', 'local-resumed'].includes(id)
+  ? { id, config: { agentId: 'grok', workdir: runnerFake.dir, requirementId: 'grok-requirement' } } as Session
+  : undefined)
 try {
   const runnerAgent: AgentDef = {
     ...grokAgent,
@@ -384,7 +390,9 @@ try {
       model: 'grok-4.6',
       effort: 'high',
       permissionMode: 'ask',
-      workdir: runnerFake.dir
+      workdir: runnerFake.dir,
+      requirementId: 'grok-requirement',
+      additionalDirectories: ['/unsupported-extra-workspace']
     }
   )
   runner.on('event', (event) => events.push(event))
@@ -397,6 +405,11 @@ try {
     .map((line) => JSON.parse(line))
     .find((record) => record.kind === 'inbound' && record.frame?.method === 'session/new')
   assert.equal(firstSessionRequest.frame.params.mcpServers.length, 1)
+  assert.equal(firstSessionRequest.frame.params.cwd, runnerFake.dir)
+  assert.equal(firstSessionRequest.frame.params.additionalDirectories, undefined, 'an ACP runtime without multi-directory support receives only the primary cwd')
+  const requirementToken = firstSessionRequest.frame.params.mcpServers[0].env.find((entry: { name: string }) => entry.name === 'UNIAGENT_REQUIREMENT_TOKEN')?.value
+  assert.equal(requirementToken, '<redacted>', 'Grok receives a requirement-scoped MCP binding without logging its credential')
+  assert.equal(requirementCaller('local-grok', requirementMcpEnv('local-grok').UNIAGENT_REQUIREMENT_TOKEN).config.requirementId, 'grok-requirement')
   assert.equal(firstSessionRequest.frame.params.mcpServers[0].name, 'uniagent')
   assert.equal(firstSessionRequest.frame.params.mcpServers[0].command, process.execPath)
   assert.equal(
@@ -469,13 +482,24 @@ try {
       model: 'grok-4.6',
       effort: 'high',
       permissionMode: 'ask',
-      workdir: runnerFake.dir
+      workdir: runnerFake.dir,
+      requirementId: 'grok-requirement',
+      additionalDirectories: ['/unsupported-extra-workspace']
     },
     'grok-session-1'
   )
   resumed.on('event', (event) => resumedEvents.push(event))
   await resumed.startTurn('stream')
   resumed.dispose()
+  const resumeRequest = (await readFile(runnerFake.logPath, 'utf8')).split('\n').filter(Boolean).map(line => JSON.parse(line))
+    .findLast(record => record.kind === 'inbound' && record.frame?.method === 'session/resume')
+  assert.equal(resumeRequest.frame.params.cwd, runnerFake.dir)
+  assert.equal(resumeRequest.frame.params.additionalDirectories, undefined)
+  const resumedMcp = resumeRequest.frame.params.mcpServers[0]
+  assert.equal(resumedMcp.env.find((entry: { name: string }) => entry.name === 'UNIAGENT_CALLER_SESSION')?.value, 'local-resumed')
+  const resumedRequirementToken = resumedMcp.env.find((entry: { name: string }) => entry.name === 'UNIAGENT_REQUIREMENT_TOKEN')?.value
+  assert.equal(resumedRequirementToken, '<redacted>')
+  assert.equal(requirementCaller('local-resumed', requirementMcpEnv('local-resumed').UNIAGENT_REQUIREMENT_TOKEN).config.requirementId, 'grok-requirement')
   const resumedMessages = resumedEvents.filter((event) => event.type === 'agent_message')
   assert.equal(new Set(resumedMessages.map((event) => event.payload.id)).size, 1)
   assert.equal(resumedMessages.at(-1)?.payload.text, 'Grok reply')
@@ -642,18 +666,29 @@ try {
   assert.equal(unavailable.status, 'incompatible', 'generic ACP -32000 does not mean missing authentication')
   const needsAuth = await probeGrokACP(runnerFake.bin, runnerFake.dir, { GROK_HOME: join(runnerFake.dir, 'native-home'), FAKE_GROK_SCENARIO: JSON.stringify({ authenticationRequired: true }) })
   assert.equal(needsAuth.status, 'needs-auth')
+  const initialize = ACPConnection.prototype.initialize
+  try {
+    ACPConnection.prototype.initialize = async () => { throw new ACPRecoveryError() }
+    const blocked = await probeGrokACP(runnerFake.bin, runnerFake.dir, { GROK_HOME: join(runnerFake.dir, 'native-home') })
+    assert.equal(blocked.status, 'incompatible')
+    assert.match(blocked.reason || '', /本地进程恢复未完成/)
+  } finally { ACPConnection.prototype.initialize = initialize }
 
   const history = await listGrokSessions(runnerFake.bin, runnerFake.dir)
   assert.ok(history.some((entry) => entry.id === 'grok-session-1' && entry.agentId === 'grok'))
   const loaded = await loadGrokSessionEvents('grok-session-1', runnerFake.bin, runnerFake.dir)
   assert.equal(loaded.cwd, runnerFake.dir)
   assert.equal(loaded.model, 'grok-4.6')
-  assert.ok(loaded.events.some((event) => event.type === 'user_message' && event.payload.text === 'stream'))
+  const nativeUserText = runnerRecords.find(record => record.kind === 'inbound' && record.frame?.method === 'session/prompt').frame.params.prompt[0].text
+  assert.ok(nativeUserText.includes('本会话关联需求共享上下文') && nativeUserText.endsWith('stream'))
+  assert.ok(loaded.events.some((event) => event.type === 'user_message' && event.payload.text === nativeUserText), 'native history preserves the complete submitted requirement context and user input')
   assert.ok(loaded.events.some((event) => event.type === 'reasoning' && event.payload.text === 'Inspecting'))
   assert.ok(loaded.events.some((event) => event.type === 'agent_message' && event.payload.text === 'Grok reply'))
   await deleteGrokSession('grok-session-1', runnerFake.bin, runnerFake.dir)
   assert.equal((await listGrokSessions(runnerFake.bin, runnerFake.dir)).some((entry) => entry.id === 'grok-session-1'), true, 'undeclared native delete preserves native history')
 } finally {
+  configureRequirementRuntime(() => undefined)
+  setRequirementsEnabled(false)
   await runnerFake.cleanup()
 }
 

@@ -34,6 +34,47 @@ try {
   const withTurn = (ms, turn, payload) =>
     JSON.stringify({ timestamp: iso(ms), turn_id: turn, type: 'event_msg', payload })
 
+  for (const agentId of ['codex', 'traex']) {
+    for (const terminal of ['turn_aborted', 'missing', 'task_complete']) {
+      const interrupted = join(temp, `${agentId}-${terminal}.jsonl`)
+      const rows = [
+        JSON.stringify({ timestamp: iso(base), type: 'session_meta', payload: { id: threadId } }),
+        withTurn(base + 1, turnA, { type: 'task_started' }),
+        evt(base + 2, { type: 'user_message', message: 'original running task' }),
+        evt(base + 3, { type: 'agent_message', message: 'partial reply' })
+      ]
+      if (terminal !== 'missing') rows.push(withTurn(base + 4, turnA, { type: terminal }))
+      await writeFile(interrupted, rows.join('\n'))
+      const { events } = await loadCodexLikeEvents(interrupted, agentId, threadId)
+      assert.equal(events.find(event => event.type === 'user_message')?.payload.text, 'original running task')
+      assert.equal(events.find(event => event.type === 'agent_message')?.payload.text, 'partial reply')
+      const completions = events.filter(event => event.type === 'turn_completed')
+      assert.equal(completions.length, 1, `${agentId}/${terminal}: close the original turn exactly once`)
+      assert.equal(completions[0].payload.turnId, turnA)
+      assert.equal(completions[0].state, terminal === 'task_complete' ? 'success' : 'cancelled',
+        `${agentId}/${terminal}: a killed running turn must not be replayed as successful`)
+      const notices = events.filter(event => event.type === 'system_notice' && event.payload.kind === 'interrupted')
+      assert.equal(notices.length, terminal === 'task_complete' ? 0 : 1,
+        `${agentId}/${terminal}: restored interruptions must remain visible`)
+    }
+    const pendingStart = join(temp, `${agentId}-pending-start.jsonl`)
+    const completedRows = [
+      withTurn(base + 1, turnA, { type: 'task_started' }),
+      evt(base + 2, { type: 'user_message', message: 'completed task' }),
+      evt(base + 3, { type: 'agent_message', message: 'finished reply' }),
+      withTurn(base + 4, turnA, { type: 'task_complete' }),
+      withTurn(base + 5, turnB, { type: 'task_started' })
+    ]
+    for (const aborted of [false, true]) {
+      await writeFile(pendingStart, [...completedRows,
+        ...(aborted ? [withTurn(base + 6, turnB, { type: 'turn_aborted' })] : [])].join('\n'))
+      const { events } = await loadCodexLikeEvents(pendingStart, agentId, threadId)
+      assert.deepEqual(events.filter(event => event.type === 'turn_completed').map(event => event.state), ['success'],
+        `${agentId}: losing a later turn before its input must not cancel the previous completed turn`)
+      assert.equal(events.some(event => event.payload.kind === 'interrupted'), false)
+    }
+  }
+
   const multi = join(temp, 'multi.jsonl')
   await writeFile(multi, [
     JSON.stringify({ timestamp: iso(base), type: 'session_meta', payload: { id: threadId, cwd: '/repo' } }),
@@ -73,6 +114,7 @@ try {
     ['user_message', 'third prompt'],
     ['turn_started', turnC],
     ['agent_message', 'reply C'],
+    ['system_notice', '本轮已中断。'],
     ['turn_completed', turnC]
   ], 'each turn must open on its user_message and close at the next boundary / EOF')
 

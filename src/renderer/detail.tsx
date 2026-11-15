@@ -1,9 +1,15 @@
-import { createRoot } from 'react-dom/client'
-import { DetailChatPopover } from './components/DetailChatPopover'
 import './styles.css'
 import './commentStyles.css'
+import { applyColorTheme } from './colorTheme'
 
-void window.uniagent.getDetailWindow().then(initial => {
-  createRoot(document.getElementById('root')!).render(<DetailChatPopover {...initial} detached
-    onClose={() => window.close()} onPromoted={() => {}} onSessionCreated={() => {}} />)
-}).catch(() => window.close())
+const refreshColorTheme = () => { void window.uniagent.getDetailWindow().then(initial => applyColorTheme(initial.theme)).catch(() => {}) }
+refreshColorTheme()
+const stopColorTheme = window.uniagent.onUniAgentManagementChanged(resource => {
+  if (resource === 'settings') refreshColorTheme()
+})
+window.addEventListener('pagehide', stopColorTheme, { once: true })
+
+// Paint the existing loading UI before evaluating the conversation renderer.
+requestAnimationFrame(() => {
+  setTimeout(() => { void import('./detailChat').catch(() => window.close()) }, 0)
+})

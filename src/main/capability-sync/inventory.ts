@@ -6,7 +6,7 @@ import type {
   CapabilityAgentId, CapabilityAgentInventory, CapabilityInventoryItem, CapabilityInventoryResult,
   CapabilityInventoryDetail, CapabilityDetailFile
 } from '../../shared/capabilitySync.ts'
-import { assertSafePathChain, discoverProvider } from './provider.ts'
+import { assertSafePathChain, discoverProvider, parseMcpBlocks, providerPaths, redactMcpConfig } from './provider.ts'
 import {
   applySkillPrecedence, discoverSkillRoot, secureManifest, secureRegularText, type SkillDiscovery
 } from './skillDiscovery.ts'
@@ -15,14 +15,23 @@ import {
   type DiscoveredPlugin, type PluginCommandRunner
 } from './plugins.ts'
 import { inspectGrokInventory, type GrokInventoryOptions } from '../grokInventory.ts'
+import { qoderConfigRoot } from '../qoderPaths.ts'
 
-type FileInventoryAgentId = 'codex' | 'traex' | 'claude'
-const AGENTS: FileInventoryAgentId[] = ['codex', 'traex', 'claude']
+type FileInventoryAgentId = 'codex' | 'traex' | 'claude' | 'qoder'
+const AGENTS: FileInventoryAgentId[] = ['codex', 'traex', 'claude', 'qoder']
+async function qoderSharesSkills(home: string): Promise<boolean> {
+  try {
+    const root = qoderConfigRoot('cn', home)
+    const settings = JSON.parse(await secureRegularText(join(root, 'settings.json'), root, 2 * 1024 * 1024))
+    return settings.skills?.loadFromAgentsDirectory === true
+  } catch { return false }
+}
 const COMMANDS = [
   ['compact', true], ['goal', true], ['review', true], ['new', true], ['diff', false],
   ['init', false], ['plan', true], ['model', true], ['status', true]
 ] as const
 const BUILTIN_TOOLS = [
+  'uniagent_automation',
   'uniagent_task',
   'uniagent_query',
   'send_to_feishu'
@@ -31,10 +40,11 @@ const BUILTIN_TOOLS = [
 const digest = (value: string): string => createHash('sha256').update(value).digest('hex')
 const itemId = (agentId: CapabilityAgentId, scope: string, kind: string, identity: string): string =>
   `${agentId}:${scope}:${kind}:${digest(identity).slice(0, 24)}`
-export const managedInventoryId = (agentId: 'codex' | 'traex', canonicalId: string): string =>
+export const managedInventoryId = (agentId: 'codex' | 'traex' | 'qoder', canonicalId: string): string =>
   itemId(agentId, 'agent', 'managed', canonicalId)
 
 function roots(agentId: FileInventoryAgentId, home: string): { root: string; skills: string } {
+  if (agentId === 'qoder') { const root = qoderConfigRoot('cn', home); return { root, skills: join(root, 'skills') } }
   if (agentId === 'codex') return { root: join(home, '.codex'), skills: join(home, '.codex/skills') }
   if (agentId === 'traex') return { root: join(home, '.trae'), skills: join(home, '.trae/skills') }
   return { root: join(home, '.claude'), skills: join(home, '.claude/skills') }
@@ -64,6 +74,8 @@ function pluginItem(plugin: DiscoveredPlugin): InventorySkill {
     manageable: (plugin.agentId !== 'claude' || plugin.scope === 'user') && plugin.issueCode !== 'plugin_enumeration_failed', copyable: false,
     location: plugin.installedDir,
     manifestPath: plugin.manifestPath, enabled: plugin.enabled,
+    ...(plugin.agentId === 'codex' ? { stateManageable: !plugin.remote && plugin.status === 'available',
+      ...(plugin.remote ? { stateReadOnlyReason: '此远程插件的启用与停用需在 Codex 插件页中管理。' } : {}) } : {}),
     status: plugin.status, issueCode: plugin.issueCode, pluginId: plugin.pluginId, marketplace: plugin.marketplace,
     version: plugin.version, cachedVersions: plugin.cachedVersions, components: plugin.components,
     migratableTo: plugin.migratableTo || []
@@ -131,6 +143,7 @@ export async function skillLinkDependencies(home: string, availableAgents: reado
     } catch { /* stale or unsafe links are not dependencies */ }
   }
   for (const [agentId, root] of [
+    ['qoder', roots('qoder', home).skills],
     ['codex', join(home, '.codex/skills')],
     ['traex', join(home, '.trae/skills')],
     ['traex', join(home, '.trae/cli/skills')],
@@ -156,6 +169,7 @@ export async function listCapabilityInventories(
   availableAgents: readonly string[] = AGENTS
 ): Promise<CapabilityInventoryResult> {
   const agents = AGENTS.filter(id => availableAgents.includes(id))
+  const qoderShared = await qoderSharesSkills(home)
   const sharedRoot = join(home, '.agents/skills')
   const sharedDiscoveries = await discoverSkillRoot(home, sharedRoot, 'shared')
   const dependencyIndex = await skillLinkDependencies(home, availableAgents)
@@ -163,7 +177,7 @@ export async function listCapabilityInventories(
   for (const item of sharedDiscoveries) if (item.manifest && !item.linked) {
     try {
       const links = dependencyIndex.get(await realpath(dirname(item.manifest))) || []
-      dependentAgents.set(item.identity, agents.filter((agentId) => agentId !== 'claude' || links.some((link) => link.agentId === agentId)))
+      dependentAgents.set(item.identity, agents.filter((agentId) => agentId !== 'claude' && (agentId !== 'qoder' || qoderShared) || links.some((link) => link.agentId === agentId)))
     } catch { /* invalid shared items stay read-only */ }
   }
   const inventories: CapabilityAgentInventory[] = []
@@ -171,7 +185,7 @@ export async function listCapabilityInventories(
   for (const agentId of agents) {
     const paths = roots(agentId, home)
     const available = existsSync(paths.root)
-    const visibleSharedDiscoveries = agentId === 'claude' ? [] : sharedDiscoveries
+    const visibleSharedDiscoveries = agentId === 'claude' || agentId === 'qoder' && !qoderShared ? [] : sharedDiscoveries
     let items: InventorySkill[] = []
     let status: CapabilityAgentInventory['status'] = available ? 'available' : 'unsupported'
     let issueCode: CapabilityAgentInventory['issueCode']
@@ -216,7 +230,7 @@ export async function listCapabilityInventories(
       items.push(...system.map(value => ({ ...discoveryItem(agentId, value), scope: 'builtin' as const,
         owner: 'system' as const, manageable: false, removal: undefined, readOnlyReason: 'Codex 内置技能，由 Agent 安装和更新维护。' })))
     }
-    items = [...items, ...(plugins.get(agentId) || []).map(pluginItem), ...builtinItems(agentId)]
+    items = [...items, ...(agentId === 'qoder' ? [] : plugins.get(agentId) || []).map(pluginItem), ...builtinItems(agentId)]
     const identityParts = items.map(revisionIdentity).sort()
     inventories.push({ agentId, available, writable: layoutWritable || items.some(item => item.manageable), status,
       ...(issueCode ? { issueCode } : {}), revision: digest([...revisionParts, ...identityParts].sort().join('\0')), items })
@@ -230,13 +244,14 @@ async function skillFolderIndex(home: string, availableAgents: readonly string[]
   const index = new Map<string, { folder: string; manifest: string; kind: 'skill' | 'plugin'; name: string }>()
   const agents = AGENTS.filter(id => availableAgents.includes(id))
   const sharedRoot = join(home, '.agents/skills')
+  const qoderShared = await qoderSharesSkills(home)
   const record = (agentId: CapabilityAgentId, item: SkillDiscovery): void => {
     if (!item.manifest) return
     index.set(itemId(agentId, item.scope, 'skill', item.identity), { folder: dirname(item.manifest), manifest: item.manifest, kind: 'skill', name: item.name })
   }
   for (const agentId of agents) {
     const paths = roots(agentId, home)
-    const sharedDiscoveries = agentId === 'claude' ? [] : await discoverSkillRoot(home, sharedRoot, 'shared')
+    const sharedDiscoveries = agentId === 'claude' || agentId === 'qoder' && !qoderShared ? [] : await discoverSkillRoot(home, sharedRoot, 'shared')
     for (const item of sharedDiscoveries) record(agentId, item)
     if (agentId === 'claude') {
       for (const item of await discoverSkillRoot(home, paths.skills, 'agent')) record(agentId, item)
@@ -247,8 +262,8 @@ async function skillFolderIndex(home: string, availableAgents: readonly string[]
         index.set(managedInventoryId(agentId, entry.id), { folder: entry.privateRef, manifest: join(entry.privateRef, 'SKILL.md'), kind: 'skill', name: entry.name })
       }
     }
-    for (const plugin of await discoverInstalledPlugins(agentId, home)) {
-      if (plugin.installedDir && plugin.manifestPath) index.set(capabilityPluginInventoryId(agentId, plugin.pluginId), {
+    for (const plugin of agentId === 'qoder' ? [] : await discoverInstalledPlugins(agentId, home)) {
+      if (plugin.installedDir && plugin.manifestPath) index.set(capabilityPluginInventoryId(plugin.agentId, plugin.pluginId), {
         folder: plugin.installedDir, manifest: plugin.manifestPath, kind: 'plugin', name: plugin.displayName || plugin.name
       })
     }
@@ -258,8 +273,34 @@ async function skillFolderIndex(home: string, availableAgents: readonly string[]
 
 const MAX_DETAIL_FILES = 200
 
-/** Full detail for one opaque inventory id: SKILL.md text + shallow file listing. */
+/** Resolve one opaque id to redacted MCP configuration or Skill/Plugin files. */
 export async function getCapabilityInventoryDetail(home: string, id: string, availableAgents: readonly string[] = AGENTS): Promise<CapabilityInventoryDetail> {
+  const agentId = AGENTS.find(agent => availableAgents.includes(agent) && id.startsWith(agent + ':'))
+  if (agentId) {
+    const builtin = builtinItems(agentId).find(item => item.kind === 'mcp' && item.id === id)
+    if (builtin) return { id, name: builtin.name, kind: 'mcp', openable: false, manifestFile: '内置 MCP',
+      manifestText: JSON.stringify({ name: builtin.name, source: 'UniAgent', description: 'UniAgent 提供的任务协作与消息工具，由应用维护。', tools: BUILTIN_TOOLS }, null, 2) }
+    if (agentId === 'claude' && id.startsWith('claude:agent:mcp:')) {
+      const path = join(home, '.claude.json')
+      if (existsSync(path)) {
+        const document = JSON.parse(await secureRegularText(path, home, 2 * 1024 * 1024))
+        for (const [name, value] of Object.entries(document.mcpServers || {})) if (itemId('claude', 'agent', 'mcp', `claude:mcp:${name}`) === id) {
+          return { id, name, kind: 'mcp', openable: false, sourcePath: path, manifestFile: basename(path),
+            manifestText: JSON.stringify(redactMcpConfig(value as Record<string, unknown>), null, 2) }
+        }
+      }
+    } else if (agentId !== 'claude' && id.startsWith(`${agentId}:agent:managed:`)) {
+      const discovered = await discoverProvider(agentId, home)
+      const entry = discovered.items.find(item => item.kind === 'mcp' && managedInventoryId(agentId, item.id) === id)
+      if (entry?.privateKey) {
+        const path = providerPaths(agentId, home).config
+        const block = parseMcpBlocks(await secureRegularText(path, home, 2 * 1024 * 1024)).find(block => block.privateKey === entry.privateKey)
+        if (!block) throw new Error('invalid_selection')
+        return { id, name: entry.name, kind: 'mcp', openable: false, sourcePath: path, manifestFile: basename(path),
+          manifestText: JSON.stringify(redactMcpConfig(block.value), null, 2) }
+      }
+    }
+  }
   const target = (await skillFolderIndex(home, availableAgents)).get(id)
   if (!target) return { id, name: '', kind: 'skill', openable: false }
   let manifestText: string | undefined

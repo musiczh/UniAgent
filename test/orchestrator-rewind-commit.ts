@@ -104,7 +104,7 @@ async function persistFailureIsAtomic(): Promise<void> {
     await seedTurn(fx.orchestrator, fx.work, 't2', 'second turn', fileDiff('a.ts', 'v1', 'v2'))
 
     // Install a live streamer stub so we can prove ownership survives a failure.
-    const oldStreamer = { forkBeforeTurn: async () => 'fork-thread', removeAllListeners() {}, dispose() {}, interrupt() {} }
+    const oldStreamer = { forkBeforeTurn: async () => 'fork-thread', setInitialTitleGenerationPolicy() {}, removeAllListeners() {}, dispose() {}, interrupt() {} }
     ;(fx.orchestrator as any).streamers.set('s1', oldStreamer)
     // Fork returns a new thread; forked history loads fine.
     ;(fx.orchestrator as any).loadForkedEvents = async () => ({ events: [
@@ -154,6 +154,7 @@ async function committedDurabilityUncertainCompletesSwitch(): Promise<void> {
     let disposed = 0
     const oldStreamer = {
       forkBeforeTurn: async () => 'fork-thread',
+      setInitialTitleGenerationPolicy() {},
       removeAllListeners: () => { removedListeners += 1 },
       dispose: () => { disposed += 1 },
       interrupt() {}
@@ -227,7 +228,7 @@ async function emptyArtifactIsRewindNode(): Promise<void> {
     assert.deepEqual(preview.removeTurnIds, ['t1', 't2'])
 
     // Apply to t2 (the empty-node predecessor kept): only b.ts removed.
-    ;(fx.orchestrator as any).streamers.set('s1', { forkBeforeTurn: async () => 'fork-thread', removeAllListeners() {}, dispose() {}, interrupt() {} })
+    ;(fx.orchestrator as any).streamers.set('s1', { forkBeforeTurn: async () => 'fork-thread', setInitialTitleGenerationPolicy() {}, removeAllListeners() {}, dispose() {}, interrupt() {} })
     ;(fx.orchestrator as any).loadForkedEvents = async () => ({ events: [] })
     const res = await fx.orchestrator.rewindSession('s1', 't2')
     assert.equal(res.ok, true, (res as any).error)

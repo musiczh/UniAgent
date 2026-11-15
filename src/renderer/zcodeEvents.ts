@@ -6,6 +6,15 @@ export function mergeZCodeEvent(events: UAEvent[], event: UAEvent, cursor?: ZCod
   if (event.payload.zcodeProjection && cursor &&
     (event.payload.projectionGeneration < cursor.generation ||
       event.payload.projectionGeneration === cursor.generation && event.seq <= cursor.upToEventSeq)) return events
+  if (event.type === 'user_message' && event.payload.clientTurnKey) {
+    const index = events.findIndex(item => item.type === event.type && item.payload.clientTurnKey === event.payload.clientTurnKey)
+    if (index >= 0) {
+      if (event.payload.optimistic && !events[index].payload.optimistic) return events
+      const next = [...events]
+      next[index] = { ...event, payload: { ...events[index].payload, ...event.payload, optimistic: event.payload.optimistic === true } }
+      return next
+    }
+  }
   const id = event.payload.id ?? event.payload.requestId
   const index = events.findIndex(item => item.type === event.type &&
     (id ? (item.payload.id ?? item.payload.requestId) === id : item.seq === event.seq))
@@ -19,7 +28,7 @@ export function mergeZCodeEvent(events: UAEvent[], event: UAEvent, cursor?: ZCod
       ? { ...event, payload: { ...next[index].payload, ...event.payload } } : event
     return next
   }
-  if (event.type === 'user_message' && !event.payload.optimistic) {
+  if (event.type === 'user_message' && !event.payload.optimistic && !event.payload.clientTurnKey) {
     const optimistic = events.findIndex(item => item.type === 'user_message' && item.payload.optimistic &&
       item.payload.text === event.payload.text && event.ts >= item.ts)
     if (optimistic >= 0) {

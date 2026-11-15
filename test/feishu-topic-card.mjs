@@ -95,4 +95,12 @@ assert.equal(stripMentions('@_user_1  跑一下测试'), '跑一下测试', 'str
 assert.equal(stripMentions('@_all @_user_2 hi'), 'hi', 'strip @_all + user mentions')
 assert.equal(stripMentions('  普通消息  '), '普通消息', 'plain text is just trimmed')
 
+const autoCard = topicConfigCard('routing', { ...sel, assignment: 'auto' }, [codex], ['/w'], [], [], { enabled: true, available: true })
+const autoFields = autoCard.body.elements.filter(e => e.name).map(e => e.name)
+assert.ok(autoFields.includes('assignment') && autoFields.includes('model') && autoFields.includes('effort'))
+assert.ok(!autoFields.includes('projectId') && !autoFields.includes('requirementId'), 'automatic routing has no implicit space constraint')
+const unavailable = topicConfigCard('unavailable', sel, [codex], ['/w'], [], [], { enabled: false, available: true })
+assert.deepEqual(unavailable.body.elements.find(e => e.name === 'assignment').options.map(e => e.value), ['manual'])
+assert.ok(JSON.stringify(unavailable).includes('尚未启用'))
+
 console.log('feishu-topic-card: ok')

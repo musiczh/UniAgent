@@ -151,7 +151,7 @@ export class KimiWebRuntime {
       }
       runtime.lease.trackSession(runtime.nativeSessionId)
       const status = await runtime.status() // Cold native sessions are loaded through the official service.
-      if (options.nativeSessionId) await runtime.transport.request('POST', runtime.path('runtime'), { runtime_id: 'local' })
+      if (options.nativeSessionId && !runtime.transport.transcriptProtocol) await runtime.transport.request('POST', runtime.path('runtime'), { runtime_id: 'local' })
       if (!status.busy) await runtime.setProfile(profileFromConfig(options.config))
       return runtime
     } catch (error) {
@@ -163,6 +163,7 @@ export class KimiWebRuntime {
 
   private path(resource: string): string { return `/api/v1/sessions/${encodeURIComponent(this.nativeSessionId)}/${resource}` }
   private api(): KimiWebTransport { if (this.closed || !this.transport) throw new KimiWebError('runtime_closed'); return this.transport }
+  get usesTurnsProtocol(): boolean { return this.api().turnsProtocol }
   private serialize<T>(operation: () => Promise<T>): Promise<T> {
     const task = this.operations.then(operation)
     this.operations = task.then(() => {}, () => {})
@@ -189,7 +190,7 @@ export class KimiWebRuntime {
     return { ...snapshot, messages: { items, has_more: more } }
   }
   models(): Promise<{ items: Array<{ model: string; capabilities?: string[]; max_context_size?: number }> }> { return this.api().request('GET', '/api/v1/models') }
-  tasks(): Promise<{ items: any[] }> { return this.api().request('GET', this.path('tasks')) }
+  tasks(): Promise<{ items: any[] }> { return this.api().transcriptProtocol ? this.api().tasks(this.nativeSessionId) : this.api().request('GET', this.path('tasks')) }
   async listSubagentTasks(): Promise<any[]> {
     const { items } = await this.tasks()
     const rows = items.filter(row => row?.session_id === this.nativeSessionId && row.kind === 'subagent' && typeof row.id === 'string' && typeof row.agent_id === 'string')
@@ -200,12 +201,18 @@ export class KimiWebRuntime {
     const rows = (await this.listSubagentTasks()).filter(row => row.agent_id === agentId)
     if (rows.length !== 1) throw new KimiWebError('subagent_not_owned')
     const owner = rows[0]
-    const task = await this.api().request<any>('GET', this.path(`tasks/${encodeURIComponent(owner.id)}?with_output=true&output_bytes=32768`))
+    const task = this.api().transcriptProtocol ? await this.api().subagentTask(this.nativeSessionId, owner)
+      : await this.api().request<any>('GET', this.path(`tasks/${encodeURIComponent(owner.id)}?with_output=true&output_bytes=32768`))
     if (task.id !== owner.id || task.session_id !== this.nativeSessionId || task.kind !== 'subagent' || task.agent_id !== agentId || !this.subagentTasks.has(task.id)) throw new KimiWebError('subagent_identity_invalid')
     return task
   }
   async cancelSubagentTask(agentId: string): Promise<void> {
     const task = await this.getSubagentTask(agentId)
+    if (this.api().transcriptProtocol) {
+      const result = await this.api().subagentTask(this.nativeSessionId, task, true)
+      if (result.status !== 'cancelled') throw new KimiWebError('subagent_cancel_unconfirmed')
+      return
+    }
     const result = await this.api().request<any>('POST', this.path(`tasks/${encodeURIComponent(task.id)}:cancel`))
     if (result.cancelled !== true) throw new KimiWebError('subagent_cancel_unconfirmed')
   }
@@ -215,6 +222,8 @@ export class KimiWebRuntime {
     if (tasks.length) await this.getSubagentTask(agentId)
     else if (trusted?.parentNativeSessionId !== this.nativeSessionId || !/^[A-Za-z0-9._-]{1,128}$/.test(trusted?.nativeTaskId || '')) throw new KimiWebError('subagent_not_owned')
     const transcript = await readKimiTranscript(this.api(), this.nativeSessionId, agentId)
+    const child = transcript.agents?.find(row => row.agentId === agentId)
+    if (child?.type === 'independent' || child?.parentAgentId && child.parentAgentId !== 'main') throw new KimiWebError('subagent_not_owned')
     return kimiWebTranscriptEvents(transcript.items)
   }
   prompts(): Promise<{ active: KimiWebPrompt | null; queued: KimiWebPrompt[] }> { return this.api().request('GET', this.path('prompts')) }
@@ -250,12 +259,18 @@ export class KimiWebRuntime {
     if (Object.keys(profile).some((key) => !allowed.includes(key))) return Promise.reject(new KimiWebError('profile_fields_unsupported'))
     return this.serialize(async () => {
       const result = await this.api().request('POST', this.path('profile'), { agent_config: profile })
-      const status = await this.status()
-      if (profile.model !== undefined && status.model !== profile.model ||
+      const matches = (status: any) => !(profile.model !== undefined && status.model !== profile.model ||
           profile.thinking !== undefined && status.thinking_level !== profile.thinking ||
           profile.permission_mode !== undefined && status.permission !== profile.permission_mode ||
           profile.plan_mode !== undefined && status.plan_mode !== profile.plan_mode ||
-          profile.swarm_mode !== undefined && status.swarm_mode !== profile.swarm_mode) throw new KimiWebError('profile_not_applied')
+          profile.swarm_mode !== undefined && status.swarm_mode !== profile.swarm_mode)
+      let status = await this.status()
+      const deadline = Date.now() + this.api().timeoutMs
+      while (this.usesTurnsProtocol && !matches(status) && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 25))
+        status = await this.status()
+      }
+      if (!matches(status)) throw new KimiWebError('profile_not_applied')
       return result
     })
   }

@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { join, resolve } from 'node:path'
 import { build } from 'esbuild'
+import { rendererRuntimePlugin } from './regression/render-event-stream.mjs'
 
 // Isolated renderer unit tests: no installed App, real accounts or Agent turns.
 const root = process.cwd()
@@ -18,7 +19,7 @@ try {
     format: 'iife', globalName: 'MarkdownEditorTests', outfile: join(directory, 'renderer.js'),
     plugins: [{ name: 'fixture-no-startup', setup(builder) {
       builder.onLoad({ filter: /\/src\/renderer\/startup\.ts$/ }, () => ({ contents: 'export function updateStartup() {} export function enterStartup() {}', loader: 'js' }))
-    } }]
+    } }, rendererRuntimePlugin(directory)]
   })
   await writeFile(join(directory, 'index.html'), '<meta charset="utf-8"><link rel="stylesheet" href="renderer.css"><style>html,body{overflow:auto;height:auto;padding:0}</style><script src="renderer.js"></script>')
   await writeFile(join(directory, 'main.cjs'), `

@@ -1,4 +1,4 @@
-export type CapabilityProviderId = 'codex' | 'traex'
+export type CapabilityProviderId = 'codex' | 'traex' | 'qoder'
 export type CapabilityAgentId = CapabilityProviderId | 'claude' | 'grok' | 'kimi' | 'deepseek' | 'mcode' | 'nika' | 'zcode'
 export type CapabilityInventoryKind = CapabilityKind | 'plugin' | 'command' | 'tool' | 'hook' | 'agent-profile'
 export type CapabilityScope = 'agent' | 'shared' | 'plugin' | 'builtin'
@@ -169,6 +169,7 @@ export interface CapabilityInventoryItem {
   kind: CapabilityInventoryKind
   name: string
   scope: CapabilityScope
+  description?: string
   origin: string
   owner: CapabilityOwner
   fingerprint: string
@@ -192,6 +193,8 @@ export interface CapabilityInventoryItem {
   plugin?: string
   version?: string
   enabled?: boolean
+  stateManageable?: boolean
+  stateReadOnlyReason?: string
   pluginId?: string
   marketplace?: string
   cachedVersions?: number
@@ -239,7 +242,24 @@ export interface CapabilityAgentInventory {
 export interface CapabilityInventoryResult { inventories: CapabilityAgentInventory[]; scannedAt: number }
 
 /** Request full detail for one opaque inventory item id. */
-export interface CapabilityInventoryDetailRequest { id: string }
+export interface CapabilityInventoryDetailRequest { id: string; loadMcpTools?: boolean }
+
+export interface CapabilityMcpTool {
+  name: string
+  title?: string
+  description?: string
+  parameters: { name: string; type: string; description?: string; required: boolean }[]
+}
+
+export interface CapabilityMcpCatalog {
+  status: 'loaded' | 'failed' | 'not-found'
+  serverName?: string
+  version?: string
+  description?: string
+  connectionStatus?: 'notStarted' | 'starting' | 'connected' | 'authenticationRequired' | 'failed' | 'cancelled' | 'disabled'
+  authStatus?: 'unsupported' | 'notLoggedIn' | 'bearerToken' | 'oAuth'
+  tools: CapabilityMcpTool[]
+}
 
 /** A single file inside a Skill folder, described without leaking its absolute path. */
 export interface CapabilityDetailFile {
@@ -262,16 +282,26 @@ export interface CapabilityInventoryDetail {
   id: string
   name: string
   kind: CapabilityInventoryKind
-  /** SKILL.md (or manifest) text when available. */
+  /** Skill/Plugin manifest text or the selected MCP's redacted configuration. */
   manifestText?: string
   /** File name of the manifest relative to the folder, e.g. SKILL.md. */
   manifestFile?: string
+  /** Configuration file supplying this item; display only, never a mutation input. */
+  sourcePath?: string
   /** Shallow listing of the Skill folder, when this capability is a folder. */
   files?: CapabilityDetailFile[]
   /** Absolute Skill folder path, present only when a folder can be browsed. */
   folderPath?: string
   /** Whether the renderer may open folderPath in the in-app file browser. */
   openable: boolean
+  mcp?: { catalogSupported: boolean; catalog?: CapabilityMcpCatalog }
+  plugin?: {
+    description?: string
+    shortDescription?: string
+    author?: string
+    logoDataUrl?: string
+    skills: CapabilityInventoryItem[]
+  }
 }
 
 /** Prepare a normal sync scan from opaque capability-center inventory ids. */
@@ -347,8 +377,8 @@ export interface CapabilityMarkdownPreview {
   byteCount: number
 }
 
-const providers = new Set(['codex', 'traex'])
-const agents = new Set<CapabilityAgentId>(['codex', 'traex', 'claude'])
+const providers = new Set(['codex', 'traex', 'qoder'])
+const agents = new Set<CapabilityAgentId>(['codex', 'traex', 'claude', 'qoder'])
 const modes = new Set(['merge', 'clone-supported-scope', 'remove-selected'])
 const capabilityKinds = new Set<CapabilityKind>(['skill', 'mcp', 'memory', 'global-instructions', 'global-preference'])
 const resolutions = new Set(['target', 'source', 'merge', 'skip'])
@@ -390,6 +420,12 @@ export function parseCapabilityInventorySyncRequest(v: unknown): CapabilityInven
     target: v.target as CapabilityProviderId,
     selections: [...v.selections] as string[]
   }
+}
+
+export function parseCapabilityInventoryDetailRequest(v: unknown): CapabilityInventoryDetailRequest {
+  if (!record(v) || !exactKeys(v, ['id'], ['loadMcpTools']) || !bounded(v.id, 512) ||
+      v.loadMcpTools !== undefined && typeof v.loadMcpTools !== 'boolean') throw new Error('invalid_selection')
+  return { id: v.id, ...(v.loadMcpTools !== undefined ? { loadMcpTools: v.loadMcpTools as boolean } : {}) }
 }
 
 export function parseCapabilityPluginActionRequest(v: unknown): CapabilityPluginActionRequest {
@@ -499,6 +535,8 @@ export type BetaCapabilityGrokMcpConfiguration = Pick<BetaCapabilityMcpConfigura
 
 /** Main supplies filesystem roots and binaries; existing items require their current fingerprint. */
 export type BetaCapabilityManageRequest =
+  | { agentId: 'qoder'; action: 'plugin-install'; source: string; expectedRevision?: string }
+  | { agentId: 'qoder'; action: 'plugin-enable' | 'plugin-disable' | 'plugin-uninstall'; id: string; expectedFingerprint: string }
   | { agentId: 'kimi'; action: 'skill-create'; name: string; manifestText: string }
   | { agentId: 'kimi'; action: 'skill-update'; id: string; expectedFingerprint: string; manifestText: string }
   | { agentId: 'kimi'; action: 'skill-delete' | 'mcp-delete'; id: string; expectedFingerprint: string }
@@ -529,6 +567,7 @@ export type DeepSeekCapabilityManageRequest =
 export type DeepSeekCapabilityManageResult = CapabilityAgentInventory
 
 export type CapabilityInventoryManageRequest = BetaCapabilityManageRequest | DeepSeekCapabilityManageRequest
+  | { agentId: 'codex'; action: 'plugin-enable' | 'plugin-disable'; id: string; expectedFingerprint: string }
   | { agentId: 'mcode'; action: 'plugin-uninstall'; id: string; expectedFingerprint: string }
   | { agentId: 'kimi'; action: 'plugin-uninstall'; id: string; expectedFingerprint: string }
   | { agentId: 'zcode'; action: 'plugin-uninstall'; id: string; expectedFingerprint: string }

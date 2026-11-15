@@ -147,6 +147,7 @@ export class CodexSourceService extends EventEmitter {
   private readonly quotas = new Map<CodexSourceId, CachedQuota>()
   private runtimeIssues: CodexSourceRuntimeIssue[] = []
   private activeRouterConfig?: RouterConfig
+  private connectionRevision = 0
 
   constructor() {
     super()
@@ -259,11 +260,13 @@ export class CodexSourceService extends EventEmitter {
       if (typeof enabled !== 'boolean') throw new Error('无效的启用状态')
       if (enabled) await this.apply({ ...this.state, enabled: true })
       else {
+        const affected = this.state.enabled ? this.state.sources.filter(source => source.enabled).map(source => source.id) : []
         this.state = { ...this.state, enabled: false }
         this.persist()
         await this.stopChild()
         this.phase = 'stopped'
         this.activeRouterConfig = undefined
+        this.connectionChanged(affected)
       }
     })
   }
@@ -271,6 +274,7 @@ export class CodexSourceService extends EventEmitter {
     return this.run(async () => {
       if (!this.state.enabled) throw new Error('请先配置并启用来源')
       await this.apply(this.state)
+      this.connectionChanged(this.state.sources.filter(source => source.enabled).map(source => source.id))
     })
   }
   migrate(): Promise<CodexSourcesSnapshot> {
@@ -385,6 +389,10 @@ export class CodexSourceService extends EventEmitter {
     catch (error) { this.state = previous; throw error }
   }
   private emitStatus(): void { this.emit('changed', this.snapshot()) }
+
+  private connectionChanged(sourceIds: string[]): void {
+    if (sourceIds.length) this.emit('connectionChanged', { revision: ++this.connectionRevision, sourceIds })
+  }
   private quotaSignature(source: StoredSource): string { return `${source.preset}\0${source.baseUrl}\0${source.encryptedKey}` }
   private resolvePath(path: unknown): string {
     if (typeof path !== 'string' || !path) return join(this.codexHome, 'models_cache.json')
@@ -440,6 +448,13 @@ export class CodexSourceService extends EventEmitter {
       this.persist()
       this.activeRouterConfig = config
       this.phase = 'running'
+      const ids = new Set([...previous.sources, ...next.sources].map(source => source.id))
+      this.connectionChanged([...ids].filter(id => {
+        const before = previous.sources.find(source => source.id === id)
+        const after = next.sources.find(source => source.id === id)
+        // Includes encrypted credential replacement without exposing credentials in events.
+        return previous.enabled !== next.enabled || JSON.stringify(before) !== JSON.stringify(after)
+      }))
     } catch (error) {
       await this.stopChild()
       this.state = previous

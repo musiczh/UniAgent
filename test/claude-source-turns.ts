@@ -13,12 +13,12 @@ import type { AgentDef, Session, SessionConfig, UAEvent } from '../src/shared/ty
 
 const directory = await mkdtemp(join(tmpdir(), 'ua-claude-source-turn-'))
 process.env.UNIAGENT_USER_DATA = directory
-const connection: ClaudeConnection = { preset: 'kimi-code', apiKey: 'fixture-turn-key', baseUrl: 'https://api.kimi.com/coding', model: 'k3' }
+let connection: ClaudeConnection = { preset: 'kimi-code', apiKey: 'fixture-turn-key', baseUrl: 'https://api.kimi.com/coding', model: 'k3' }
 configureClaudeSourceRuntime(async () => connection)
 const bin = join(directory, 'cli.cjs')
 await writeFile(bin, `#!${process.execPath}
 const fs=require('node:fs');const args=process.argv.slice(2);const file=args[args.indexOf('--settings')+1];
-const settings=JSON.parse(fs.readFileSync(file,'utf8'));fs.writeFileSync('capture.json',JSON.stringify({args,settings,env:process.env.ANTHROPIC_API_KEY}));
+const settings=JSON.parse(fs.readFileSync(file,'utf8'));fs.writeFileSync('capture.json',JSON.stringify({args,settings,env:process.env.ANTHROPIC_API_KEY,auth:process.env.ANTHROPIC_AUTH_TOKEN}));
 const send=value=>process.stdout.write(JSON.stringify(value)+'\\n');
 require('node:readline').createInterface({input:process.stdin}).on('line',line=>{
  const input=JSON.parse(line);if(input.type==='control_request'){send({type:'control_response',response:{subtype:'success',request_id:input.request_id,response:{commands:[],models:[]}}});return}if(input.type!=='user')return;
@@ -59,6 +59,21 @@ try {
     assert.equal(capture.env, connection.apiKey)
     await runner.disposeClaudeSdk(); await emptyRuntimes()
   }
+  const previousConnection = connection
+  connection = { preset: 'ferry', apiKey: 'ferry', baseUrl: 'http://127.0.0.1:18790', model: 'claude-gpt-6-1-sol', efforts: ['low', 'high'], defaultEffort: 'high' }
+  const ferryConfig: SessionConfig = { ...config, model: codexModelKey(connection.model, { kind: 'third-party', sourceId: 'ferry' }), effort: 'high' }
+  const ferryRunner = new TurnRunner('ferry', { n: 0 })
+  try {
+    const done = once(ferryRunner, 'done')
+    ferryRunner.start(agent, ferryConfig, 'success')
+    assert.equal((await done)[0].failed, false)
+    const capture = JSON.parse(await readFile(join(directory, 'capture.json'), 'utf8'))
+    assert.ok(capture.args.includes('--model=claude-gpt-6-1-sol') || capture.args[capture.args.indexOf('--model') + 1] === 'claude-gpt-6-1-sol')
+    assert.equal(capture.settings.env.ANTHROPIC_BASE_URL, connection.baseUrl)
+    assert.equal(capture.env, '')
+    assert.equal(capture.auth, 'ferry')
+    assert.equal(capture.settings.enableArtifact, false)
+  } finally { await ferryRunner.disposeClaudeSdk(); connection = previousConnection; await emptyRuntimes() }
   const missing = new TurnRunner('missing', { n: 0 })
   let count = 0; missing.on('done', () => count++)
   const missingDone = once(missing, 'done'); missing.start({ ...agent, bin: join(directory, 'missing') }, config, 'success')
@@ -99,13 +114,14 @@ try {
     id: codexModelKey(model, { kind: 'third-party', sourceId }), label: model, ...claudeSourceEffort(model, sourceId === 'kimi' ? 'kimi-code' : 'deepseek')
   }))
   agent.models.push({ id: 'sonnet', label: 'Sonnet', efforts: ['low', 'medium', 'high'] })
+  agent.models.push({ id: ferryConfig.model!, label: 'Ferry GPT-6.1-Sol', efforts: ['low', 'high'], defaultEffort: 'high', modelSource: { kind: 'third-party', sourceId: 'ferry' } })
   const orchestrator = new Orchestrator(() => agent, new SessionStore(join(directory, 'sessions.json')), join(directory, 'artifacts'))
   const session: Session = { id: 'source', title: 'Source', status: 'idle', createdAt: 1, nativeSessionId: 'native', config }
   ;(orchestrator as any).sessions.set(session.id, session)
   ;(orchestrator as any).seqRefs.set(session.id, { n: 0 }); (orchestrator as any).events.set(session.id, [])
   try {
     const deepseek = { ...config, model: codexModelKey('deepseek-flash', { kind: 'third-party', sourceId: 'deepseek' }) }
-    for (const [previous, target] of [[config, deepseek], [deepseek, config]]) {
+    for (const [previous, target] of [[config, deepseek], [deepseek, config], [config, ferryConfig], [ferryConfig, deepseek]]) {
       session.config = { ...previous }
       for (const status of ['idle', 'running', 'queued', 'cancelling', 'awaiting-approval', 'error'] as const) {
         session.config = { ...previous }

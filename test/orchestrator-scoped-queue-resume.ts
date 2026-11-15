@@ -257,6 +257,49 @@ async function appServerThreadIdPersistsBeforeTurnCompletes(): Promise<void> {
   }
 }
 
+async function oneShotThreadIdPersistsBeforeTurnCompletes(): Promise<void> {
+  const { TurnRunner } = await import('../src/main/adapter')
+  const start = TurnRunner.prototype.start
+  TurnRunner.prototype.start = () => {}
+  try {
+    for (const adapter of ['codex', 'traex', 'claude'] as const) {
+      const session = queuedSession(`one-shot-${adapter}`, adapter)
+      session.pendingQueue = []
+      const { orchestrator, storePath } = await fixture([session])
+      const liveSession = orchestrator.getSessionById(session.id)!
+      try {
+        ;(orchestrator as any).setStatus(liveSession, 'running')
+        ;(orchestrator as any).runOneShot(liveSession, { ...agent(adapter), adapter }, 'first prompt')
+        const runner = (orchestrator as any).runners.get(session.id)
+        const nativeId = `native-${adapter}-before-done`
+        runner.emit('event', { sessionId: session.id, seq: 0, ts: Date.now(), type: 'turn_started', payload: {} })
+        assert.equal(new SessionStore(storePath).load()[0]?.nativeSessionId, undefined,
+          `${adapter}: a turn announcement without an identity must not invent a resume target`)
+        runner.onLine(adapter, JSON.stringify(adapter === 'claude'
+          ? { type: 'system', subtype: 'init', session_id: nativeId }
+          : { type: 'thread.started', thread_id: nativeId }))
+        assert.equal(new SessionStore(storePath).load()[0]?.nativeSessionId, nativeId,
+          `${adapter}: a running one-shot turn must save its native identity without waiting for done`)
+        runner.emit('event', { sessionId: session.id, seq: 2, ts: Date.now(), type: 'turn_started', payload: { threadId: '  ' } })
+        assert.equal(new SessionStore(storePath).load()[0]?.nativeSessionId, nativeId,
+          `${adapter}: an empty identity must not overwrite the saved thread`)
+
+        const restored = new Orchestrator((id) => agent(id), new SessionStore(storePath))
+        await restored.loadPersisted()
+        assert.equal(restored.getSessionById(session.id)?.nativeSessionId, nativeId,
+          `${adapter}: a new host must retain the original thread after losing the running process`)
+        await restored.closeSessionLogs()
+      } finally {
+        orchestrator.disposeSession(session.id)
+        await orchestrator.closeSessionLogs()
+        await rm(storePath, { force: true })
+      }
+    }
+  } finally {
+    TurnRunner.prototype.start = start
+  }
+}
+
 async function missingNativeThreadDoesNotReplay(): Promise<void> {
   const session = queuedSession('missing-native', 'streaming-agent')
   const { orchestrator, storePath } = await fixture([session])
@@ -314,6 +357,7 @@ async function forkPathRunnerForwardsSkillsChangedExactlyOnceWhenReused(): Promi
 await scopedSelectionAndCompatibility()
 await lateEligibilityRechecks()
 await appServerThreadIdPersistsBeforeTurnCompletes()
+await oneShotThreadIdPersistsBeforeTurnCompletes()
 await missingNativeThreadDoesNotReplay()
 await forkPathRunnerForwardsSkillsChangedExactlyOnceWhenReused()
 console.log('orchestrator-scoped-queue-resume: ok')

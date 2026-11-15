@@ -22,8 +22,8 @@ export function CliAgentSettings({ agent, onRedetect, installation, defaultParam
   }, [id])
   const busy = pending || snapshot.cancellable
   const installed = agent.installed === true
-  const ready = agent.lifecycle?.availability === 'available' || !!agent.lifecycle?.lastReadyAt
-  const failedDetection = agent.incompatible || agent.lifecycle?.detectionStatus === 'failed'
+  const ready = agent.lifecycle?.availability === 'available' || (agent.lifecycle?.detectionStatus === 'failed' && !!agent.lifecycle.lastReadyAt)
+  const failedDetection = agent.lifecycle?.detectionStatus === 'failed' || (agent.lifecycle?.availability !== 'needs-auth' && agent.incompatible)
   const failure = error || snapshot.message || (agent.lifecycle?.detectionStatus === 'failed' ? agent.lifecycle.detectionError : '') || ''
   const perform = async (action: 'install' | 'login' | 'detect') => {
     if (locked.current) return
@@ -75,13 +75,13 @@ export function CliAgentSettings({ agent, onRedetect, installation, defaultParam
         </> : <>
           <div className="mcode-segments" role="group" aria-label="登录方式">
             <button aria-pressed={method === 'browser'} disabled={busy} onClick={() => setMethod('browser')}>{id === 'traex' ? '自动登录' : '浏览器登录'}</button>
-            <button aria-pressed={method !== 'browser'} disabled={busy} onClick={() => setMethod(id === 'traex' ? 'sso' : 'key')}>{id === 'traex' ? 'SSO 登录' : 'API Key 登录'}</button>
+            <button aria-pressed={method !== 'browser'} disabled={busy} onClick={() => setMethod(id === 'traex' ? 'sso' : 'key')}>{id === 'traex' ? 'SSO 登录' : id === 'qoder' ? 'PAT 登录' : 'API Key 登录'}</button>
           </div>
           {id === 'traex' ? <p className="deepseek-step-sub">优先复用 Codebase 企业身份；当前 CLI 未提供已确认的 API Key 登录入口。</p>
-            : method === 'key' && <><input className="set-fld-inp mcode-key" aria-label={`${agent.name} API Key`} type="password" autoComplete="off" spellCheck={false} placeholder="输入 API Key" disabled={busy} value={apiKey} onChange={event => setApiKey(event.target.value)} />
+            : method === 'key' && <><input className="set-fld-inp mcode-key" aria-label={`${agent.name} ${id === 'qoder' ? 'PAT' : 'API Key'}`} type="password" autoComplete="off" spellCheck={false} placeholder={id === 'qoder' ? '输入 Qoder PAT' : '输入 API Key'} disabled={busy} value={apiKey} onChange={event => setApiKey(event.target.value)} />
               <p className="deepseek-step-sub">{id === 'codex' ? '通过 Codex 原生凭据机制保存。' : '加密保存在本机，仅供 UniAgent 使用；保留已有原生登录。'}</p>
-              {id === 'claude' && <button className="set-mini-btn" onClick={onOpenModels}>使用第三方来源 · 模型配置</button>}</>}
-          <div className="deepseek-connection-footer"><span className="deepseek-step-sub">{method === 'key' ? '验证认证与模型目录，不发送模型任务。' : '将使用官方登录流程，授权后自动复查。'}</span><button className="set-mini-btn primary" disabled={busy || method === 'key' && !apiKey.trim()} onClick={() => void perform('login')}>{busy ? '验证中…' : method === 'key' ? '使用 API Key 登录' : '一键登录'}</button></div>
+              {(id === 'claude' || id === 'qoder') && <button className="set-mini-btn" onClick={onOpenModels}>使用第三方来源 · 模型配置</button>}</>}
+          <div className="deepseek-connection-footer"><span className="deepseek-step-sub">{method === 'key' ? '验证认证与模型目录，不发送模型任务。' : '将使用官方登录流程，授权后自动复查。'}</span><button className="set-mini-btn primary" disabled={busy || method === 'key' && !apiKey.trim()} onClick={() => void perform('login')}>{busy ? '验证中…' : method === 'key' ? id === 'qoder' ? '使用 PAT 登录' : '使用 API Key 登录' : '一键登录'}</button></div>
         </>}
       </div>}
     </section>

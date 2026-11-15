@@ -21,11 +21,12 @@ const history = [
 function turnKeys(events: UAEvent[]): string[] {
   const keys: string[] = []
   function Probe(): null {
-    const visit = (node: React.ReactNode): void => {
+    const visit = (node: React.ReactNode, turnKey?: React.Key | null): void => {
       React.Children.forEach(node, child => {
         if (!React.isValidElement<any>(child)) return
-        if (typeof child.type === 'function' && child.type.name === 'TurnBlock') keys.push(String(child.key))
-        visit(child.props.children)
+        const key = child.type === React.Fragment && child.key !== null ? child.key : turnKey
+        if (typeof child.type === 'function' && child.type.name === 'TurnBlock') keys.push(String(key ?? child.key))
+        visit(child.props.children, key)
       })
     }
     visit(EventStream({ events, status: 'idle' }))

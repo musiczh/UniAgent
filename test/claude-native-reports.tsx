@@ -52,8 +52,8 @@ try {
 
   const vite = await createServer({ root: process.cwd(), configFile: false, plugins: [{
     name: 'ssr-dom-sanitizer', enforce: 'pre',
-    resolveId(id) { if (id === 'dompurify') return '\0dompurify-ssr-fixture' },
-    load(id) { if (id === '\0dompurify-ssr-fixture') return 'export default {sanitize: (value) => value}' }
+    resolveId(id) { if (id === 'dompurify') return '\0dompurify-ssr-fixture'; if (/^virtual:uniagent-(?:mermaid-runtime|markdown-worker)-url$/.test(id)) return '\0claude-report-runtime-url' },
+    load(id) { if (id === '\0dompurify-ssr-fixture') return 'export default {sanitize: (value) => value}'; if (id === '\0claude-report-runtime-url') return 'export default "about:blank"' }
   }], ssr: { noExternal: ['dompurify'] }, resolve: { alias: { '@shared': resolve('src/shared') } },
     server: { middlewareMode: true }, appType: 'custom', logLevel: 'silent' })
   try {

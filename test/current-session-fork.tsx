@@ -88,8 +88,9 @@ const compatibleMarkup = renderToStaticMarkup(createElement(HistoryConfirmation 
   onConfirm: () => undefined
 }))
 assert.match(compatibleMarkup, /重建历史，便于切换模型来源/)
-assert.match(compatibleMarkup, /<strong>兼容模式<\/strong>/)
-assert.match(compatibleMarkup, /部分推理、工具及原生上下文可能无法保留/)
+assert.match(compatibleMarkup, /<strong>压缩上下文 \+ 历史资料<\/strong>/)
+assert.match(compatibleMarkup, /目标模型/)
+assert.match(compatibleMarkup, /disabled="">检查中/)
 assert.match(compatibleMarkup, /aria-checked="true"/)
 
 const claudeMarkup = renderToStaticMarkup(createElement(HistoryConfirmation as any, {
@@ -103,8 +104,8 @@ const claudeMarkup = renderToStaticMarkup(createElement(HistoryConfirmation as a
   onCancel: () => undefined,
   onConfirm: () => undefined
 }))
-assert.match(claudeMarkup, /原 Agent 历史重建/)
-assert.match(claudeMarkup, /部分推理、工具及原生上下文可能无法保留/)
+assert.match(claudeMarkup, /原 Agent 原生记录分叉/)
+assert.match(claudeMarkup, /继承完整原生会话历史/)
 assert.doesNotMatch(claudeMarkup, /重建历史，便于切换模型来源/)
 
 const scratch = await mkdtemp(join(tmpdir(), 'ua-current-session-fork-'))
@@ -143,7 +144,16 @@ try {
   assert.equal(fork?.readOnly, false)
   assert.equal(fork?.forkedFrom?.nativeId, nativeId)
   assert.equal(fork?.forkedFrom?.mode, 'same')
-  const compatibleFork = await orchestrator.forkSameSession('traex', nativeId, scratch, undefined, true)
+  // Legacy normalized histories remain readable; new migration jobs are covered separately.
+  const legacyTransplant = async (target: string) => {
+    const { exportNativeSession } = await import('../src/main/history.ts')
+    const result = await exportNativeSession('traex', nativeId, target, id => agents.find(agent => agent.id === id))
+    const session = await orchestrator.importSession(target, result!.nativeId)
+    session!.readOnly = false
+    session!.forkedFrom = { agentId: 'traex', nativeId, mode: target === 'traex' ? 'compatible' : 'cross' }
+    return session
+  }
+  const compatibleFork = await legacyTransplant('traex')
   assert.equal(compatibleFork?.config.agentId, 'traex')
   assert.equal(compatibleFork?.forkedFrom?.mode, 'compatible')
   assert.notEqual(compatibleFork?.nativeSessionId, nativeId)
@@ -154,7 +164,7 @@ try {
     compatibleRecords.find((record) => record.type === 'session_meta')?.payload?.uniagent_transplant,
     true
   )
-  const crossFork = await orchestrator.forkCrossSession('traex', nativeId, 'codex')
+  const crossFork = await legacyTransplant('codex')
   assert.equal(crossFork?.config.agentId, 'codex', 'the selected target Agent must own the cross-Agent fork')
   assert.equal(crossFork?.teamBinding, undefined)
   assert.equal(crossFork?.forkedFrom?.mode, 'cross')

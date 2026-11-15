@@ -11,6 +11,12 @@ export interface ProcessIdentity {
   startTime: string
 }
 export type ProcessInspection = { ok: true; process?: ProcessIdentity } | { ok: false; error: unknown }
+export class ACPRecoveryError extends Error {
+  constructor(cause?: unknown) {
+    super('本地进程恢复未完成，请重试检测', { cause })
+    this.name = 'ACPRecoveryError'
+  }
+}
 
 export function parsePsProcess(line: string): ProcessIdentity | undefined {
   const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(\d+)\s*$/.exec(line)
@@ -27,7 +33,7 @@ export function sameProcessIdentity(left: ProcessIdentity, right: ProcessIdentit
 export function inspectACPProcess(pid: number): Promise<ProcessInspection> {
   return new Promise(resolve => {
     execFile('/bin/ps', ['-p', String(pid), '-o', 'pid=,ppid=,uid=,pgid=,lstart='], {
-      encoding: 'utf8', env: { LC_ALL: 'C' }, maxBuffer: 64 * 1024, timeout: 500
+      encoding: 'utf8', env: { LC_ALL: 'C' }, maxBuffer: 64 * 1024, timeout: 1000
     }, (error, stdout) => {
       if (error) {
         resolve((error as Error & { code?: string | number }).code === 1 && !stdout.trim()
@@ -55,62 +61,149 @@ export function signalACPProcess(expected: ProcessIdentity, inspected: ProcessIn
 }
 
 type Connection = { closeAndWait(): Promise<void> }
-type ProcessRecord = { version: 1; owner: ProcessIdentity; root: ProcessIdentity; processes: ProcessIdentity[] }
+type ProcessRecord = { version: 1; owner: ProcessIdentity; root: ProcessIdentity; processes: ProcessIdentity[]; provider?: string }
+type RecoveryItem = { file: string; scope?: string; flight?: Promise<void>; error?: unknown }
 const connections = new Set<Connection>()
 const saved = new Map<string, string>()
+const pendingRecovery = new Map<string, RecoveryItem>()
 let directory: string | undefined
 let owner: ProcessIdentity | undefined
 let recovery: Promise<void> | undefined
+let preparation: Promise<void> | undefined
+let recoveryPath: string | undefined
 let recovering = false
 let recoveryStarted = false
 let shuttingDown = false
 let closing: Promise<void> | undefined
 let writes = Promise.resolve()
 
-export function assertACPStartAllowed(): void {
+function providerScope(value?: string): string | undefined {
+  const scope = value?.trim().toLowerCase()
+  if (!scope) return undefined
+  if (scope === 'minimax code') return 'mcode'
+  if (scope === 'kimi code') return 'kimi'
+  if (scope === 'deepseek harness') return 'deepseek'
+  return scope
+}
+
+function relevantRecovery(item: RecoveryItem, scope?: string): boolean {
+  // Older records have no provider; keep every provider guarded until their
+  // ownership has been verified instead of guessing from a reusable PID.
+  return !item.scope || !scope || item.scope === providerScope(scope)
+}
+
+export function assertACPStartAllowed(scope?: string): void {
   if (shuttingDown) throw new Error('UniAgent 正在退出，不能新建 ACP 连接')
   if (recovering) throw new Error('ACP 遗留进程仍在恢复')
+  const pending = [...pendingRecovery.values()].find(item => relevantRecovery(item, scope))
+  if (pending) throw new ACPRecoveryError(pending.error)
 }
 
-export async function awaitACPStartup(): Promise<void> {
+export async function awaitACPStartup(scope?: string): Promise<void> {
   if (shuttingDown) assertACPStartAllowed()
-  await recovery
-  assertACPStartAllowed()
+  try {
+    if (!preparation && recoveryPath) prepareACPConnections(recoveryPath)
+    await preparation
+    if (shuttingDown) assertACPStartAllowed()
+    const pending = [...pendingRecovery.values()].filter(item => relevantRecovery(item, scope))
+    await Promise.all(pending.map(item => item.flight || startRecovery(item)))
+    assertACPStartAllowed(scope)
+  } catch (error) {
+    if (shuttingDown) assertACPStartAllowed()
+    throw error instanceof ACPRecoveryError ? error : new ACPRecoveryError(error)
+  }
 }
 
-export function registerACPConnection(connection: Connection): void { assertACPStartAllowed(); connections.add(connection) }
+export function registerACPConnection(connection: Connection, scope?: string): void { assertACPStartAllowed(scope); connections.add(connection) }
 export function unregisterACPConnection(connection: Connection): void { connections.delete(connection) }
 
 /** Defer disk/process recovery until the first UI document is visible. */
 export function prepareACPConnections(path: string, ready: Promise<unknown> = Promise.resolve()): Promise<void> {
   if (recovery) return recovery
+  recoveryPath = path
   recovering = true
-  recovery = ready.then(async () => {
+  const initialFlights: Promise<void>[] = []
+  const setup = ready.then(async () => {
     if (shuttingDown) return
     recoveryStarted = true
     if (process.platform === 'win32') return
     await mkdir(path, { recursive: true, mode: 0o700 })
     const inspected = await inspectACPProcess(process.pid)
     if (!inspected.ok || !inspected.process) throw new Error('无法确认 UniAgent 进程身份')
-    for (const file of await readdir(path)) {
-      if (!/^\d+-\d+\.json$/.test(file)) continue
-      let value: ProcessRecord
-      try { value = JSON.parse(await readFile(join(path, file), 'utf8')) }
-      catch { throw new Error('ACP 进程归属记录无法读取') }
-      if (!validRecord(value) || file !== `${value.owner.pid}-${value.root.pid}.json`) throw new Error('ACP 进程归属记录无效')
-      await recoverRecord(join(path, file), value)
-    }
+    const files = (await readdir(path)).filter(file => /^\d+-\d+\.json$/.test(file))
+    const items = await Promise.all(files.map(async name => {
+      const file = join(path, name)
+      const record = await readRecoveryRecord(file).catch(() => undefined)
+      return { file, scope: providerScope(record?.provider) } satisfies RecoveryItem
+    }))
     owner = inspected.process
     directory = path
+    const groups = new Map<string, Promise<void>>()
+    for (const item of items) {
+      pendingRecovery.set(item.file, item)
+      const key = item.scope || ''
+      const flight = startRecovery(item, groups.get(key))
+      groups.set(key, flight.catch(() => {}))
+      initialFlights.push(flight)
+    }
   }).finally(() => { recovering = false })
-  void recovery.catch(() => {})
-  return recovery
+  preparation = setup
+  const initial = setup.then(async () => {
+    const results = await Promise.allSettled(initialFlights)
+    const failed = results.find(result => result.status === 'rejected')
+    if (failed?.status === 'rejected') throw failed.reason
+  })
+  recovery = initial
+  void initial.catch(() => {})
+  void setup.catch(() => {
+    if (preparation === setup) preparation = undefined
+    if (recovery === initial) recovery = undefined
+  })
+  return initial
 }
 
-export function rememberACPProcesses(root: ProcessIdentity, processes: ProcessIdentity[]): void {
+async function readRecoveryRecord(file: string): Promise<ProcessRecord | undefined> {
+  let text: string
+  try { text = await readFile(file, 'utf8') }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw new Error('ACP 进程归属记录无法读取')
+  }
+  let record: ProcessRecord
+  try { record = JSON.parse(text) } catch { throw new Error('ACP 进程归属记录无法读取') }
+  if (!validRecord(record) || file !== join(directory || recoveryPath!, `${record.owner.pid}-${record.root.pid}.json`)) throw new Error('ACP 进程归属记录无效')
+  return record
+}
+
+function startRecovery(item: RecoveryItem, previous?: Promise<void>): Promise<void> {
+  if (item.flight) return item.flight
+  const flight = (async () => {
+    await previous
+    const record = await readRecoveryRecord(item.file)
+    if (record) {
+      const scope = providerScope(record.provider)
+      if (item.scope && scope !== item.scope) {
+        item.scope = undefined
+        throw new Error('ACP 进程归属记录已变化，请重新检测')
+      }
+      if (!item.scope) item.scope = scope
+      await recoverRecord(item.file, record)
+    }
+    if (pendingRecovery.get(item.file) === item) pendingRecovery.delete(item.file)
+    item.error = undefined
+  })().catch(error => { item.error = error; throw error }).finally(() => {
+    if (item.flight === flight) item.flight = undefined
+  })
+  item.flight = flight
+  void flight.catch(() => {})
+  return flight
+}
+
+export function rememberACPProcesses(root: ProcessIdentity, processes: ProcessIdentity[], provider?: string): void {
   if (!directory || !owner) return
   const file = join(directory, `${owner.pid}-${root.pid}.json`)
-  const text = JSON.stringify({ version: 1, owner, root, processes } satisfies ProcessRecord)
+  const scope = providerScope(provider)
+  const text = JSON.stringify({ version: 1, owner, root, processes, ...(scope ? { provider: scope } : {}) } satisfies ProcessRecord)
   if (saved.get(file) === text) return
   saved.set(file, text)
   queueWrite(async () => {
@@ -141,7 +234,10 @@ export function closeACPConnections(): Promise<void> {
   shuttingDown = true
   closing = (async () => {
     const results = await Promise.allSettled([...connections].map(connection => connection.closeAndWait()))
-    if (recoveryStarted) await recovery
+    if (recoveryStarted) {
+      await preparation
+      await Promise.allSettled([...pendingRecovery.values()].flatMap(item => item.flight ? [item.flight] : []))
+    }
     await writes
     if (results.some(result => result.status === 'rejected')) throw new Error('部分 ACP 连接未完成关闭，启动时将重新清理')
   })()
@@ -156,13 +252,18 @@ function validIdentity(value: ProcessIdentity): boolean {
 
 function validRecord(value: ProcessRecord): boolean {
   return value?.version === 1 && validIdentity(value.owner) && validIdentity(value.root) &&
+    (value.provider === undefined || typeof value.provider === 'string' && /^[a-z0-9][a-z0-9 -]{0,79}$/i.test(value.provider)) &&
     value.root.ppid === value.owner.pid && value.root.pgid === value.root.pid && value.root.pid !== value.owner.pid &&
     Array.isArray(value.processes) && value.processes.every(entry => validIdentity(entry) && entry.pid !== value.owner.pid)
 }
 
 async function checkedIdentity(expected: ProcessIdentity): Promise<ProcessIdentity | undefined> {
   const inspected = await inspectACPProcess(expected.pid)
-  if (!inspected.ok) throw new Error('ACP 遗留进程身份检查失败')
+  if (!inspected.ok) {
+    const error = inspected.error as NodeJS.ErrnoException & { killed?: boolean }
+    const code = typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,39}$/.test(error.code) ? error.code : error?.killed ? 'TIMEOUT' : 'UNKNOWN'
+    throw new Error(`ACP 遗留进程身份检查失败（pid=${expected.pid}, ${code}）`, { cause: inspected.error })
+  }
   return inspected.process && sameProcessIdentity(expected, inspected.process) ? inspected.process : undefined
 }
 
@@ -212,7 +313,7 @@ export function inspectACPProcessGroup(pgid: number): Promise<ProcessIdentity[]>
     execFile('/bin/ps', ['-axo', 'pid=,ppid=,uid=,pgid=,lstart='], {
       encoding: 'utf8', env: { LC_ALL: 'C' }, maxBuffer: 16 * 1024 * 1024, timeout: 1000
     }, (error, stdout) => {
-      if (error) { reject(new Error('ACP 遗留进程组检查失败')); return }
+      if (error) { reject(new Error('ACP 遗留进程组检查失败', { cause: error })); return }
       const group: ProcessIdentity[] = []
       for (const line of stdout.split('\n')) {
         if (!line.trim()) continue

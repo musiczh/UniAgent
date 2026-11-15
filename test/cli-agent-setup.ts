@@ -53,6 +53,14 @@ try {
   installed = false; available = false
   assert.equal((await setup.install('codex')).phase, 'idle')
   assert.equal(downloads, 1); assert.equal(calls[0].bin, '/bin/bash')
+  let qoderInstalled = false
+  const qoderSetup = new CliAgentSetup({ inspect: async id => ({ ...ready(id), bin: '/fixture/qoderclicn', installed: qoderInstalled }),
+    openBrowser: async () => {}, find: async () => qoderInstalled ? '/fixture/qoderclicn' : undefined,
+    request: async url => { assert.equal(String(url), 'https://qoder.com.cn/install'); return new Response('#!/bin/sh\nexit 0\n') },
+    run: async (bin, args) => { assert.equal(bin, '/bin/bash'); assert.equal(args.at(-1), '--skip-path'); qoderInstalled = true; return '' } })
+  assert.equal((await qoderSetup.install('qoder')).phase, 'idle')
+  assert.equal((await qoderSetup.install('qoder')).phase, 'idle', 'shared CN installation is reused after installation')
+  await qoderSetup.close()
   const installerFailure = new CliAgentSetup({ inspect: async id => ({ ...ready(id), installed: false }), openBrowser: async () => {}, find: async () => undefined,
     request: async () => new Response('upstream failure', { status: 503 }) })
   assert.equal((await installerFailure.install('grok')).phase, 'failed')
@@ -102,6 +110,8 @@ try {
   assert.equal((await noAuth.signIn('codex')).phase, 'failed', 'CLI exit zero alone cannot mark login successful')
   assert.equal(trustedAgentLoginUrl('grok', 'https://auth.x.ai/login'), 'https://auth.x.ai/login')
   assert.equal(trustedAgentLoginUrl('grok', 'https://x.ai.evil.example/login'), undefined)
+  assert.equal(trustedAgentLoginUrl('qoder', 'https://qoder.com.cn/login'), 'https://qoder.com.cn/login')
+  assert.equal(trustedAgentLoginUrl('qoder', 'https://qoder.com.cn.evil.test/login'), undefined)
   assert.equal(trustedAgentLoginUrl('codex', 'https://user:pass@auth.openai.com/'), undefined)
   const local = join(root, 'fixture-cli')
   await writeFile(local, '#!/bin/sh\nexit 0\n', { mode: 0o700 })

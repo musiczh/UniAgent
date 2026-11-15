@@ -261,9 +261,10 @@ try {
     const startedAt = Date.now()
     const waiting = rpc(child, 2, {
       name: 'uniagent_task',
-      arguments: { action: 'create', prompt: 'keep waiting while running', wait: true, timeout: 0.05 }
+      arguments: { action: 'create', prompt: 'keep waiting while running', wait: true, timeout: 0.2 }
     })
     const request = await takeRequest(handoff.handoffInboxDir())
+    await new Promise((resolve) => setTimeout(resolve, 100))
     await writeState(handoff.handoffResultsDir(), request.id, {
       status: 'running', text: '', sessionId: 'child', delivery: 'started'
     })
@@ -273,7 +274,7 @@ try {
       })
     }, 720)
     const response = await waiting
-    assert.ok(Date.now() - startedAt >= 700, 'running handoff must keep renewing beyond one wait window')
+    assert.ok(Date.now() - startedAt >= 800, 'running handoff must keep renewing beyond multiple wait windows after asynchronous startup')
     assert.match(response.result.content[0].text, /最终结果/)
     assert.match(response.result.content[0].text, /uniagent:event=started/)
     assert.match(response.result.content[0].text, /uniagent:terminal=completed/)

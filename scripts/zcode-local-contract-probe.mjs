@@ -25,7 +25,9 @@ const server = createServer(async (req, res) => {
     const input = JSON.parse(body)
     const messages = input.messages ?? []
     const tools = input.tools ?? []
-    const lastUser = messages.findLastIndex(m => m.role === 'user')
+    // Native skill reminders also use the user role; locate the fixture's
+    // prompt so the following tool result can terminate its model turn.
+    const lastUser = messages.findLastIndex(m => m.role === 'user' && !JSON.stringify(m.content ?? '').includes('<system-reminder>'))
     const prompt = JSON.stringify(messages[lastUser]?.content ?? '')
     const authMarker = prompt.match(/ZCODE_AUTH_OK_[12]/)?.[0]
     const longResponse = prompt.includes('FIXTURE_LARGE') ? 'FIXTURE_LARGE_OK ' + 'L'.repeat(256 * 1024) : undefined
@@ -118,11 +120,16 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');}
 `, { mode: 0o600 })
   if (actualHandoff) {
     // Use the exact production stdio server; only its main-process response broker is a fixture.
-    const handoff = await readFile(join(import.meta.dirname, '../src/main/handoff.ts'), 'utf8')
-    const source = handoff.match(/const SERVER_SRC = String.raw`([\s\S]*?)\n`\n/)
-    if (!source || source[1].includes('${')) throw new Error('handoff_source_extraction_failed')
-    await writeFile(mcpScript, source[1], { mode: 0o600 })
-    manifest.handoffServerSha256 = createHash('sha256').update(source[1]).digest('hex')
+    const { build } = await import('esbuild')
+    const modulePath = resolve(import.meta.dirname, '../out/agent-qualification', `zcode-handoff-${process.pid}.mjs`)
+    await build({ stdin: { contents: "export { ensureHandoffServer } from './src/main/handoff'", resolveDir: resolve(import.meta.dirname, '..') }, outfile: modulePath, bundle: true, platform: 'node', format: 'esm', packages: 'external' })
+    const previousUserData = process.env.UNIAGENT_USER_DATA
+    process.env.UNIAGENT_USER_DATA = join(root, 'handoff-data')
+    let source
+    try { source = await readFile((await import(modulePath)).ensureHandoffServer()) }
+    finally { if (previousUserData === undefined) delete process.env.UNIAGENT_USER_DATA; else process.env.UNIAGENT_USER_DATA = previousUserData }
+    await writeFile(mcpScript, source, { mode: 0o600 })
+    manifest.handoffServerSha256 = createHash('sha256').update(source).digest('hex')
     await mkdir(requirementInbox)
     await mkdir(requirementResults)
     requirementTimer = setInterval(async () => {

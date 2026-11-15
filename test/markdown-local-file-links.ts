@@ -42,7 +42,7 @@ const setup = `
   };
 `
 const inspect = `(async () => {
-  const root = document.querySelector('.agent-md');
+  const root = document.querySelector('.agent-msg .agent-md');
   const image = root.querySelector('img');
   const link = [...root.querySelectorAll('a')].find((anchor) => anchor.textContent === '设计稿 HTML');
   const external = [...root.querySelectorAll('a')].find((anchor) => anchor.textContent === '官网');

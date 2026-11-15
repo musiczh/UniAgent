@@ -62,6 +62,7 @@ const server = http.createServer((req, res) => {
   }
   if (url.pathname === '/openapi.json') {
     return send(res, 200, { paths: {
+      ...(scenario.modern ? { '/api/v1/sessions/{session_id}/transcript/ops': { get: {} } } : {}),
       '/api/v1/sessions/{session_id}/goal': { get: {} },
       '/api/v1/sessions/{session_id}/profile': { post: {} },
       '/api/v1/sessions/{session_id}/prompts': { post: {} },
@@ -73,7 +74,8 @@ const server = http.createServer((req, res) => {
   if (url.pathname === `/api/v1/sessions/${sessionId}/tasks`) return send(res, 200, { code: 0, data: { items: tasks } })
   if (url.pathname === `/api/v1/sessions/${sessionId}/transcript`) {
     const agentId = url.searchParams.get('agent_id') || ''
-    return send(res, 200, { code: 0, data: { agent_id: agentId, items: turns, has_more: false, meta: {} } })
+    return send(res, 200, { code: 0, data: { agent_id: agentId, items: turns, has_more: false, meta: {},
+      ...(scenario.modern ? { agents: scenario.agents || [{ agentId: 'child-1', type: 'sub', parentAgentId: 'main' }] } : {}) } })
   }
   return send(res, 404, { code: 40401, data: null })
 })

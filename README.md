@@ -1,6 +1,6 @@
 # UniAgent Public
 
-macOS 多 Agent 桌面工作台。支持 Codex、Claude Code、Grok、Kimi Code、DeepSeek Harness、MiniMax Code 和 ZCode，保留各家原生协议、账号和能力。
+macOS 多 Agent 桌面工作台。支持 Codex、Claude Code、Grok、Kimi Code、DeepSeek Harness、MiniMax Code、ZCode 和 Qoder，保留各家原生协议、账号和能力。
 
 官网：https://musiczh.github.io/UniAgent/
 

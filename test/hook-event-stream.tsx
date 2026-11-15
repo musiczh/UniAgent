@@ -274,7 +274,7 @@ const interactions = await renderEventStream([], 'idle', 'empty', {
       summary: panel.querySelector('.hook-batch-summary').textContent,
       expanded: first.getAttribute('aria-expanded'), linked: panel.id === first.getAttribute('aria-controls'),
       afterActions: panel.previousElementSibling === first.parentElement,
-      afterUsage: first.parentElement.previousElementSibling?.classList.contains('usage'),
+      usageInActions: !!first.parentElement.querySelector('.message-usage > button'),
       rowsClosed: rows.every(row => row.getAttribute('aria-expanded') === 'false'),
       othersClosed: turns().slice(1).every(turn => !turn.querySelector('.turn-hooks')),
     };
@@ -301,8 +301,8 @@ assert.deepEqual(interactions.before, {
 }, 'history actions remain available while the current turn hides Hooks; snapshots count as one call')
 assert.deepEqual(interactions.opened, {
   count: 3, names: ['hook-a.json', 'hook-b.json', 'stop-hook.json'], summary: '2 已完成1 失败',
-  expanded: 'true', linked: true, afterActions: true, afterUsage: true, rowsClosed: true, othersClosed: true,
-}, 'the action opens only its own turn after usage, including late Stop Hooks')
+  expanded: 'true', linked: true, afterActions: true, usageInActions: true, rowsClosed: true, othersClosed: true,
+}, 'the action opens only its own turn while Token shares the toolbar, including late Stop Hooks')
 assert.equal(interactions.detail.expanded, 'true')
 assert.match(interactions.detail.text, /来源\/repo\/hook-a.json/)
 assert.match(interactions.detail.text, /command · sync · turn/, 'individual disclosure retains handler metadata')

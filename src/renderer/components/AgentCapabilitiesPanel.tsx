@@ -11,9 +11,10 @@ import { AgentIcon } from './AgentIcon'
 import { FileBrowser } from './FileBrowser'
 import { RefreshIcon, ToggleSwitch, UiIcon } from './Icons'
 import { Markdown } from './Markdown'
+import { McpCapabilityDetail } from './McpCapabilityDetail'
 import './AgentCapabilitiesPanel.css'
 
-const AGENT_NAMES: Record<CapabilityAgentId, string> = { codex: 'Codex', traex: 'TraeX', claude: 'Claude Code', grok: 'Grok', kimi: 'Kimi Code', deepseek: 'DeepSeek Harness', mcode: 'MiniMax Code', nika: 'Nika', zcode: 'ZCode' }
+const AGENT_NAMES: Record<CapabilityAgentId, string> = { qoder: 'Qoder', codex: 'Codex', traex: 'TraeX', claude: 'Claude Code', grok: 'Grok', kimi: 'Kimi Code', deepseek: 'DeepSeek Harness', mcode: 'MiniMax Code', nika: 'Nika', zcode: 'ZCode' }
 // 需求3: 对比视图 — diff 状态 → 文案（复用同步页 STATUS 语义，前置到对比视图）。
 const COMPARE_STATUS: Record<CapabilityDiffStatus, string> = {
   add: '新增', update: '更新', conflict: '冲突', same: '一致', 'target-only': '仅目标', incompatible: '不兼容', invalid: '无效'
@@ -24,7 +25,7 @@ const INVENTORY_KINDS: CapabilityInventoryKind[] = ['skill', 'plugin', 'mcp', 'h
 const COMPARE_KINDS = INVENTORY_KINDS
 
 export function capabilityListItems(items: CapabilityInventoryItem[]): CapabilityInventoryItem[] {
-  return items.filter(item => !['command', 'tool', 'global-instructions', 'global-preference'].includes(item.kind))
+  return items.filter(item => item.issueCode !== 'plugin_enumeration_failed' && !['command', 'tool', 'global-instructions', 'global-preference'].includes(item.kind))
 }
 
 export interface CompareRow {
@@ -213,6 +214,7 @@ function capabilitySubtitle(item: CapabilityInventoryItem): string {
 
 export function canManageCapabilityItem(item: CapabilityInventoryItem, writable: boolean): boolean {
   if (item.removal) return item.manageable
+  if (item.agentId === 'qoder' && item.kind === 'plugin') return item.manageable
   if (item.agentId === 'mcode' && item.kind === 'plugin') return item.manageable
   if (item.agentId === 'zcode' && item.kind === 'plugin') return item.manageable
   if (item.agentId === 'deepseek' && item.kind === 'plugin') return !!betaCapabilityRemovalRequest(item)
@@ -236,6 +238,7 @@ export function capabilityOwningPlugin(item: CapabilityInventoryItem, items: Cap
 export function betaCapabilityRemovalRequest(item: CapabilityInventoryItem): Extract<CapabilityInventoryManageRequest, { id: string }> | undefined {
   if (item.removal) return undefined
   if (!item.manageable || item.linked || item.status === 'invalid' || item.status === 'unsupported') return undefined
+  if (item.agentId === 'qoder' && item.kind === 'plugin') return { agentId: 'qoder', action: 'plugin-uninstall', id: item.id, expectedFingerprint: item.fingerprint }
   if (item.agentId === 'mcode' && item.kind === 'plugin') return { agentId: 'mcode', action: 'plugin-uninstall', id: item.id, expectedFingerprint: item.fingerprint }
   if (item.agentId === 'zcode' && item.kind === 'plugin') return { agentId: 'zcode', action: 'plugin-uninstall', id: item.id, expectedFingerprint: item.fingerprint }
   if (item.agentId === 'kimi' && item.kind === 'plugin' && item.scope === 'plugin' && item.owner === 'plugin' && item.pluginId) return { agentId: 'kimi', action: 'plugin-uninstall', id: item.id, expectedFingerprint: item.fingerprint }
@@ -251,7 +254,7 @@ export function betaCapabilityRemovalRequest(item: CapabilityInventoryItem): Ext
 
 type BetaEditorKind = 'skill' | 'mcp' | 'plugin'
 export interface BetaCapabilityEditorInput {
-  agentId: 'kimi' | 'grok' | 'deepseek'
+  agentId: 'kimi' | 'grok' | 'deepseek' | 'qoder'
   kind: BetaEditorKind
   name: string
   text: string
@@ -263,6 +266,7 @@ interface BetaCapabilityEditor extends BetaCapabilityEditorInput { error?: strin
 export function canCreateBetaCapability(inventory: CapabilityAgentInventory | undefined, kind: BetaEditorKind): boolean {
   if (!inventory?.available || inventory.status !== 'available' || inventory.managementSupported === false) return false
   return inventory.agentId === 'kimi' ? inventory.writable && (kind === 'skill' || kind === 'mcp')
+    : inventory.agentId === 'qoder' ? kind === 'plugin'
     : inventory.agentId === 'grok' ? kind === 'mcp' || kind === 'plugin'
     : inventory.agentId === 'deepseek' && kind === 'plugin' && inventory.managementSupported === true
 }
@@ -282,10 +286,10 @@ export function betaCapabilityEditorRequest(input: BetaCapabilityEditorInput): C
     if (agentId === 'deepseek') return item
       ? { agentId, action: 'plugin-update', id: item.id, expectedFingerprint: item.fingerprint, ...(name ? { spec: name } : {}) }
       : { agentId, action: 'plugin-install', spec: name }
-    if (agentId !== 'grok' || item) throw new Error('invalid_capability_inventory_manage_request')
+    if (agentId !== 'grok' && agentId !== 'qoder' || item) throw new Error('invalid_capability_inventory_manage_request')
     return { agentId, action: 'plugin-install', source: name, ...(expectedRevision ? { expectedRevision } : {}) }
   }
-  if (agentId === 'deepseek') throw new Error('invalid_capability_inventory_manage_request')
+  if (agentId === 'deepseek' || agentId === 'qoder') throw new Error('invalid_capability_inventory_manage_request')
   let config: Record<string, unknown>
   try {
     config = JSON.parse(text)
@@ -306,6 +310,9 @@ export function betaCapabilityEditorRequest(input: BetaCapabilityEditorInput): C
 }
 
 export function betaCapabilityStateRequest(item: CapabilityInventoryItem, enabled: boolean, expectedRevision?: string): CapabilityInventoryManageRequest | undefined {
+  if (item.agentId === 'codex' && item.kind === 'plugin' && item.manageable && item.stateManageable) return {
+    agentId: 'codex', action: enabled ? 'plugin-enable' : 'plugin-disable', id: item.id, expectedFingerprint: item.fingerprint
+  }
   if (item.id.startsWith('deepseek:files:')) return undefined
   if (!betaCapabilityRemovalRequest(item)) return undefined
   if (item.agentId === 'kimi' && item.kind === 'mcp') return { agentId: 'kimi', action: enabled ? 'mcp-enable' : 'mcp-disable', id: item.id, expectedFingerprint: item.fingerprint }
@@ -316,6 +323,7 @@ export function betaCapabilityStateRequest(item: CapabilityInventoryItem, enable
 }
 
 function capabilityEnabled(item: CapabilityInventoryItem, detail: CapabilityInventoryDetail | null): boolean {
+  if (typeof item.enabled === 'boolean') return item.enabled
   try {
     const parsed = JSON.parse(detail?.manifestText || '{}')
     const config = Array.isArray(parsed) ? parsed.find((value) => value?.name === item.name) : parsed
@@ -423,6 +431,10 @@ export function AgentCapabilitiesPanel({ onOpenSync, embedded = false, agents = 
   const [detailItem, setDetailItem] = useState<CapabilityInventoryItem | null>(null)
   const [detail, setDetail] = useState<CapabilityInventoryDetail | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
+  const [mcpToolsLoading, setMcpToolsLoading] = useState(false)
+  const [detailError, setDetailError] = useState('')
+  const [detailPathsOpen, setDetailPathsOpen] = useState(false)
+  const detailPathsId = useId()
   const [browseFolder, setBrowseFolder] = useState<string | null>(null)
   const detailRequest = useRef(0)
   const [job, setJob] = useState<CapabilitySyncJob | null>(null)
@@ -604,15 +616,21 @@ export function AgentCapabilitiesPanel({ onOpenSync, embedded = false, agents = 
   // 需求2: 打开某个能力的详情抽屉，并异步拉取安全的 detail（SKILL.md + 文件列表 +
   // 可浏览的绝对目录）。detailRequest 保证只有最后一次点击的结果会落地。
   function openDetail(item: CapabilityInventoryItem): void {
+    setMcpToolsLoading(false)
     setEditor(null)
+    setDetailPathsOpen(false); setDetailError('')
     const request = ++detailRequest.current
     setDetailItem(item)
     setError('')
     setDetail(null)
     setDetailLoading(true)
     void window.uniagent.capabilityInventoryDetail(item.id)
-      .then((next) => { if (request === detailRequest.current) setDetail(next) })
-      .catch(() => { if (request === detailRequest.current) setDetail(null) })
+      .then((next) => {
+        if (request !== detailRequest.current) return
+        if (!next || next.id !== item.id || next.kind !== item.kind) throw new Error('invalid_detail')
+        setDetail(next)
+      })
+      .catch(() => { if (request === detailRequest.current) { setDetail(null); setDetailError('读取详情失败，请重新扫描后重试。') } })
       .finally(() => { if (request === detailRequest.current) setDetailLoading(false) })
   }
 
@@ -620,6 +638,20 @@ export function AgentCapabilitiesPanel({ onOpenSync, embedded = false, agents = 
     if (managementBusy.current) return
     detailRequest.current += 1
     setDetailItem(null); setDetail(null); setDetailLoading(false)
+    setMcpToolsLoading(false)
+  }
+
+  async function readMcpTools(): Promise<void> {
+    if (!detailItem || detailItem.kind !== 'mcp' || mcpToolsLoading) return
+    const item = detailItem, request = ++detailRequest.current
+    setMcpToolsLoading(true); setDetailError('')
+    try {
+      const next = await window.uniagent.capabilityInventoryDetail(item.id, true)
+      if (request !== detailRequest.current || !mounted.current) return
+      if (next?.id !== item.id || next.kind !== 'mcp') throw new Error('invalid_detail')
+      setDetail(next)
+    } catch { if (request === detailRequest.current && mounted.current) setDetailError('读取工具信息失败，请重试。') }
+    finally { if (request === detailRequest.current && mounted.current) setMcpToolsLoading(false) }
   }
 
   function openCreate(kind: BetaEditorKind): void {
@@ -748,7 +780,7 @@ export function AgentCapabilitiesPanel({ onOpenSync, embedded = false, agents = 
   }
 
   async function previewRemoval(ids: string[]): Promise<CapabilitySyncPlan | undefined> {
-    if ((agentId !== 'codex' && agentId !== 'traex') || ids.length === 0 || jobActive) return
+    if ((agentId !== 'codex' && agentId !== 'traex' && agentId !== 'qoder') || ids.length === 0 || jobActive) return
     const inputGeneration = removalInputGeneration.current
     const requestGeneration = ++removalRequestGeneration.current
     const target = agentId
@@ -850,7 +882,7 @@ export function AgentCapabilitiesPanel({ onOpenSync, embedded = false, agents = 
   }
 
   // 需求3: 对比视图 —— 只有 codex↔traex 可 diff+同步；Claude/Grok 只读对比。
-  const writablePair = (leftAgent === 'codex' && rightAgent === 'traex') || (leftAgent === 'traex' && rightAgent === 'codex')
+  const writablePair = leftAgent !== rightAgent && ['codex', 'traex', 'qoder'].includes(leftAgent) && ['codex', 'traex', 'qoder'].includes(rightAgent)
   const compareExecutionSupported = writablePair && compareScan?.executionSupported === true
 
   // 源侧「可复制」清单项的不透明 id 映射（按 kind+小写名对齐），用于把对比选择路由回既有同步流程。
@@ -952,7 +984,7 @@ export function AgentCapabilitiesPanel({ onOpenSync, embedded = false, agents = 
           <span className={`cap-log-summary-icon ${logRows.length ? 'has-issues' : ''}`}><UiIcon name={logRows.length ? 'warn' : 'check'} size={18}/></span>
           <div><b>{logRows.length ? `本次能力扫描发现 ${logRows.length} 条异常` : '本次能力扫描未发现异常'}</b><span>{result ? `扫描于 ${new Date(result.scannedAt).toLocaleString()} · 重新扫描后自动刷新` : '等待首次扫描'}</span></div>
           <button className="settings-mini-btn" disabled={!logRows.length} onClick={() => void copyCapabilityLog()}><UiIcon name="copy" size={13}/>{logCopyState === 'copied' ? '已复制 ✓' : logCopyState === 'failed' ? '复制失败' : '复制全部日志'}</button>
-          <button className="settings-mini-btn" onClick={() => onBack ? onBack() : setView('inventory')}>{onBack ? '返回通用' : '返回能力列表'}</button>
+          <button className="settings-mini-btn" onClick={() => onBack ? onBack() : setView('inventory')}>{onBack ? '返回开发者选项' : '返回能力列表'}</button>
         </section>
         <div className="cap-log-filters"><button className={`cap-chip ${logAgent === 'all' ? 'on' : ''}`} onClick={() => setLogAgent('all')}>全部 <span className="cnt">{logRows.length}</span></button>{agentIds.map((id) => <button key={id} className={`cap-chip ${logAgent === id ? 'on' : ''}`} onClick={() => setLogAgent(id)}>{AGENT_NAMES[id]} <span className="cnt">{logCounts[id] || 0}</span></button>)}<span>日志来自当前扫描结果，不额外采集用户数据</span></div>
         <div className="cap-log-table">
@@ -1035,7 +1067,14 @@ export function AgentCapabilitiesPanel({ onOpenSync, embedded = false, agents = 
       const ownerPlugin = capabilityOwningPlugin(detailItem, inventory?.items || [])
       const pending = capabilityActionPending?.startsWith(detailItem.id) === true
       const manifest = detail?.manifestText ? parseManifest(detail.manifestText) : null
-      const headerDesc = manifest?.description || capabilitySubtitle(detailItem)
+      const plugin = detail?.plugin
+      const headerDesc = plugin?.shortDescription || manifest?.description || (detailItem.kind === 'mcp' ? 'MCP 服务配置与连接信息' : plugin ? undefined : capabilitySubtitle(detailItem))
+      const sourcePaths = [
+        [detailItem.linked ? '读取入口（符号链接）' : '读取位置', detailItem.entryPath],
+        ['实际源目录', detailItem.location],
+        ['原始指令文件', detailItem.manifestPath],
+        ['配置文件', detail?.sourcePath]
+      ].filter(([, path]) => path)
       return <div className="cap-detail-overlay" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) closeDetail() }}>
         <aside className="cap-detail" role="dialog" aria-modal="true" aria-label={`${detailItem.name} 详情`}>
           <div className="cd-head">
@@ -1044,15 +1083,21 @@ export function AgentCapabilitiesPanel({ onOpenSync, embedded = false, agents = 
               <span className="cd-head-spacer" />
               <button className="cd-x" aria-label="关闭详情" onClick={closeDetail}><UiIcon name="close" size={14} /></button>
             </div>
-            <h2 className="cd-name" title={detailItem.name}>{detailItem.name}</h2>
+            <div className={plugin ? 'cd-plugin-title' : undefined}>
+              {plugin?.logoDataUrl && <img className="cd-plugin-logo" src={plugin.logoDataUrl} alt=""/>}
+              <div><h2 className="cd-name" title={detailItem.name}>{detailItem.name}</h2>
+                {plugin && <div className="cd-plugin-byline">{[plugin.author, detailItem.version && `v${detailItem.version}`].filter(Boolean).join(' · ')}</div>}
+              </div>
+            </div>
             {headerDesc && <p className="cd-desc">{headerDesc}</p>}
             <div className="cd-meta">
               <span className="tag">{SCOPE_NAMES[detailItem.scope] || detailItem.scope}</span>
-              <span className={`cd-status ${detailItem.status === 'available' ? 'ok' : detailItem.status === 'shadowed' ? 'covered' : 'bad'}`}><span className="dot" aria-hidden="true" /> {detailItem.status === 'available' && detailItem.kind === 'skill' ? '使用中' : detailItem.status === 'available' && detailItem.kind === 'plugin' ? '已安装' : INVENTORY_STATUS_NAMES[detailItem.status]}</span>
+              <span className={`cd-status ${detailItem.kind === 'plugin' && detailItem.enabled === false ? 'covered' : detailItem.status === 'available' ? 'ok' : detailItem.status === 'shadowed' ? 'covered' : 'bad'}`}><span className="dot" aria-hidden="true" /> {detailItem.status === 'available' && detailItem.kind === 'skill' ? '使用中' : detailItem.status === 'available' && detailItem.kind === 'plugin' ? detailItem.enabled === false ? '已停用' : '已启用' : detailItem.status === 'available' && detailItem.kind === 'mcp' ? '已配置' : INVENTORY_STATUS_NAMES[detailItem.status]}</span>
+              {sourcePaths.length > 0 && <button type="button" className="cap-source-trigger cd-source-trigger" aria-label="查看来源位置" aria-expanded={detailPathsOpen} aria-controls={detailPathsId} onClick={() => setDetailPathsOpen(open => !open)}><UiIcon name="alert-circle" size={17}/></button>}
             </div>
-            <div className="cd-origin" title={detailItem.origin}>{detailItem.origin}</div>
-            {detailItem.entryPath && <dl className="cd-paths">
-              {[[detailItem.linked ? '读取入口（符号链接）' : '读取位置', detailItem.entryPath], ['实际源目录', detailItem.location], ['原始指令文件', detailItem.manifestPath]].filter(([, path]) => path).map(([label, path]) => <div key={label}>
+            {detailItem.kind === 'plugin' && <div className="cd-origin" title={detailItem.origin}>{detailItem.origin}</div>}
+            {sourcePaths.length > 0 && <dl className="cd-paths" id={detailPathsId} hidden={!detailPathsOpen}>
+              {sourcePaths.map(([label, path]) => <div key={label}>
                 <dt>{label}<button className="cd-copy-path" aria-label={`复制${label}`} onClick={() => void navigator.clipboard.writeText(path!).catch(() => setError('复制路径失败，请重试。'))}><UiIcon name="copy" size={12}/></button></dt><dd>{path}</dd>
               </div>)}
             </dl>}
@@ -1071,13 +1116,21 @@ export function AgentCapabilitiesPanel({ onOpenSync, embedded = false, agents = 
           </div>
           <div className="cd-body">
             {error && <div className="cap-sync-error" role="alert">{error}</div>}
+            {detailError && <div className="cap-sync-error" role="alert">{detailError}</div>}
             {detailLoading && !detail ? <div className="panel-loading"><div className="loading-spinner"/><span>正在读取详情…</span></div> : <>
-              {manifest && manifest.body.trim()
+              {detailItem.kind === 'mcp' && detail ? <McpCapabilityDetail detail={detail} loading={mcpToolsLoading} onReadTools={() => void readMcpTools()}/> : plugin ? <div className="cd-plugin-content">
+                {detailItem.stateReadOnlyReason && <p className="cd-plugin-state-note">{detailItem.stateReadOnlyReason}</p>}
+                {plugin.description && <><div className="cd-section-h">插件介绍</div><p className="cd-plugin-description">{plugin.description}</p></>}
+                <div className="cd-section-h">Skill <span className="cd-section-note">{plugin.skills.length}</span></div>
+                {plugin.skills.length ? <div className="cd-plugin-skills">{plugin.skills.map(skill => <button key={skill.id} className="cd-plugin-skill" onClick={() => openDetail(skill)}>
+                  <span className="cap-kind capability-kind k-skill">Skill</span><span><b>{skill.name}</b>{skill.description && <small>{skill.description}</small>}</span><UiIcon name="chevron-right" size={14}/>
+                </button>)}</div> : <p className="cd-plugin-empty">此插件未包含可读取的 Skill。</p>}
+              </div> : manifest && manifest.body.trim()
                 ? (() => { const json = tryPrettyJson(manifest.body)
                     return json != null
                       ? <><div className="cd-section-h">{detail?.manifestFile || '清单'}</div><pre className="cd-code">{json}</pre></>
                       : <div className="cap-detail-md"><Markdown text={manifest.body} /></div> })()
-                : !manifest && <div className="cap-detail-md"><p>{capabilitySubtitle(detailItem)}</p></div>}
+                : !manifest && !detailError && <div className="cap-detail-md"><p>{detailItem.kind === 'mcp' ? '当前 Agent 尚未提供可展示的服务配置。' : capabilitySubtitle(detailItem)}</p></div>}
               {detail?.files && detail.files.length > 0 && <>
                 <div className="cd-section-h">文件<span className="cd-section-note"> · 点击「在文件浏览器中打开」查看完整目录</span></div>
                 <div className="cd-files">{detail.files.map((file) => <div key={file.relativePath} className="cd-file"><UiIcon name={file.directory ? 'folder' : 'file'} size={13} /><span className="fnm">{file.relativePath}{file.directory ? '/' : ''}</span>{file.size != null && !file.directory && <span className="fsize">{formatFileSize(file.size)}</span>}</div>)}</div>

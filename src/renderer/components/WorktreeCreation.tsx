@@ -7,7 +7,8 @@ export function WorktreeCreation({ session }: { session: Session }): JSX.Element
   const [retrying, setRetrying] = useState(false)
   const tree = session.config.worktree
   if (!tree) return null
-  const pending = !!session.worktreeTask || tree.state !== 'ready'
+  const pending = !!session.worktreeTask || !!session.worktreePreparing || tree.state !== 'ready'
+  const retryItem = !session.worktreeTask && tree.state === 'ready' && session.pendingQueue?.find(item => item.state === 'pending')
   const failure = tree.lastError || session.worktreeTaskError || error
   if (!pending && !failure) return null
 
@@ -25,7 +26,7 @@ export function WorktreeCreation({ session }: { session: Session }): JSX.Element
       <p>{failure || '正在准备独立工作目录，完成后自动开始执行任务。'}</p>
       <div className="worktree-creation-meta"><span><UiIcon name="folder" size={12} />{tree.sourcePrimaryDirectory.split('/').pop()}</span><span><UiIcon name="fork" size={12} />基于 {tree.baseRef === 'HEAD' ? tree.baseCommit.slice(0, 7) : tree.baseRef.replace(/^refs\/heads\//, '')}</span></div>
       <div className="worktree-creation-path">{tree.workdir}</div>
-      {failure && pending && <button type="button" disabled={retrying} onClick={() => void retry()}><UiIcon name="refresh" size={13} />{retrying ? '正在重试…' : '重试创建'}</button>}
+      {failure && (pending || retryItem) && <button type="button" disabled={retrying} onClick={() => void retry()}><UiIcon name="refresh" size={13} />{retrying ? '正在重试…' : tree.state === 'ready' ? '重试准备' : '重试创建'}</button>}
       {failure && tree.state === 'ready' && <p>也可在下方修改任务后发送。</p>}
     </div>
   </div></div>

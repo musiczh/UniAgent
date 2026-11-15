@@ -11,10 +11,12 @@ import { assistantIndexedMessage, assistantIndexedSession } from './transcript'
 import { bindAssistantScope, revokeAssistantScope, setAssistantScopeActive, watchAssistantInbox, type AssistantScope } from './mcp'
 import { AssistantReview } from './review'
 import { AssistantCommands } from './commands'
+import type { AssistantConversationSelection } from '../../shared/assistantConversation'
 
 export class PersonalAssistantService {
   private management?: (scope: AssistantScope, args: unknown) => Promise<unknown>
-  configureManagement(handler: (scope: AssistantScope, args: unknown) => Promise<unknown>): void { this.management = handler }
+  private settings?: (scope: AssistantScope, args: unknown) => Promise<unknown>
+  configureManagement(handler: (scope: AssistantScope, args: unknown) => Promise<unknown>, settings?: (scope: AssistantScope, args: unknown) => Promise<unknown>): void { this.management = handler; this.settings = settings }
   readonly store = createAssistantStore()
   readonly commands: AssistantCommands
   private review: AssistantReview
@@ -26,7 +28,7 @@ export class PersonalAssistantService {
   private projections = new Map<string, { session: Session; message: import('../../shared/assistant').IndexedMessage }>()
   private projectionTimer?: ReturnType<typeof setTimeout>
   constructor(private orchestrator: Orchestrator, private getAgent: (id: string) => AgentDef | undefined, private changed: () => void,
-    private onError: (error: unknown) => void, private resolveWorkspace: (workdir: string) => Project, defaultConfig: () => Promise<SessionConfig>) {
+    private onError: (error: unknown) => void, private resolveWorkspace: (workdir: string) => Project, defaultConfig: (selection?: AssistantConversationSelection) => Promise<SessionConfig>) {
     this.commands = new AssistantCommands(orchestrator, () => this.snapshot(), () => this.invalidate(), defaultConfig)
     this.review = new AssistantReview(this.store, id => orchestrator.getSessionById(id), getAgent,
       () => orchestrator.listSessions().some(s => !!s.config.assistantSnapshot && isSessionBusy(s.status)), (scope,tool,args) => this.call(scope,tool,args), changed)
@@ -91,6 +93,7 @@ export class PersonalAssistantService {
     this.projections.clear()
   }
   private event(event: UAEvent): void {
+    if (event.payload?.recoveryIntermediate || event.payload?.automaticRecovery) return
     const session = this.orchestrator.getSessionById(event.sessionId)
     if (!session || !this.inScope(session)) return
     const message = assistantIndexedMessage(event)
@@ -182,9 +185,10 @@ export class PersonalAssistantService {
       const session = this.orchestrator.getSessionById(scope.sessionId)
       if (!session || !this.inScope(session)) throw new Error('assistant_session_required')
     }
-    if (tool === 'uniagent_manage') {
-      if (scope.jobId || !this.management || !(await this.store.detail()).assistant.enabled || !scope.active) throw new Error('assistant_management_unavailable')
-      return this.management(scope, args)
+    if (tool === 'uniagent_manage' || tool === 'uniagent_settings') {
+      const handler = tool === 'uniagent_settings' ? this.settings : this.management
+      if (scope.jobId || !handler || !(await this.store.detail()).assistant.enabled || !scope.active) throw new Error('assistant_management_unavailable')
+      return handler(scope, args)
     }
     if (tool === 'assistant_memory') {
       if (scope.jobId && scope.calls++ >= 8) throw new Error('review_tool_budget_exceeded')

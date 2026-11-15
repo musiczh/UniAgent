@@ -23,8 +23,10 @@ try {
   await symlink(join(home, 'missing'), join(home, '.agents/skills/broken'))
   await mkdir(join(home, '.claude/skills/manifest-link'))
   await symlink(join(home, '.agents/skills/source/SKILL.md'), join(home, '.claude/skills/manifest-link/SKILL.md'))
-  await writeFile(join(home, '.codex/config.toml'), 'model="fixture"\n')
-  await writeFile(join(home, '.trae/traecli.toml'), 'model="fixture"\n')
+  const mcpConfig = 'model="fixture"\n[mcp_servers.reader]\ncommand="node"\nargs=["--token", "fixture-secret-arg"]\n[mcp_servers.reader.env]\nACCESS_TOKEN="fixture-secret-env"\n[mcp_servers."fixture-secret-key"]\ncommand="node"\n'
+  await writeFile(join(home, '.codex/config.toml'), mcpConfig)
+  await writeFile(join(home, '.trae/traecli.toml'), mcpConfig)
+  await writeFile(join(home, '.claude.json'), JSON.stringify({mcpServers:{reader:{type:'http',url:'https://example.test/mcp?token=fixture-secret-url',headers:{Authorization:'fixture-secret-header'}}}}))
 
   const inventories = (await listCapabilityInventories(home, runner)).inventories
   const claude = inventories.find(value => value.agentId === 'claude')!
@@ -102,6 +104,23 @@ try {
   await symlink(join(home, '.agents/skills/source'), join(home, '.nika/skills/private-link'))
 
   const result = await listAgentToolInventories(options)
+  for (const agentId of ['codex', 'traex', 'claude'].filter(isDistributionAgent)) {
+    const mcp = result.inventories.find(value => value.agentId === agentId)!.items.find(value => value.kind === 'mcp' && value.name === 'reader')!
+    const detail = await getAgentToolDetail(mcp.id, options)
+    assert.equal(detail.kind, 'mcp')
+    assert(detail.manifestText, `${agentId} MCP details must include the selected service configuration`)
+    assert(!JSON.stringify(detail).includes('fixture-secret'), 'credentials must not cross the detail boundary')
+    assert.equal(detail.sourcePath, join(home, agentId === 'claude' ? '.claude.json' : agentId === 'codex' ? '.codex/config.toml' : '.trae/traecli.toml'))
+    const configuration = JSON.parse(detail.manifestText!)
+    if (agentId !== 'claude') assert.equal(configuration.command, 'node')
+    assert.equal(detail.openable, false, 'MCP detail must not enable browsing the entire Agent config directory')
+    const builtin = result.inventories.find(value => value.agentId === agentId)!.items.find(value => value.name === 'uniagent-handoff')!
+    const builtinDetail = await getAgentToolDetail(builtin.id, options)
+    assert(builtinDetail.manifestText?.includes('uniagent_task'), 'builtin MCP details explain the tools they provide')
+  }
+  const opaqueMcp = result.inventories.find(value => value.agentId === 'codex')!.items.find(value => value.name.startsWith('MCP server #'))!
+  assert(opaqueMcp)
+  assert(!JSON.stringify(await getAgentToolDetail(opaqueMcp.id, options)).includes('fixture-secret-key'), 'opaque server names stay private in details')
   assert.deepEqual(result.inventories.map(value => value.agentId), names)
   const entry = (agent: string, name: string) => result.inventories.find(value => value.agentId === agent)!.items.find(value => value.name === name)!
   assert(entry('kimi', 'kimi-flat').entryPath?.endsWith('flat.md'))

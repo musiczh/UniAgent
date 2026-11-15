@@ -53,7 +53,12 @@ const result = await renderEventStream([
   `,
   inspect: `(async () => {
     const tick = () => new Promise(resolve=>setTimeout(resolve,30));
-    const input = document.querySelector('.composer .markdown-editor-content');
+    let input;
+    for(let attempt=0;attempt<100;attempt++) {
+      input=document.querySelector('.composer .markdown-editor-content');
+      if(input)break;
+      await tick();
+    }
     const send = document.querySelector('.composer-send-btn');
     if (!input || !send) throw new Error(JSON.stringify({errors:window.feedbackErrors,html:document.body.innerHTML.slice(-4000)}));
     const snapshot = () => ({
@@ -93,6 +98,7 @@ const result = await renderEventStream([
 
 assert.equal(result.nativeCompaction.notice, undefined, 'Codex 自发或手动压缩只显示工作过程，不能显示输入框等待提示')
 assert.equal(result.nativeCompaction.editable, true, '手动或自发压缩期间仍允许编辑草稿')
+assert.equal(result.nativeCompaction.disabled, false, '手动或自发压缩期间发送按钮仍可加入等待队列')
 assert.equal(result.sameProvider.notice, undefined, '同 provider 切换不显示横幅')
 assert.equal(result.waiting.disabled, true)
 assert.equal(result.waiting.editable, false, '跨来源切换期间输入框直接禁用')

@@ -1,8 +1,6 @@
 import assert from 'node:assert/strict'
-import { createElement } from 'react'
-import { renderOpenChains } from './regression/open-chain'
+import { renderEventStream } from './regression/render-event-stream.mjs'
 import { mergeSessionEvent } from '../src/renderer/App.tsx'
-import { EventStream } from '../src/renderer/components/EventStream.tsx'
 import type { UAEvent } from '../src/shared/types.ts'
 
 function task(seq: number, state: UAEvent['state'], status: string): UAEvent {
@@ -24,25 +22,28 @@ const merged = [
 assert.equal(merged.length, 1, 'started/completed updates for one background task must replace in place')
 assert.equal(merged[0].state, 'success')
 
-const successMarkup = renderOpenChains(createElement(EventStream, {
-  sessionId: 'task-session', status: 'running',
-  events: [
+async function markup(event: UAEvent): Promise<string> {
+  // Markdown sanitization requires a DOM; exercise the actual disclosures in the browser.
+  return renderEventStream([
     { sessionId: 'task-session', seq: 0, ts: 1_000, type: 'user_message', payload: { text: 'run' } },
-    merged[0]
-  ]
-}))
+    event
+  ], 'running', 'task-session', { inspect: `(async () => {
+    for (let pass = 0; pass < 8; pass++) {
+      const closed = [...document.querySelectorAll('button.process-step-meta[aria-expanded=false],button.steps-fold-row[aria-expanded=false]')];
+      if (!closed.length) return document.body.innerHTML;
+      for (const button of closed) button.click();
+      await new Promise(resolve => setTimeout(resolve, 40));
+    }
+    throw Error('background task disclosures did not settle');
+  })()` })
+}
+const successMarkup = await markup(merged[0])
 assert.match(successMarkup, /后台任务 #6201/)
 assert.match(successMarkup, /Shell task completed with exit code 0/)
 assert.match(successMarkup, /task_output-6201.txt/)
 assert.doesNotMatch(successMarkup, /<details[^>]* open=""/, 'successful background tasks must stay collapsed by default')
 
-const failedMarkup = renderOpenChains(createElement(EventStream, {
-  sessionId: 'task-session', status: 'running',
-  events: [
-    { sessionId: 'task-session', seq: 0, ts: 1_000, type: 'user_message', payload: { text: 'run' } },
-    task(3, 'failed', 'failed')
-  ]
-}))
+const failedMarkup = await markup(task(3, 'failed', 'failed'))
 assert.match(failedMarkup, /background-task open state-failed/, 'failed background tasks must open by default')
 assert.match(failedMarkup, /Shell task failed with exit code 1/)
 

@@ -115,8 +115,8 @@ assert.deepEqual(rows.map((row) => ({ name: row.name, status: row.status, syncSe
 
 const emptyCapabilities = renderToStaticMarkup(createElement(AgentCapabilitiesPanel, { onOpenSync: () => undefined }))
 assert.match(emptyCapabilities, /aria-label="选择 Agent" aria-haspopup="listbox"/)
-assert.equal((emptyCapabilities.match(/role="option"/g) || []).length, INTERNAL_DISTRIBUTION ? 9 : 7, 'all distribution providers remain selectable before the inventory request finishes')
-for (const id of ['codex', 'claude', 'grok', 'kimi', 'deepseek', 'mcode', 'zcode']) {
+assert.equal((emptyCapabilities.match(/role="option"/g) || []).length, INTERNAL_DISTRIBUTION ? 10 : 8, 'all distribution providers remain selectable before the inventory request finishes')
+for (const id of ['codex', 'claude', 'grok', 'kimi', 'deepseek', 'mcode', 'zcode', 'qoder']) {
   assert.ok(emptyCapabilities.includes(`data-agent-id="${id}"`), id + ' is available in the selector')
 }
 assert.equal(emptyCapabilities.includes('data-agent-id="traex"'), INTERNAL_DISTRIBUTION)
@@ -125,6 +125,11 @@ assert.match(emptyCapabilities, /agent-icon-kimi/)
 assert.match(emptyCapabilities, /agent-icon-deepseek/)
 assert.match(emptyCapabilities, /agent-icon-mcode/)
 const nativePlugin: CapabilityInventoryItem = { ...grokItem('plugin'), agentId: 'claude', kind: 'plugin', manageable: true }
+const qoderPlugin = { ...nativePlugin, agentId: 'qoder' as const }
+assert.equal(canManageCapabilityItem(qoderPlugin, false), true)
+assert.equal(canManageCapabilityItem({ ...qoderPlugin, manageable: false }, true), false)
+assert.equal(betaCapabilityRemovalRequest(qoderPlugin)?.action, 'plugin-uninstall')
+assert.equal(usesDirectCapabilityRemoval(qoderPlugin), true)
 assert.equal(canManageCapabilityItem(nativePlugin, false), true, 'the native user-scope plugin action does not require a writable file-sync provider')
 assert.equal(canManageCapabilityItem({ ...nativePlugin, manageable: false }, true), false, 'read-only native scopes never become deletable from an Agent-level writable flag')
 assert.equal(canManageCapabilityItem({ ...nativePlugin, kind: 'skill' }, false), false, 'native plugin management does not grant deletion of unrelated private Skills')
@@ -145,7 +150,7 @@ assert.match(newTaskSource, new RegExp('grok:\\s*\\{\\s*install:'))
 assert.match(appSource, /<AgentIcon agentId=\{a\.id\} adapter=\{a\.adapter\}/)
 assert.match(readFileSync('src/renderer/components/AgentIcon.tsx', 'utf8'), /key === 'grok'/)
 assert.match(capabilitySource, new RegExp('grok:\\s*[\"\']Grok[\"\']'))
-assert.match(capabilitySource, /leftAgent === 'codex' && rightAgent === 'traex'/)
+assert.match(capabilitySource, /\['codex', 'traex', 'qoder'\]\.includes\(leftAgent\)/)
 assert.equal(capabilitySource.includes('任一侧为 <b>Claude Code</b>'), false)
 
 const resumeSource = readFileSync('src/renderer/components/ResumePanel.tsx', 'utf8')

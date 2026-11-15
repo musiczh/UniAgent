@@ -76,6 +76,10 @@ try {
     const ready = renderToStaticMarkup(render())
     assert.match(ready, /安装信息/); assert.match(ready, /默认参数/)
     assert.doesNotMatch(ready, /deepseek-step|一键安装|API Key|提示词安装/)
+    agent.lifecycle = { availability: 'needs-auth', lastReadyAt: 1 }
+    assert.match(renderToStaticMarkup(render()), /一键登录/, 'confirmed expired auth must override a previously ready state')
+    agent.incompatible = true
+    assert.match(renderToStaticMarkup(render()), /一键登录/, 'confirmed auth status overrides an outdated incompatible flag')
   }
   console.log('Agent setup UI: all four zero-agent entries, one detection action, text-sized disclosure, copy/retry, password gating, auth methods, waiting controls and standard ready detail passed')
 } finally {

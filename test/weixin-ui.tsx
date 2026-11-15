@@ -2,7 +2,6 @@ import assert from 'node:assert/strict'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { WeixinBindingView } from '../src/renderer/components/AssistantWeixinBinding'
-import { EventStream } from '../src/renderer/components/EventStream'
 import { SessionList } from '../src/renderer/components/SessionList'
 import { appendWeixinContext, splitWeixinContext, WEIXIN_CONTEXT_TEXT, type AssistantWeixinState } from '../src/shared/weixin'
 import { renderEventStream } from './regression/render-event-stream.mjs'
@@ -37,11 +36,14 @@ const input = appendWeixinContext('分析项目')
 assert.equal(splitWeixinContext(input)?.text,'分析项目')
 assert.equal(splitWeixinContext(input + '\n非末尾内容'),undefined)
 assert.equal(splitWeixinContext('<uniagent_weixin_context>unknown</uniagent_weixin_context>'),undefined)
-const bubble = (source: string) => renderToStaticMarkup(createElement(EventStream, { status: 'idle', events: [{ sessionId: 'weixin',seq: 1,ts: 1,type: 'user_message',payload: { source,text: input } }] }))
-assert.match(bubble('weixin'), /<div class="bubble"><span>分析项目<\/span><\/div>/)
-assert.match(bubble('weixin'),/user-weixin-source/)
-assert.ok(bubble('weixin').includes(`title="${WEIXIN_CONTEXT_TEXT}"`))
-assert.doesNotMatch(bubble('app'),/user-weixin-source/,'desktop text cannot acquire a trusted channel marker')
+const bubble = (source: string) => renderEventStream([{ sessionId: 'weixin',seq: 1,ts: 1,type: 'user_message',payload: { source,text: input } }], 'idle', 'weixin', {
+  inspect: `({ text: document.querySelector('.bubble').textContent.trim(), html: document.body.innerHTML })`
+})
+const weixinBubble = await bubble('weixin'), appBubble = await bubble('app')
+assert.equal(weixinBubble.text, '分析项目')
+assert.match(weixinBubble.html,/user-weixin-source/)
+assert.ok(weixinBubble.html.includes(`title="${WEIXIN_CONTEXT_TEXT}"`))
+assert.doesNotMatch(appBubble.html,/user-weixin-source/,'desktop text cannot acquire a trusted channel marker')
 const snapshot = { assistantId: 'personal',soul: '',soulRevision: 1,workingRules: '',workingRulesRevision: 1 }
 const session = (id: string, weixin: boolean) => ({ id,title: id,status: 'idle',createdAt: 1,origin: 'created',config: {agentId: 'codex',workdir: '',assistantSnapshot: snapshot,...(weixin ? {assistantChannel: 'weixin'} : {})} })
 const noop = () => {}

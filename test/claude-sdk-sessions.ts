@@ -51,11 +51,11 @@ try {
     assert.equal(restored.goal.status,'paused','startup must not advertise autonomous work without a live SDK owner')
     assert.equal(restored.goal.autonomous,false)
     restored.goal={...claudeGoal('live objective'),autonomous:true}
-    ;(orchestrator as any).claudeSdkRunners.set(restored.id,{hasClaudeSdkConnection:()=>true})
+    ;(orchestrator as any).sdkRunners.set(restored.id,{hasClaudeSdkConnection:()=>true})
     orchestrator.reconcileAgentConfigs()
     assert.equal(restored.goal.autonomous,true,'refresh must preserve a live native Goal')
   } finally {
-    ;(orchestrator as any).claudeSdkRunners.clear()
+    ;(orchestrator as any).sdkRunners.clear()
     orchestrator.disposeAll()
     await orchestrator.closeSessionLogs()
   }
@@ -67,6 +67,9 @@ try {
   assert.deepEqual(prefix.map((message:any)=>message.message.content), ['parent-first',[{type:'text',text:'parent-reply'}]], 'rewind must exclude the selected user turn and all its successors')
   assert.ok(prefix.every((message:any)=>![first,reply,second].includes(message.uuid)), 'SDK forks assign new native message identities')
   await operation('deleteSession', beforeRewind.sessionId)
+  entries.push({ ...entries[1], uuid: randomUUID(), parentUuid: second,
+    message: { role: 'assistant', model: 'fixture', content: [{ type: 'text', text: 'latest parent result before first send' }] } })
+  await writeFile(file, entries.map(entry => JSON.stringify(entry)).join('\n') + '\n')
   for (const prompt of ['side-first', 'side-second']) {
     const done = once(side, 'done')
     await side.startTurn(prompt)
@@ -74,6 +77,8 @@ try {
   }
   assert.ok(side.nativeThreadId())
   assert.notEqual(side.nativeThreadId(), parent)
+  assert.ok((await operation('history', side.nativeThreadId())).some((message: any) =>
+    message.message.content?.[0]?.text === 'latest parent result before first send'), 'SDK fork must read parent history at first send, not construction')
   const prompts = (await readFile(log, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
   assert.deepEqual(prompts.map(value=>value.session), [side.nativeThreadId(),side.nativeThreadId()], 'all side turns must resume the same isolated native fork')
   assert.deepEqual(prompts.map(value=>value.content), ['side-first','side-second'])

@@ -72,21 +72,44 @@ try {
     'the side runner must not fork the active parent from a second process')
   assert.equal(orchestrator.getSideStatus(session.id), 'running')
 
+  internals.sideNativeSessionIds.set(session.id, 'old-side-thread')
+  orchestrator.closeSideChat(session.id)
+  const newState = orchestrator.getSideState(session.id)
+  assert.equal(newState.hasLiveStreamer, false, '新对话按钮和状态读取不能提前冻结主会话上下文')
+  assert.equal(internals.sideNativeSessionIds.has(session.id), false, '新对话不能复用旧侧边原生线程')
+  assert.deepEqual(orchestrator.getSideEvents(session.id), [])
+  const latest = { sessionId: session.id, seq: 2, ts: 3, type: 'agent_message', state: 'running', payload: { id: 'latest', text: '点击新对话后、发送前主会话新增的结果' } }
+  internals.events.get(session.id).push(latest)
+  await orchestrator.sendSideMessage(session.id, '基于最新进展追问')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(capturedEvents, internals.events.get(session.id), '第一次发送时才读取当前主会话数据')
+  assert.ok((capturedEvents as unknown[]).includes(latest))
+  assert.deepEqual(capturedPriorSideEvents, [], '新分支不能带入上一次侧边对话')
+
   const owner = orchestrator.getSessionById(session.id)!
   internals.streamers.delete(session.id)
   const runner = internals.ensureMainStreamer(owner, agent) as AppServerRunner
   const queued = {
-    id: 'failed-head', prompt: 'must remain retryable', acceptedAt: 1, state: 'dispatching', attempts: 1
+    id: 'failed-head', prompt: 'provider startup input', acceptedAt: 1, state: 'dispatching', attempts: 1
   }
   internals.queues.set(session.id, [queued])
   owner.pendingQueue = [queued]
   owner.status = 'running'
   internals.activeQueueItems.set(session.id, queued.id)
+  internals.record(session.id, { type: 'user_message', payload: { text: queued.prompt } })
+  internals.record(session.id, { type: 'error', state: 'failed', payload: { message: 'provider startup failed' } })
+  internals.record(session.id, { type: 'turn_completed', state: 'failed', payload: {} })
   runner.emit('done', { nativeSessionId: 'main-thread', failed: true })
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(orchestrator.getSessionById(session.id)?.status, 'error')
-  assert.equal(orchestrator.getQueue(session.id)[0]?.state, 'pending',
-    'a provider startup failure must not acknowledge and delete its durable queue item')
+  assert.deepEqual(orchestrator.getQueue(session.id), [], 'failed input leaves the sent queue without automatic retry')
+  assert.deepEqual(store.load()[0].pendingQueue || [], [], 'restart cannot restore the failed input as pending')
+  assert.equal(internals.activeQueueItems.has(session.id), false)
+  assert.equal(internals.deferredDispatches.has(session.id), false, 'failure does not schedule another turn')
+  const failedEvents = await orchestrator.getEvents(session.id)
+  assert.equal(failedEvents.filter(event => event.type === 'user_message' && event.payload.text === queued.prompt).length, 1)
+  assert.ok(failedEvents.some(event => event.type === 'error' && event.payload.message === 'provider startup failed'))
+  assert.ok(failedEvents.some(event => event.type === 'turn_completed' && event.state === 'failed'))
   console.log('side-chat-running-fork: ok')
 } finally {
   AppServerRunner.prototype.startTurn = originalStartTurn

@@ -340,6 +340,14 @@ async function activeGoalTracksProviderTurnForSteer(): Promise<void> {
       'provider-turn-1',
       'Goal queue status must recover an active turn whose start notification predates the runner'
     )
+    const firstWait = events.findLast(event => event.type === 'queue_status')!
+    transport.emit('notification', 'queue/status', {
+      threadId: 'thread-1', turnId: 'provider-turn-1', state: 'ready'
+    })
+    transport.emit('notification', 'item/completed', {
+      threadId: 'thread-1', turnId: 'provider-turn-1',
+      item: { id: 'goal-answer', type: 'agentMessage', phase: 'final_answer', text: '后台任务已完成。' }
+    })
     transport.emit('notification', 'turn/started', {
       threadId: 'thread-1',
       turn: { id: 'provider-turn-1', status: 'inProgress', items: [] }
@@ -361,6 +369,22 @@ async function activeGoalTracksProviderTurnForSteer(): Promise<void> {
       threadId: 'child-thread',
       turn: { id: 'child-turn', status: 'inProgress', items: [] }
     })
+    transport.emit('notification', 'queue/status', {
+      threadId: 'thread-1', turnId: 'provider-turn-2', state: 'waiting', position: 215
+    })
+    const continuedWait = events.findLast(event => event.type === 'queue_status')!
+    assert.notEqual(continuedWait.payload.id, firstWait.payload.id,
+      'a Goal continuation must create a new queue node after the previous final reply')
+    assert.equal(continuedWait.payload.queue.waitedMs, 0,
+      'the new native turn must not include the previous turn queue duration')
+    assert.equal(continuedWait.payload.queue.turnId, 'provider-turn-2')
+    assert.ok(events.indexOf(continuedWait) > events.findIndex(event => event.payload.id === 'goal-answer'))
+    const queueCount = events.filter(event => event.type === 'queue_status').length
+    transport.emit('notification', 'queue/status', {
+      threadId: 'thread-1', turnId: 'provider-turn-1', state: 'waiting', position: 1
+    })
+    assert.equal(events.filter(event => event.type === 'queue_status').length, queueCount,
+      'late queue updates from the completed native turn must not overwrite the continuation')
     await runner.steer('直接发送')
 
     const steer = transport.calls.findLast((call) => call.method === 'turn/steer')

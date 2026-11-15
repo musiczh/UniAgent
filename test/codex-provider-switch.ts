@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import TOML from '@iarna/toml'
 import { AppServerRunner, configureCodexAppServerArgsProvider } from '../src/main/appServerAdapter'
 import type { AppServerRpc } from '../src/main/appServerTransport'
 import { Orchestrator } from '../src/main/orchestrator'
@@ -34,6 +35,8 @@ class Transport extends EventEmitter implements AppServerRpc {
   compactStarted!: () => void
   resumeUsage?: any
   historyPath?: string
+  configOverrides: Record<string, unknown> = {}
+  mcpPages: any[] = [{ data: [] }]
   async start(): Promise<void> {}
   notify(): void {}
   respond(): void {}
@@ -41,12 +44,14 @@ class Transport extends EventEmitter implements AppServerRpc {
   async dispose(): Promise<void> {}
   async request<T>(method: string, params: any): Promise<T> {
     this.requests.push({ method, params })
-    if (method === 'config/read') return { config: { model_provider: 'openai' } } as T
+    if (method === 'config/read') return { config: { model_provider: 'openai', ...this.configOverrides } } as T
+    if (method === 'mcpServerStatus/list') return this.mcpPages.shift() as T
     if (method === 'thread/resume') {
       if (this.resumeUsage) this.emit('notification', 'thread/tokenUsage/updated', { threadId: params.threadId, tokenUsage: this.resumeUsage })
       return { thread: { id: params.threadId }, model: params.model, modelProvider: params.modelProvider } as T
     }
     if (method === 'thread/goal/get') return { goal: null } as T
+    if (method === 'thread/fork') return { thread: { id: `${params.threadId}-provider`, model: params.model, modelProvider: params.modelProvider } } as T
     if (method === 'turn/start') return { turn: { id: 'native-next-turn' } } as T
     if (method === 'thread/read') return { thread: { id: params.threadId, path: this.historyPath } } as T
     if (method === 'thread/compact/start') {
@@ -60,6 +65,50 @@ class Transport extends EventEmitter implements AppServerRpc {
 
 configureCodexAppServerArgsProvider(config => config.modelSource?.kind === 'third-party'
   ? ['-c', `model_provider=${JSON.stringify(codexSessionProvider(config.modelSource))}`] : [])
+async function exportCompactionCase(failed: boolean): Promise<void> {
+  let started!: () => void
+  const ready = new Promise<void>(resolve => { started = resolve })
+  const wire = new Transport(); wire.compactStarted = started
+  const runner = new AppServerRunner('export-native', { n: 0 }, agent, native, 'source-copy', undefined, () => wire)
+  try {
+    let settled = false
+    const operation = runner.compactForExport().finally(() => { settled = true })
+    const result = failed ? assert.rejects(operation) : operation
+    await ready
+    const resume = wire.requests.find(request => request.method === 'thread/resume')!.params
+    assert.equal(resume.modelProvider, 'openai', 'export uses source provider without portable/provider-switch overrides')
+    assert.equal(resume.config['model_providers.uniagent-portable-openai.capabilities.remote_compaction'], undefined)
+    wire.emit('notification', 'item/completed', { threadId: 'source-copy', turnId: 'compact-turn', item: { id: 'compact-item', type: 'contextCompaction' } })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(settled, false, 'item completion is insufficient without native turn terminal state')
+    wire.emit('notification', 'turn/completed', { threadId: 'source-copy', turn: { id: 'compact-turn', status: failed ? 'failed' : 'completed' } })
+    await result
+  } finally { runner.dispose() }
+}
+await exportCompactionCase(false)
+await exportCompactionCase(true)
+const budgetCatalog = join(await mkdtemp(join(tmpdir(), 'fork-model-budget-')), 'catalog.json')
+await writeFile(budgetCatalog, JSON.stringify({ models: [{ slug: native.model, context_window: 500000, supports_search_tool: false }] }))
+for (const adapter of ['codex', 'traex'] as const) {
+  const wire = new Transport()
+  wire.configOverrides = { model_context_window: 200000, model_catalog_json: budgetCatalog }
+  wire.mcpPages = [{ data: [{ tools: { first: { description: 'read' } } }], nextCursor: 'page2' }, { data: [{ tools: { second: { description: 'write' } } }] }]
+  const runner = new AppServerRunner('fork-capacity', { n: 0 }, { ...agent, id: adapter, adapter }, { ...native, agentId: adapter }, 'target-copy', undefined, () => wire)
+  try {
+    const capacity = await runner.validateForkContext(10000, 500000)
+    assert.equal(capacity.window, 200000, 'native runtime limits override larger model declarations')
+    assert.equal(wire.requests.filter(row => row.method === 'mcpServerStatus/list').length, 2)
+    assert.ok(!wire.requests.some(row => row.method === 'turn/start' || row.method === 'thread/compact/start'), 'validation does not generate a model turn or replay business work')
+    wire.mcpPages = [{ data: [{ tools: { oversized: { description: 'x'.repeat(380000) } } }] }]
+    await assert.rejects(runner.validateForkContext(10000, 500000), /超过/)
+    wire.mcpPages = [{}]
+    await assert.rejects(runner.validateForkContext(10000, 500000), /工具容量暂无法确认/)
+    await writeFile(budgetCatalog, JSON.stringify({ models: [{ slug: native.model, context_window: 500000, supports_search_tool: true }] }))
+    wire.mcpPages = [{ data: [{ tools: { deferred: { name: 'deferred', description: 'x'.repeat(380000), outputSchema: { description: 'output'.repeat(100000) } } } }] }]
+    assert.equal((await runner.validateForkContext(10000, 500000)).overheadTokens, 50000, 'deferred schemas and output definitions are not eagerly injected input')
+    await writeFile(budgetCatalog, JSON.stringify({ models: [{ slug: native.model, context_window: 500000, supports_search_tool: false }] }))
+  } finally { runner.dispose() }
+}
 async function adapterCase(mode: 'success' | 'failed' | 'disconnect' | 'missing' | 'too-large' | 'item-then-failed', compactModel = native): Promise<void> {
   let started!: () => void
   const startedPromise = new Promise<void>(resolve => { started = resolve })
@@ -79,13 +128,12 @@ async function adapterCase(mode: 'success' | 'failed' | 'disconnect' | 'missing'
     const rejection = mode === 'success' ? undefined : assert.rejects(operation)
     await startedPromise
     const wire = transports.at(-1)!
-    const resume = wire.requests.find(request => request.method === 'thread/resume')!.params
-    const provider = compactModel === native ? 'uniagent-portable-openai' : 'uniagent-kimi'
+    const resume = wire.requests.find(request => ['thread/resume', 'thread/fork'].includes(request.method))!.params
+    const provider = compactModel === native ? 'openai' : 'uniagent-kimi'
     assert.equal(resume.model, compactModel === native ? native.model : 'k3-256k')
     assert.equal(resume.modelProvider, provider, '切换压缩必须使用目标模型的实际上下文规则')
-    if (compactModel === native) assert.equal(resume.config['model_providers.uniagent-portable-openai.requires_openai_auth'], true)
-    assert.equal(resume.config[`model_providers.${provider}.capabilities.remote_compaction`], 'unsupported')
-    const notify = (method: string, extra: any): void => { wire.emit('notification', method, { threadId: 'existing-thread', turnId: 'compact-turn', ...extra }) }
+    assert.equal(resume.config[`model_providers.${provider}.capabilities.remote_compaction`], undefined, 'destination compaction keeps its canonical provider')
+    const notify = (method: string, extra: any): void => { wire.emit('notification', method, { threadId: runner.nativeThreadId(), turnId: 'compact-turn', ...extra }) }
     if (mode === 'disconnect') {
       wire.emit('disconnect', 'connection lost')
     } else if (mode === 'failed') {
@@ -117,12 +165,12 @@ async function adapterCase(mode: 'success' | 'failed' | 'disconnect' | 'missing'
         // 拿旧模型恢复线程，codex 会对已记录为目标模型的 rollout 再发一条
         // 反向的 resume 模型不一致警告。
         await runner.getContextTokens()
-        const review = transports.at(-1)!.requests.filter(request => request.method === 'thread/resume').at(-1)!.params
+        const review = transports.at(-1)!.requests.filter(request => ['thread/resume', 'thread/fork'].includes(request.method)).at(-1)!.params
         assert.equal(review.model, 'k3-256k')
         assert.equal(review.modelProvider, 'uniagent-kimi')
       }
       await runner.applyProviderConfig(kimi, 249036)
-      assert.equal(transports.at(-1)!.requests.find(request => request.method === 'thread/resume')!.params.modelProvider, 'uniagent-kimi')
+      assert.equal(transports.at(-1)!.requests.find(request => ['thread/resume', 'thread/fork'].includes(request.method))!.params.modelProvider, 'uniagent-kimi')
       const occupancy = events.filter(event => event.payload?.kind === 'context').at(-1)!.payload.usage
       assert.equal(occupancy.contextWindow, 249036, '切换完成即发布目标窗口，不能等首条消息才更新')
       assert.equal(occupancy.contextTokens, 4000, '发布压缩后的占用，而非旧累计账单')
@@ -200,7 +248,7 @@ async function encryptedCompactionCase(): Promise<void> {
   class CompactTransport extends Transport {
     async request<T>(method: string, params: any): Promise<T> {
       if (method !== 'thread/compact/start') return super.request(method, params)
-      providers.push(this.requests.findLast(request => request.method === 'thread/resume')!.params.modelProvider)
+      providers.push(this.requests.findLast(request => ['thread/resume', 'thread/fork'].includes(request.method))!.params.modelProvider)
       const turnId = `compact-${++sequence}`
       const item = { id: `${turnId}-item`, type: 'contextCompaction' }
       this.emit('notification', 'turn/started', { threadId: params.threadId, turn: { id: turnId } })
@@ -230,15 +278,16 @@ async function encryptedCompactionCase(): Promise<void> {
   } finally { runner.dispose(); await rm(root, { recursive: true, force: true }) }
 }
 
-async function overflowRecoveryCase(mode: 'success' | 'exhausted' | 'other' | 'interrupted' | 'compact-failed' | 'cancel-recovery' | 'completion-only'): Promise<void> {
+async function overflowRecoveryCase(mode: 'success' | 'exhausted' | 'other' | 'interrupted' | 'compact-failed' | 'cancel-recovery' | 'completion-only' | 'remote-compact' | 'binding-failed', config = kimi, side = false): Promise<void> {
   let retryStarted!: () => void
   const retry = new Promise<void>(resolve => { retryStarted = resolve })
   class TurnTransport extends Transport {
     async request<T>(method: string, params: any): Promise<T> {
       if (method === 'thread/compact/start') {
+        this.requests.push({ method, params })
         if (mode === 'compact-failed') throw new Error('compact quota exhausted')
         queueMicrotask(() => {
-          const common = { threadId: 'existing-thread', turnId: 'compact-turn' }
+          const common = { threadId: params.threadId, turnId: 'compact-turn' }
           this.emit('notification', 'turn/started', { ...common, turn: { id: 'compact-turn' } })
           if (mode === 'cancel-recovery') runner.interrupt()
           this.emit('notification', 'item/started', { ...common, item: { id: 'compact-item', type: 'contextCompaction' } })
@@ -255,20 +304,26 @@ async function overflowRecoveryCase(mode: 'success' | 'exhausted' | 'other' | 'i
     }
   }
   const wire = new TurnTransport()
-  const runner = new AppServerRunner('switch-overflow', { n: 0 }, agent, kimi, 'existing-thread', undefined, () => wire)
+  const runner = new AppServerRunner('switch-overflow', { n: 0 }, agent, config, 'existing-thread', undefined, () => wire)
+  const parent = side ? new AppServerRunner('switch-overflow', { n: 0 }, agent, native, 'parent-thread', undefined, () => wire) : undefined
+  if (parent) runner.setForkPreparation(async () => { throw new Error('existing side must not fork again') }, parent)
   const events: any[] = [], done: any[] = []
   let ended!: () => void
   const terminal = new Promise<void>(resolve => { ended = resolve })
   runner.on('event', event => events.push(event))
   runner.on('done', result => { done.push(result); ended() })
-  const error = { message: mode === 'other' ? 'API key is invalid' : "Codex ran out of room in the model's context window.", codexErrorInfo: mode === 'other' ? 'other' : 'contextWindowExceeded' }
-  const notify = (method: string, turnId: string, extra: any): void => { wire.emit('notification', method, { threadId: 'existing-thread', turnId, ...extra }) }
+  if (mode === 'binding-failed') runner.on('nativeThreadRebound', () => { throw new Error('binding write failed') })
+  const error = mode === 'remote-compact'
+    ? { message: 'Error running remote compact task: {"error":{"message":"Your input exceeds the context window of this model.","code":"context_length_exceeded"}}', codexErrorInfo: 'other' }
+    : { message: mode === 'other' ? 'API key is invalid' : "Codex ran out of room in the model's context window.", codexErrorInfo: mode === 'other' ? 'other' : 'contextWindowExceeded' }
+  const notify = (method: string, turnId: string, extra: any): void => { wire.emit('notification', method, { threadId: runner.nativeThreadId(), turnId, ...extra }) }
   try {
     await runner.startTurn('原始问题', [{ kind: 'image', name: 'fixture.png', path: '/fixture.png' }])
+    if (mode === 'remote-compact') notify('item/started', 'turn-1', { item: { id: 'failed-auto-compact', type: 'contextCompaction' } })
     if (mode === 'interrupted') runner.interrupt()
     if (mode !== 'completion-only') notify('error', 'turn-1', { error })
     notify('turn/completed', 'turn-1', { turn: { id: 'turn-1', status: mode === 'interrupted' ? 'interrupted' : 'failed', error } })
-    const recover = ['success', 'exhausted', 'completion-only'].includes(mode)
+    const recover = ['success', 'exhausted', 'completion-only', 'remote-compact'].includes(mode)
     const settled = recover ? retry : terminal
     await Promise.race([settled, new Promise((_, reject) => {
       const timer = setTimeout(() => reject(new Error(JSON.stringify(events))), 2000)
@@ -279,10 +334,20 @@ async function overflowRecoveryCase(mode: 'success' | 'exhausted' | 'other' | 'i
     assert.ok(starts[0].params.input.some((item: any) => item.type === 'localImage' && item.path === '/fixture.png'))
     assert.equal(starts.length, recover ? 2 : 1, '仅明确超限且未中断时自动接续一次')
     if (recover) {
+      const provider = config === native ? 'uniagent-portable-openai' : 'uniagent-kimi'
+      const compactBinding = wire.requests.find(request => ['thread/resume', 'thread/fork'].includes(request.method) &&
+        request.params.config?.[`model_providers.${provider}.capabilities.remote_compaction`] === 'unsupported'),
+        binding = wire.requests.findLast(request => ['thread/resume', 'thread/fork'].includes(request.method))!.params
+      assert.ok(compactBinding, 'side recovery must also enable local compaction on its own branch')
+      assert.equal(compactBinding.params.threadId, 'existing-thread', 'recovery starts from its independent branch')
+      assert.equal(binding.modelProvider, config === native ? 'openai' : 'uniagent-kimi', 'automatic retry returns to the normal Provider')
+      assert.equal(binding.config?.[`model_providers.${provider}.capabilities.remote_compaction`], undefined, 'local compression override cannot leak into the retried business turn')
+      assert.equal(wire.requests.filter(request => request.method === 'thread/fork').length, config === native ? 2 : 0)
+      if (config === native) assert.ok(wire.requests.some(request => request.method === 'thread/archive' && request.params.threadId === 'existing-thread-provider'), 'completed temporary compression branch is archived')
       assert.deepEqual(starts[1].params.input, [], '接续原生历史中已保存的输入，不重复提交用户问题和附件')
       assert.equal(done.length, 0, '压缩接续期间不能提前结束逻辑回合或调度下一条消息')
       assert.equal(events.some(event => event.type === 'error'), false, '可恢复的首次超限显示等待提示')
-      notify('error', 'turn-1', { error })
+      wire.emit('notification', 'error', { threadId: 'existing-thread', turnId: 'turn-1', error })
       assert.equal(events.some(event => event.type === 'error'), false, '迟到的旧错误不能破坏压缩接续')
       notify('item/started', 'turn-2', { item: { id: 'auto-compact', type: 'contextCompaction' } })
       notify('item/completed', 'turn-2', { item: { id: 'auto-compact', type: 'contextCompaction' } })
@@ -292,15 +357,19 @@ async function overflowRecoveryCase(mode: 'success' | 'exhausted' | 'other' | 'i
       assert.equal(wire.requests.filter(item => item.method === 'turn/start').length, 2, '第二次超限不再重试')
     }
     assert.equal(done.length, 1)
+    const branchIds = new Set(['existing-thread', ...wire.requests.filter(request => request.method === 'thread/fork').map(request => `${request.params.threadId}-provider`)])
+    assert.ok(wire.requests.filter(request => ['turn/start', 'thread/compact/start', 'turn/interrupt'].includes(request.method))
+      .every(request => branchIds.has(request.params.threadId)), '恢复操作只能作用于当前分支及它的 fork，不能压缩或中断主会话')
+    assert.equal(runner.nativeThreadId(), config === native && recover ? 'existing-thread-provider-provider' : 'existing-thread', 'failure or interruption retains the original binding')
     assert.ok(events.filter(event => event.type === 'context_compaction').every(event => event.payload.reason === undefined),
       '运行中超限恢复及 Codex 自发压缩都不能显示跨 provider 切换输入框提示')
-    assert.equal(!!done[0].failed, ['exhausted', 'other', 'compact-failed'].includes(mode))
+    assert.equal(!!done[0].failed, ['exhausted', 'other', 'compact-failed', 'binding-failed'].includes(mode))
     if (mode === 'cancel-recovery') assert.equal(done[0].interrupted, true)
-  } finally { runner.dispose() }
+  } finally { runner.dispose(); parent?.dispose() }
 }
 
-async function orchestratorCase({ fail = false, applyFails = false, previous = native, target = kimi, contextTokens, compact = true, afterCompact = 4000 }: {
-  fail?: boolean; applyFails?: boolean; previous?: SessionConfig; target?: SessionConfig; contextTokens?: number; compact?: boolean; afterCompact?: number
+async function orchestratorCase({ fail = false, applyFails = false, persistFails = false, previous = native, target = kimi, contextTokens, compact = true, afterCompact = 4000 }: {
+  fail?: boolean; applyFails?: boolean; persistFails?: boolean; previous?: SessionConfig; target?: SessionConfig; contextTokens?: number; compact?: boolean; afterCompact?: number
 } = {}): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'uniagent-provider-switch-'))
   const store = new SessionStore(join(root, 'sessions.json'))
@@ -313,6 +382,7 @@ async function orchestratorCase({ fail = false, applyFails = false, previous = n
   const gate = new Promise<void>(resolve => { release = resolve })
   const calls: string[] = []
   let didCompact = false
+  let boundNativeId = 'existing-thread'
   const fake = {
     getContextTokens: async (config: SessionConfig): Promise<number | undefined> => { assert.equal(config.model, target.model); calls.push('usage'); await gate; return didCompact ? afterCompact : contextTokens },
     compactForProviderSwitch: async (limit: number, config: SessionConfig): Promise<void> => {
@@ -321,8 +391,9 @@ async function orchestratorCase({ fail = false, applyFails = false, previous = n
         '切换容量必须采用目标目录的有效窗口，不能继续使用未知模型的 272K 上限')
       calls.push('compact'); await gate; if (fail) throw new Error('quota exhausted'); didCompact = true
     },
-    applyProviderConfig: async (config: SessionConfig): Promise<void> => { calls.push('apply'); assert.equal(config.model, target.model); if (applyFails) throw new Error('provider unavailable') },
-    updateConfig: (): void => { calls.push('restore') }
+    applyProviderConfig: async (config: SessionConfig): Promise<void> => { calls.push('apply'); assert.equal(config.model, target.model); if (applyFails) throw new Error('provider unavailable'); boundNativeId = 'provider-fork' },
+    nativeThreadId: () => boundNativeId,
+    restoreProviderConfig: (_config: SessionConfig, id: string): void => { calls.push('restore'); boundNativeId = id }
   }
   ;(orchestrator as any).ensureStreamerForNativeAction = () => fake
   ;(orchestrator as any).assertSessionNotExternallyOccupied = async () => {}
@@ -335,9 +406,11 @@ async function orchestratorCase({ fail = false, applyFails = false, previous = n
       assert.equal(calls.length, 0, '忙碌时不得准备另一厂商的连接或压缩历史')
     }
     current.status = 'idle'
+    if (persistFails) store.saveOrThrow = () => { throw new Error('disk write failed') }
     const switching = orchestrator.updateSessionConfig('session', target)
     const tooLarge = compact && afterCompact >= Math.floor(agent.models.find(model => model.id === target.model)!.contextWindow! * 0.95)
-    const rejected = fail || applyFails || tooLarge ? assert.rejects(switching, /quota|provider|上下文/) : undefined
+    const unsuccessful = fail || applyFails || tooLarge || persistFails
+    const rejected = unsuccessful ? assert.rejects(switching, /quota|provider|上下文|disk/) : undefined
     await Promise.resolve(); await Promise.resolve()
     assert.equal(current.config.model, previous.model)
     await assert.rejects(orchestrator.updateSessionConfig('session', { effort: 'high' }), /原生操作/)
@@ -345,9 +418,9 @@ async function orchestratorCase({ fail = false, applyFails = false, previous = n
     release()
     if (rejected) await rejected
     else await switching
-    assert.equal(current.config.model, fail || applyFails || tooLarge ? previous.model : target.model)
-    assert.equal(current.nativeSessionId, 'existing-thread', '切换成功或失败均保留原生会话 ID')
-    assert.deepEqual(calls, ['usage', ...(compact ? ['compact', ...(fail ? [] : ['usage'])] : []), ...(fail || tooLarge ? [] : ['apply']), ...(fail || applyFails || tooLarge ? ['restore'] : [])])
+    assert.equal(current.config.model, unsuccessful ? previous.model : target.model)
+    assert.equal(current.nativeSessionId, unsuccessful ? 'existing-thread' : 'provider-fork', 'successful provider switch commits the fork; failures retain the original binding')
+    assert.deepEqual(calls, ['usage', ...(compact ? ['compact', ...(fail ? [] : ['usage'])] : []), ...(fail || tooLarge ? [] : ['apply']), ...(unsuccessful ? ['restore'] : [])])
     const events = await orchestrator.getEvents('session')
     assert.equal(events.filter(event => event.type === 'system_notice').some(event => String(event.payload?.text || '').includes('切换')), false,
       '切换过程与结果由卡片承载，不再发纯文本提示')
@@ -359,7 +432,7 @@ async function orchestratorCase({ fail = false, applyFails = false, previous = n
     assert.equal(card.payload.toModel, target.model)
     assert.ok(card.payload.fromLabel && card.payload.toLabel, '卡片携带展示用模型名')
     assert.equal(typeof card.payload.startedAt, 'number')
-    if (!fail && !applyFails && !tooLarge) {
+    if (!unsuccessful) {
       assert.equal(card.state, 'success')
       assert.equal(card.payload.compacted, compact)
       assert.equal(card.payload.step, 'apply')
@@ -369,7 +442,9 @@ async function orchestratorCase({ fail = false, applyFails = false, previous = n
       assert.ok(card.payload.error, '失败卡片必须给出原因')
     }
     assert.equal((orchestrator as any).nativeActionReservations.has('session'), false)
-    assert.equal(new SessionStore(join(root, 'sessions.json')).load()[0].config.model, fail || applyFails || tooLarge ? previous.model : target.model)
+    const persisted = new SessionStore(join(root, 'sessions.json')).load()[0]
+    assert.equal(persisted.config.model, unsuccessful ? previous.model : target.model)
+    assert.equal(persisted.nativeSessionId, unsuccessful ? 'existing-thread' : 'provider-fork', 'the durable binding must agree with the confirmed config')
   } finally { await rm(root, { recursive: true, force: true }) }
 }
 
@@ -386,6 +461,8 @@ async function warningFoldingCase(): Promise<void> {
     getContextTokens: async (): Promise<number> => { await gate; return 20000 },
     compactForProviderSwitch: async (): Promise<void> => {},
     applyProviderConfig: async (): Promise<void> => {},
+    nativeThreadId: () => 'existing-thread',
+    restoreProviderConfig: (): void => {},
     updateConfig: (): void => {}
   }
   ;(orchestrator as any).ensureStreamerForNativeAction = () => fake
@@ -458,6 +535,13 @@ async function providerRoundTripCase(chain: SessionConfig[]): Promise<void> {
   let turnNumber = 0
   class RoundTripTransport extends Transport {
     async request<T>(method: string, params: any): Promise<T> {
+      if (method === 'thread/fork') {
+        this.requests.push({ method, params })
+        return { thread: { id: `${params.threadId}-fork-${transports.length}`, model: params.model, modelProvider: params.modelProvider } } as T
+      }
+      if (method === 'thread/resume') {
+        assert.equal(params.threadId, 'roundtrip-thread', 'provider changes fork history instead of resuming another provider in place')
+      }
       const result = await super.request<T>(method, params)
       return method === 'turn/start' ? { turn: { id: `roundtrip-${++turnNumber}` } } as T : result
     }
@@ -469,33 +553,163 @@ async function providerRoundTripCase(chain: SessionConfig[]): Promise<void> {
   })
   runner.on('event', event => events.push(event))
   try {
+    let previousThreadId = runner.nativeThreadId()
     for (const [index, config] of chain.entries()) {
       await runner.applyProviderConfig(config)
-      assert.equal(runner.nativeThreadId(), 'roundtrip-thread')
+      const threadId = runner.nativeThreadId()
+      assert.equal(threadId === previousThreadId, index === 0, 'cross-provider changes use a new native thread while retaining the host runner')
       const wire = transports.at(-1)!
-      const resume = wire.requests.find(request => request.method === 'thread/resume')!.params
+      const operation = wire.requests.find(request => request.method === (index === 0 ? 'thread/resume' : 'thread/fork'))!.params
+      assert.equal(operation.threadId, index === 0 ? threadId : previousThreadId, 'fork references the complete previous history')
       const model = config === native ? native.model : config === kimi ? 'k3-256k' : 'deepseek-flash'
-      assert.equal(resume.model, model)
-      assert.equal(resume.modelProvider, config === native ? 'openai' : codexSessionProvider(config.modelSource!))
+      assert.equal(operation.model, model)
+      assert.equal(operation.modelProvider, config === native ? 'openai' : codexSessionProvider(config.modelSource!))
       const done = new Promise<any>(resolve => runner.once('done', resolve))
       await runner.startTurn(`message-${index}`)
       const start = wire.requests.find(request => request.method === 'turn/start')!.params
       assert.equal(start.model, model, '切换后新发送的消息必须使用目标模型')
       assert.deepEqual(start.input, [{ type: 'text', text: `message-${index}`, text_elements: [] }])
       const turnId = `roundtrip-${turnNumber}`
-      wire.emit('notification', 'item/completed', { threadId: 'roundtrip-thread', turnId, item: { id: `reply-${index}`, type: 'agentMessage', text: `reply-${index}` } })
-      wire.emit('notification', 'turn/completed', { threadId: 'roundtrip-thread', turn: { id: turnId, status: 'completed' } })
+      wire.emit('notification', 'item/completed', { threadId, turnId, item: { id: `reply-${index}`, type: 'agentMessage', text: `reply-${index}` } })
+      wire.emit('notification', 'turn/completed', { threadId, turn: { id: turnId, status: 'completed' } })
       const result = await done
       assert.equal(!!result.failed, false)
       assert.equal(!!result.interrupted, false)
       assert.ok(events.some(event => event.type === 'agent_message' && event.payload.text === `reply-${index}`), '切换后必须完成真实消息事件链，不能只验证配置值')
+      previousThreadId = threadId
     }
     assert.equal(transports.length, chain.length, '每次跨来源都重新连接，切回官方时不得沿用第三方路由')
     assert.ok(transports.every(wire => !wire.requests.some(request => request.method === 'thread/start')), '往返过程中不能新建空白会话')
   } finally { runner.dispose() }
 }
 
+async function providerForkFailureCase(mode: 'remote' | 'identity' | 'model' | 'provider' | 'goal'): Promise<void> {
+  const wires: Transport[] = [], events: UAEvent[] = []
+  class ForkTransport extends Transport {
+    async request<T>(method: string, params: any): Promise<T> {
+      if (method === 'thread/fork') {
+        this.requests.push({ method, params })
+        if (mode === 'remote') throw new Error('fork rejected')
+        return { thread: { id: mode === 'identity' ? params.threadId : 'new-provider-thread' },
+          model: mode === 'model' ? 'wrong-model' : params.model,
+          modelProvider: mode === 'provider' ? 'wrong-provider' : params.modelProvider } as T
+      }
+      if (method === 'thread/goal/get' && params.threadId === 'new-provider-thread' && mode === 'goal') throw new Error('goal check rejected')
+      return super.request(method, params)
+    }
+  }
+  const runner = new AppServerRunner('fork-failure', { n: 0 }, agent, deepseek, 'original-thread', undefined, () => {
+    const wire = new ForkTransport(); wires.push(wire); return wire
+  })
+  runner.on('event', event => events.push(event))
+  try {
+    await runner.ensureThreadReady()
+    await assert.rejects(runner.applyProviderConfig(kimi))
+    assert.equal(runner.nativeThreadId(), 'original-thread', `${mode}: failed fork must retain the original binding`)
+    await runner.ensureThreadReady()
+    const restored = wires.at(-1)!.requests.find(row => row.method === 'thread/resume')!.params
+    assert.equal(restored.modelProvider, 'uniagent-deepseek')
+    assert.equal(restored.model, 'deepseek-flash')
+    assert.equal(events.some(event => event.payload?.kind === 'model_provider_fork'), false, 'failed validation cannot announce a completed provider switch')
+  } finally { runner.dispose() }
+}
+
+async function portableRoundTripCase(mode: 'success' | 'local-fork' | 'return-fork' | 'archive' | 'too-large'): Promise<void> {
+  class PortableTransport extends Transport {
+    async request<T>(method: string, params: any): Promise<T> {
+      if (method === 'thread/fork' && (mode === 'local-fork' && params.modelProvider === 'uniagent-portable-openai' ||
+        mode === 'return-fork' && params.modelProvider === 'openai')) throw new Error(mode)
+      if (method === 'thread/archive' && mode === 'archive') throw new Error(mode)
+      if (method !== 'thread/compact/start') return super.request(method, params)
+      this.requests.push({ method, params })
+      const common = { threadId: params.threadId, turnId: 'portable-compact' }
+      this.emit('notification', 'turn/started', { ...common, turn: { id: common.turnId } })
+      this.emit('notification', 'item/started', { ...common, item: { id: 'portable-item', type: 'contextCompaction' } })
+      this.emit('notification', 'thread/tokenUsage/updated', { ...common, tokenUsage: { last: { totalTokens: mode === 'too-large' ? 200000 : 4000 } } })
+      this.emit('notification', 'item/completed', { ...common, item: { id: 'portable-item', type: 'contextCompaction' } })
+      this.emit('notification', 'turn/completed', { ...common, turn: { id: common.turnId, status: 'completed' } })
+      return {} as T
+    }
+  }
+  const wires: PortableTransport[] = []
+  const spawnedArgs: string[][] = []
+  const runner = new AppServerRunner('portable-roundtrip', { n: 0 }, agent, native, 'original-thread', undefined, options => {
+    spawnedArgs.push(options.args)
+    const wire = new PortableTransport(); wires.push(wire); return wire
+  })
+  try {
+    const compact = (runner as any).runCompaction(true, 200000)
+    if (mode === 'success') {
+      await compact
+      assert.equal(runner.nativeThreadId(), 'original-thread-provider-provider')
+      const operations = wires.flatMap(wire => wire.requests)
+      assert.deepEqual(operations.filter(request => request.method === 'thread/fork').map(request => request.params.modelProvider),
+        ['uniagent-portable-openai', 'openai'])
+      assert.equal(operations.find(request => request.method === 'thread/archive')!.params.threadId, 'original-thread-provider')
+      const overrides = spawnedArgs.find(args => args.some(arg => arg.includes('uniagent-portable-openai')))!
+        .filter(arg => arg.startsWith('model_providers.uniagent-portable-openai.'))
+      const provider = (TOML.parse(overrides.join('\n')) as any).model_providers['uniagent-portable-openai']
+      assert.deepEqual(provider.env_http_headers, { 'OpenAI-Organization': 'OPENAI_ORGANIZATION', 'OpenAI-Project': 'OPENAI_PROJECT' }, 'native CLI header overrides must be TOML maps')
+      const id = runner.nativeThreadId()!
+      ;(runner as any).invalidateReadyConnection(true)
+      assert.equal(await runner.ensureThreadReady(), id, 'cold restore resumes the completed normal Provider branch')
+      const restored = wires.at(-1)!.requests.find(request => request.method === 'thread/resume')!.params
+      assert.equal(restored.modelProvider, 'openai')
+      assert.equal(restored.config['model_providers.uniagent-portable-openai.capabilities.remote_compaction'], undefined)
+    } else {
+      await assert.rejects(compact, /fork|archive|超过/)
+      assert.equal(runner.nativeThreadId(), 'original-thread', 'every failed portable stage keeps the original durable branch')
+      await runner.ensureThreadReady()
+      assert.equal(wires.at(-1)!.requests.find(request => request.method === 'thread/resume')!.params.modelProvider, 'openai')
+    }
+    assert.equal(wires.flatMap(wire => wire.requests).some(request => request.method === 'turn/start'), false, 'compression preparation cannot resend business input')
+  } finally { runner.dispose() }
+}
+
+async function reboundPersistenceCase(side: boolean, fails: boolean): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), 'uniagent-compaction-binding-'))
+  const store = new SessionStore(join(root, 'sessions.json'))
+  const session: Session = { id: 'rebound', title: '保留原任务', config: native, nativeSessionId: 'main-thread', status: 'running', createdAt: Date.now(), origin: 'created', readOnly: false }
+  store.save([session])
+  store.saveSideChats([{ sessionId: session.id, config: native, nativeSessionId: 'side-thread', events: [], queue: [] }])
+  const orchestrator = new Orchestrator(() => agent, store, join(root, 'artifacts'), join(root, 'logs'))
+  orchestrator.loadPersisted()
+  const wire = new Transport(), runner = new AppServerRunner(session.id, { n: 0 }, agent, native, side ? 'side-thread' : 'main-thread', undefined, () => wire)
+  const current = orchestrator.getSessionById(session.id)!
+  const owner = orchestrator as any
+  const map = side ? owner.sideStreamers : owner.streamers
+  map.set(session.id, runner)
+  owner.bindAppServerDiagnostics(runner, session.id, side ? 'side' : 'main')
+  const pending = [{ id: 'retained-queue', prompt: '下一条输入' }]
+  ;(side ? owner.sideQueues : owner.queues).set(session.id, pending)
+  const originalMainSave = store.saveOrThrow.bind(store), originalSideSave = store.saveSideChatsOrThrow.bind(store)
+  if (fails) {
+    if (side) store.saveSideChatsOrThrow = () => { throw new Error('side write failed') }
+    else store.saveOrThrow = () => { throw new Error('main write failed') }
+  }
+  try {
+    if (fails) assert.throws(() => runner.emit('nativeThreadRebound', 'returned-thread'), /write failed/)
+    else runner.emit('nativeThreadRebound', 'returned-thread')
+    assert.equal(current.nativeSessionId, !side && !fails ? 'returned-thread' : 'main-thread')
+    assert.equal(owner.sideNativeSessionIds.get(session.id), side && !fails ? 'returned-thread' : 'side-thread')
+    assert.equal((side ? owner.sideQueues : owner.queues).get(session.id), pending, 'rebinding preserves the pending queue')
+    assert.equal(current.title, session.title)
+    assert.deepEqual(current.config, native)
+    const restoredStore = new SessionStore(join(root, 'sessions.json'))
+    assert.equal(restoredStore.load()[0].nativeSessionId, !side && !fails ? 'returned-thread' : 'main-thread')
+    assert.equal(restoredStore.loadSideChats()[0].nativeSessionId, side && !fails ? 'returned-thread' : 'side-thread')
+    if (side && !fails) assert.deepEqual(restoredStore.loadSideChats()[0].queue, pending)
+  } finally {
+    store.saveOrThrow = originalMainSave; store.saveSideChatsOrThrow = originalSideSave
+    runner.dispose(); await rm(root, { recursive: true, force: true })
+  }
+}
+
 try {
+  for (const mode of ['success', 'local-fork', 'return-fork', 'archive', 'too-large'] as const) await portableRoundTripCase(mode)
+  for (const side of [false, true]) for (const fails of [false, true]) await reboundPersistenceCase(side, fails)
+  for (const mode of ['remote', 'identity', 'model', 'provider', 'goal'] as const) await providerForkFailureCase(mode)
+  await orchestratorCase({ persistFails: true })
   await providerRoundTripCase([kimi, deepseek, kimi])
   await providerRoundTripCase([native, kimi, deepseek, native])
   await nativeModelSwitchCase()
@@ -506,6 +720,7 @@ try {
     await orchestratorCase({ previous, target, fail: true })
   }
   for (const mode of ['success', 'exhausted', 'other', 'interrupted', 'compact-failed', 'cancel-recovery', 'completion-only'] as const) await overflowRecoveryCase(mode)
+  for (const mode of ['success', 'exhausted', 'other', 'interrupted', 'compact-failed', 'cancel-recovery', 'completion-only', 'remote-compact', 'binding-failed'] as const) await overflowRecoveryCase(mode, native, true)
   await orchestratorCase({ contextTokens: 20000, compact: false })
   await targetContextCase()
   await encryptedCompactionCase()

@@ -5,12 +5,12 @@ import type { AgentDef } from '../src/shared/types'
 import { SettingsPanel } from '../src/renderer/components/SettingsPanel'
 
 const noop = () => {}
-// 外部列表只暴露三种稳态：可用 / 异常 / 可更新。
+// 外部列表区分可用、待登录、异常与可更新。
 for (const [availability, updateStatus, label] of [
   ['available', 'available', '可更新'],
   ['available', 'current', '可用'],
   ['available', 'idle', '可用'],
-  ['needs-auth', 'current', '异常'],
+  ['needs-auth', 'current', '待登录'],
   ['unhealthy', 'failed', '异常'],
   ['not-installed', 'unknown', '未安装']
 ] as const) {

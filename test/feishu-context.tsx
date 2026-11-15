@@ -1,8 +1,6 @@
 import assert from 'node:assert/strict'
-import { createElement } from 'react'
-import { renderToStaticMarkup } from 'react-dom/server'
 import { appendFeishuContext, FEISHU_CONTEXT, FEISHU_CONTEXT_TEXT, splitFeishuContext } from '../src/shared/feishuContext'
-import { EventStream } from '../src/renderer/components/EventStream'
+import { renderEventStream } from './regression/render-event-stream.mjs'
 
 const text = '生成一张图片'
 const prompt = appendFeishuContext(text)
@@ -20,18 +18,29 @@ const previousBody = '本条消息来自飞书；图片、文件用 send_to_feis
 const previous = `${text}\n\n<uniagent_feishu_context>\n${previousBody}\n</uniagent_feishu_context>`
 assert.deepEqual(splitFeishuContext(previous), { text, context: previousBody })
 
-function render(raw: string, source?: 'feishu' | 'app'): string {
-  return renderToStaticMarkup(createElement(EventStream, {
-    status: 'idle',
-    events: [{ sessionId: 'feishu-display', seq: 0, ts: 1, type: 'user_message', payload: { text: raw, source } }]
-  }))
-}
-const current = render(prompt, 'feishu')
-assert.match(current, /<div class="bubble"><span>生成一张图片<\/span><\/div>/)
-assert.ok(current.includes(`title="${FEISHU_CONTEXT_TEXT}"`), 'hover contains the complete approved context')
-assert.doesNotMatch(current, /&lt;uniagent_feishu_context&gt;/)
-assert.match(render(legacy), /user-feishu-source/, 'old transcripts receive the same source icon')
-assert.doesNotMatch(render(previous, 'feishu'), /&lt;uniagent_feishu_context&gt;/, 'the previous context stays hidden after the reply rules change')
-assert.doesNotMatch(render(text, 'app'), /user-feishu-source/)
-assert.doesNotMatch(render(`${text}\n\n${FEISHU_CONTEXT}`, 'app'), /user-feishu-source/, 'desktop text cannot mark itself as a Feishu message')
+const cases = [[prompt, 'feishu'], [legacy, undefined], [previous, 'feishu'], [text, 'app'], [`${text}\n\n${FEISHU_CONTEXT}`, 'app']]
+const rendered = await renderEventStream([], 'idle', 'feishu-display', {
+  setup: `
+    window.feishuContextHosts = ${JSON.stringify(cases)}.map(([text,source],index) => {
+      const host = document.body.appendChild(document.createElement('div'));
+      createRoot(host).render(React.createElement(EventStream,{status:'idle',events:[{sessionId:'feishu-'+index,seq:0,ts:1,type:'user_message',payload:{text,source}}]}));
+      return host;
+    });
+  `,
+  inspect: `(async()=>{
+    for(let i=0;i<100;i++){
+      if(window.feishuContextHosts.every(host=>host.querySelector('.bubble')))return window.feishuContextHosts.map(host=>({html:host.innerHTML,text:host.querySelector('.bubble').textContent.trim(),title:host.querySelector('.user-feishu-source')?.getAttribute('title')}));
+      await new Promise(resolve=>setTimeout(resolve,10));
+    }
+    throw Error('Feishu context rendering timeout');
+  })()`
+})
+const [current, renderedLegacy, renderedPrevious, desktop, desktopWrapper] = rendered
+assert.equal(current.text, text, 'the bubble shows only the original message through the current Markdown renderer')
+assert.equal(current.title, FEISHU_CONTEXT_TEXT, 'hover contains the complete approved context')
+assert.doesNotMatch(current.html, /&lt;uniagent_feishu_context&gt;/)
+assert.match(renderedLegacy.html, /user-feishu-source/, 'old transcripts receive the same source icon')
+assert.doesNotMatch(renderedPrevious.html, /&lt;uniagent_feishu_context&gt;/, 'the previous context stays hidden after the reply rules change')
+assert.doesNotMatch(desktop.html, /user-feishu-source/)
+assert.doesNotMatch(desktopWrapper.html, /user-feishu-source/, 'desktop text cannot mark itself as a Feishu message')
 console.log('feishu-context: ok')

@@ -4,18 +4,19 @@ import { join } from 'node:path'
 import type { AgentDef } from '../shared/types.ts'
 import { isCliSetupId, type CliSetupId, type CliSetupInput, type CliSetupSnapshot } from '../shared/agentSetup.ts'
 import { findAgentExecutable, runSetupCommand } from './agentSetupProcess.ts'
+import { qoderOperation, qoderRegionForBin } from './qoderSdk.ts'
 import { loadNativeCredentials, nativeCredentialEnv, saveNativeCredential } from './agentSetupCredentials.ts'
 
-const binaries = { codex: 'codex', traex: 'traecli', claude: 'claude', grok: 'grok' }
+const binaries = { codex: 'codex', traex: 'traecli', claude: 'claude', grok: 'grok', qoder: 'qoderclicn' }
 const installers: Partial<Record<CliSetupId, string>> = {
   codex: 'https://chatgpt.com/codex/install.sh', claude: 'https://claude.ai/install.sh',
-  grok: 'https://x.ai/cli/install.sh'
+  qoder: 'https://qoder.com.cn/install', grok: 'https://x.ai/cli/install.sh'
 }
 export function trustedAgentLoginUrl(id: CliSetupId, value: string): string | undefined {
   try {
     const url = new URL(value)
     const suffixes = ({ codex: ['openai.com', 'chatgpt.com'], claude: ['claude.ai', 'claude.com', 'anthropic.com'],
-      grok: ['x.ai', 'grok.com'] } as Partial<Record<CliSetupId, string[]>>)[id] || []
+      qoder: ['qoder.cn', 'qoder.com.cn', 'qoder.com', 'aliyun.com'], grok: ['x.ai', 'grok.com'] } as Partial<Record<CliSetupId, string[]>>)[id] || []
     if (url.protocol !== 'https:' || url.username || url.password || !suffixes.some(domain => url.hostname === domain || url.hostname.endsWith('.' + domain))) return
     return url.href
   } catch { return }
@@ -79,19 +80,19 @@ export class CliAgentSetup {
       const existing = await this.deps.inspect(id)
       if (existing.installed) return
       if (existing.lifecycle?.detectionStatus === 'failed') throw new Error('程序检测未完成，请先重新检测，不重复安装')
-      if (await this.deps.find(binaries[id])) return
+      if (await this.deps.find(id === 'qoder' ? existing.bin : binaries[id])) return
       if (process.platform === 'win32') throw new Error('当前平台请使用提示词安装官方程序')
       const directory = await mkdtemp(join(tmpdir(), 'uniagent-cli-install-'))
       try {
-        const response = await this.deps.request(installers[id]!, { signal: AbortSignal.any([signal, AbortSignal.timeout(60_000)]) })
+        const response = await this.deps.request(id === 'qoder' && qoderRegionForBin(existing.bin) === 'global' ? 'https://qoder.com/install' : installers[id]!, { signal: AbortSignal.any([signal, AbortSignal.timeout(60_000)]) })
         if (!response.ok) throw new Error('下载官方安装器失败，请检查网络或使用提示词安装')
         const content = await response.text()
         if (content.length > 2 * 1024 * 1024 || !/^#!/.test(content)) throw new Error('官方安装器内容无效，请使用提示词安装')
         const file = join(directory, 'install.sh')
         await writeFile(file, content, { mode: 0o700 })
-        if (await this.deps.find(binaries[id])) return
-        await this.deps.run('/bin/bash', [file], { signal, env: { ...process.env, NO_COLOR: '1' } })
-        if (!await this.deps.find(binaries[id])) throw new Error('安装器已结束，但未找到程序，请重新检测或使用提示词安装')
+        if (await this.deps.find(id === 'qoder' ? existing.bin : binaries[id])) return
+        await this.deps.run('/bin/bash', id === 'qoder' ? [file, '--skip-path'] : [file], { signal, env: { ...process.env, NO_COLOR: '1' } })
+        if (!await this.deps.find(id === 'qoder' ? existing.bin : binaries[id])) throw new Error('安装器已结束，但未找到程序，请重新检测或使用提示词安装')
       } finally { await rm(directory, { recursive: true, force: true }) }
     })
   }
@@ -108,6 +109,13 @@ export class CliAgentSetup {
       if (input.method === 'key') {
         const key = input.apiKey!.trim()
         if (id === 'codex') await this.deps.run(bin, ['login', '--with-api-key'], { env, signal, input: key + '\n', timeoutMs: 60_000 })
+        else if (id === 'qoder') {
+          const owner = qoderRegionForBin(bin) === 'cn' ? 'qoder-cn' : 'qoder'
+          const variable = owner === 'qoder-cn' ? 'QODERCN_PERSONAL_ACCESS_TOKEN' : 'QODER_PERSONAL_ACCESS_TOKEN'
+          if (!await qoderOperation(bin, 'auth', undefined, undefined, { [variable]: key })) throw new Error('Qoder PAT 验证失败；原配置已保留')
+          signal.throwIfAborted()
+          await this.deps.saveKey(owner, key)
+        }
         else if (id === 'claude' || id === 'grok') {
           const headers: Record<string, string> = id === 'claude'
             ? { 'x-api-key': key, 'anthropic-version': '2023-06-01' } : { Authorization: `Bearer ${key}` }
@@ -132,6 +140,7 @@ export class CliAgentSetup {
           const url = trustedAgentLoginUrl(id, match[0])
           if (!url || attempt.url === url) continue
           attempt.url = url; this.publish(id, { canReopen: true })
+          if (id === 'qoder') void this.deps.openBrowser(url).catch(() => this.publish(id, { message: '浏览器未打开，请点击“重新打开浏览器”' }))
           
         }
         const code = buffer.match(/(?:user[_ ]code|verification code|device code|验证码|Code)\s*[:：]\s*([A-Z0-9-]{4,16})\b/i)?.[1]

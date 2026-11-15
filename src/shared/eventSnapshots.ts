@@ -1,5 +1,22 @@
 import type { UAEvent } from './types'
 
+export function hasRunningContextCompaction(
+  events: readonly { type: string; state?: string; payload?: { id?: unknown; reason?: unknown; recoveryIntermediate?: unknown } }[],
+  reason?: string
+): boolean {
+  const settled = new Set<unknown>()
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]
+    if (event.type === 'turn_completed' && !event.payload?.recoveryIntermediate) break
+    if (event.type !== 'context_compaction') continue
+    const id = event.payload?.id ?? 'unidentified-compaction'
+    if (settled.has(id)) continue
+    settled.add(id)
+    if (event.state === 'running' && (reason === undefined || event.payload?.reason === reason)) return true
+  }
+  return false
+}
+
 const SNAPSHOTS = new Set<UAEvent['type']>([
   'agent_message', 'reasoning', 'command_exec', 'diff_update', 'queue_status', 'plan_update'
 ])
@@ -39,6 +56,17 @@ export function coalesceUsageSnapshots(events: UAEvent[]): UAEvent[] {
     }
   }
   return result
+}
+
+/** Reconcile overlapping history before merging provider streaming snapshots. */
+export function mergeHydratedEvents(
+  snapshot: UAEvent[], live: UAEvent[],
+  mergeEvent: (events: UAEvent[], event: UAEvent, inPlace?: boolean) => UAEvent[]
+): UAEvent[] {
+  const liveBySeq = new Map(live.map((event) => [event.seq, event]))
+  return [...snapshot.filter((event) => !liveBySeq.has(event.seq)), ...live]
+    .sort((a, b) => a.seq - b.seq)
+    .reduce((events, event) => mergeEvent(events, event, true), [] as UAEvent[])
 }
 
 /** Replace cumulative streaming snapshots without moving their timeline position. */

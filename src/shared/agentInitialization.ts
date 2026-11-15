@@ -1,7 +1,8 @@
 const INITIALIZATION_GUIDES: Record<string, string> = {
+  qoder: '\n默认使用中国大陆 Qoder CLI。先检测 qoderclicn / qodercn、~/.local/bin/qoderclicn 和实际版本；已有程序与 .qoder-cn 登录直接复用。缺少时使用官方 https://qoder.com.cn/install 安装器的 --skip-path 安装本机共享程序，不修改 shell 配置。浏览器登录使用 qoderclicn login。PAT 仅在专用密码输入框填写，SDK 为 @qodercn-ai/qodercn-agent-sdk。不要混用 Global qodercli、.qoder 登录态或 SDK。完成后回到 UniAgent 重新检测。',
   zcode:
     '\nUniAgent 设置 → Agent → ZCode 提供程序一键安装；本任务是备选。先检查 PATH 的完整 zcode CLI、官方 App、已登记运行时及资源与 app-server 协议；可用时直接复用，不重复源码构建。'  +
-    '\n官方源码：https://github.com/zai-org/ZCode.git；当前验证提交 3c5b227649371507ddc4eb46ac5133afe6db1cab，Node 24.14.0、pnpm 10.33.2。不要安装 npm 同名 zcode/zcode-cli 包。' +
+    '\n官方源码：https://github.com/zai-org/ZCode.git；当前验证提交 fec975905a2abd4c07e35c40d51fa097a2258ec9，Node 24.14.0、pnpm 10.33.2。不要安装 npm 同名 zcode/zcode-cli 包。' +
     '\n1. 只读检查 Git、系统架构，以及 UniAgent 用户数据目录 zcode/runtime.json 和 zcode/runtime 下的安装。仅检查路径、版本和权限，不输出 Provider 文件或任何凭据。' +
     '\n2. 优先修复并重试 UniAgent 一键安装。确需手动准备时，在用户私有目录固定提交检出官方源码，用专用 Node 和 pnpm 从仓库根运行 pnpm install --filter @zcode/cli... --frozen-lockfile，再运行 pnpm --filter @zcode/cli... build。不得修改全局 Node、shell 配置或其它 CLI。' +
     '\n3. 保留完整源码构建目录、node_modules 和 dist 资源，不能只复制 zcode.cjs。检查 --version、--help 和隔离 app-server --stdio 的 storage ready、runtime/capabilities 与 session/list。' +

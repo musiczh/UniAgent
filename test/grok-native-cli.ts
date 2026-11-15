@@ -41,7 +41,7 @@ else {
   const base=`http://127.0.0.1:${(server.address() as any).port}/v1`
   await writeFile(join(grokHome,'config.toml'),`[cli]\nauto_update=false\nuse_leader=false\n[features]\nmanaged_config=false\nfeedback=false\ntelemetry=false\n[managed_mcps]\nenabled=false\n[models]\ndefault="grok-4.7"\n[model."grok-4.7"]\nmodel="grok-4.7"\nbase_url="${base}"\napi_key="ua-dummy"\napi_backend="chat_completions"\nagent_type="grok-build"\nvision=true\nmax_retries=0\ncontext_window=200000\n[endpoints]\nmodels_base_url="${base}"\nxai_api_base_url="${base}"\ncli_chat_proxy_base_url="${base}"\n`)
   const env={HOME:home,GROK_HOME:grokHome,TMPDIR:root,XDG_CONFIG_HOME:join(root,'config'),XDG_CACHE_HOME:join(root,'cache'),XDG_DATA_HOME:join(root,'data'),XAI_API_KEY:'ua-dummy',GROK_SUBAGENTS:'1',GROK_GOAL:'0'}
-  const agent:AgentDef={id:'grok',adapter:'grok',name:'Grok',bin:process.env.UNIAGENT_GROK_BIN || '/Users/bytedance/.grok/downloads/grok-1.0.62-macos-aarch64',builtin:true,icon:'',models:[],capabilities:{modelSelect:true,reasoningEffort:true,permissionModes:[]}}
+  const agent:AgentDef={id:'grok',adapter:'grok',name:'Grok',bin:process.env.UNIAGENT_GROK_BIN || 'grok',builtin:true,icon:'',models:[],capabilities:{modelSelect:true,reasoningEffort:true,permissionModes:[]}}
   const runner=new GrokACPRunner('native-cli',{n:0},agent,{agentId:'grok',workdir:cwd,model:'grok-4.7',permissionMode:'ask'},undefined,env)
   runner.on('event',event=>{
     events.push(event)
@@ -58,7 +58,7 @@ else {
     const probe=await runner.probeSession(false)
     assert.deepEqual(probe.contract.collaborationModes, ['default'])
     await assert.rejects(runner.setCollaborationMode('plan'), /未声明 Plan/,
-      'Grok 1.0.62 must not expose a Plan mode absent from its native session')
+      'Grok must not expose a Plan mode absent from its native session')
     await runner.probeSession(false)
     ;(runner as any).connection.on('request',(frame:any)=>requests.push(frame))
     ;(runner as any).connection.on('notification',(frame:any)=>{if(frame.method?.startsWith('_') || frame.params?.sessionId !== probe.nativeSessionId)notifications.push(frame)})
@@ -66,7 +66,7 @@ else {
     const path=join(root,'blue.png');await writeFile(path,Buffer.from('iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAN0lEQVR4nO3RMQ0AMAzEQLf8OacQ3CWbD8BHcg4Mm+7qOh340A9UiVSJVIlUiVSJVIlUiVSJMA+hxgE/8m7SpQAAAABJRU5ErkJggg==','base64'))
     await runner.startTurn('Image transport',[{kind:'image',path,name:'blue.png',mime:'image/png'}])
     assert.ok(captures.some(body=>JSON.stringify(body.messages).includes('data:image/')))
-    assert.equal(events.filter(e=>e.payload.kind==='usage').length,1,JSON.stringify(events.filter(e=>e.type==='system_notice'||e.type==='error')))
+    assert.equal(events.filter(e=>e.payload.kind==='usage').length,1,JSON.stringify({events:events.filter(e=>e.type==='system_notice'||e.type==='error'),notifications:notifications.slice(-8)}))
     assert.equal(events.find(e=>e.payload.kind==='usage')!.payload.usage.cachedInputTokens,30)
     route='question';await runner.startTurn('Ask me')
     assert.ok(events.some(e=>e.payload.method==='_x.ai/ask_user_question'))
@@ -93,7 +93,7 @@ else {
     const inventory=await readonlyGrokInventory(agent.bin,{cwd,env,runner:readonlyGrokInventoryRunner})
     assert.equal(inventory.status,'available');assert.equal(inventory.writable,false)
     assert.equal(events.some(e=>e.type==='error'),false)
-    console.log('grok-native-cli: real 1.0.62 image transport, usage, questions, child routing/cancel/cache, fork cleanup and inventory passed')
+    console.log('grok-native-cli: real installed CLI image transport, usage, questions, child routing/cancel/cache, fork cleanup and inventory passed')
   } finally {
     const evidence=join(process.cwd(),'out','test-results');await mkdir(evidence,{recursive:true})
     await writeFile(join(evidence,'grok-native-cli-latest.json'),JSON.stringify({events,requests,notifications,schemas:captures.flatMap(body=>(body.tools||[]).filter((tool:any)=>['ask_user_question','spawn_subagent'].includes(tool.function.name))).slice(0,4)},null,2))

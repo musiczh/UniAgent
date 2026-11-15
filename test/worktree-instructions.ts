@@ -24,14 +24,30 @@ const configOf = (worktree?: SessionWorktree): SessionConfig =>
   ({ agentId: 'codex', workdir: worktree?.workdir || '/repo', worktree }) as SessionConfig
 
 try {
-  // 独立工作树会话的系统提示词要写明来源分支，并提醒把改动合并回去。
-  const text = worktreeInstructions(configOf(fakeTree({ baseRef: 'refs/heads/master' })))
-  assert.match(text, /当前在独立工作树分支，来源分支：master；完成任务后提醒用户把改动合并回来源分支。/)
-  assert.ok(text.includes(`创建基准：${'1'.repeat(40)}`), '原有创建基准信息保留')
+  // 每轮同步与提交后回源均由 Agent 执行，关闭回源设置时仅提醒。
+  const text = worktreeInstructions(configOf(fakeTree({ baseRef: 'refs/heads/master', autoSyncBack: true })))
+  assert.match(text, /独立工作树分支：detached HEAD；源分支：master/)
+  assert.match(text, /提交后由你合并回本机源分支/)
+  assert.match(text, /验证源分支包含本次提交/)
+  assert.match(text, /`git --no-optional-locks status --porcelain --untracked-files=no`/)
+  assert.match(text, /有输出即停止.*其他 Session.*稍后/)
+  assert.match(text, /不得 stash、代提交、reset\/clean 或覆盖源改动/)
+  assert.match(text, /无法确认目录或状态则停止/)
+  assert.match(text, /允许.*源仓库.*Git 操作/)
+  assert.match(text, /有新提交.*合并/)
+  assert.doesNotMatch(text, /宿主自动合回|请勿重复合并/)
+  assert.match(text, /每轮.*本机源分支.*同步/)
+  assert.match(text, /冲突.*分析/)
+  assert.equal(text.split('\n').length, 3)
+  assert.ok(text.length < 350, '工作树提示保持精简，只提供必要的源目录和操作边界')
+  assert.match(worktreeInstructions(configOf(fakeTree({ branch: 'uniagent/task-example', autoSyncBack: false }))), /uniagent\/task-example[\s\S]*用户明确要求合并/)
+  assert.match(worktreeInstructions(configOf(fakeTree({ autoSyncBack: false }))), /不自动合并回源分支/)
+  assert.match(worktreeInstructions(configOf(fakeTree({ autoSyncBack: false }))), /用户明确要求.*合并/)
+  assert.match(worktreeInstructions(configOf(fakeTree({}))), /不自动合并回源分支/, 'missing preference defaults to no automatic source merge')
   assert.ok(worktreeInstructions(configOf(fakeTree({ baseRef: 'refs/heads/feature/login' })))
-    .includes('来源分支：feature/login'), '来源分支去掉 refs/heads/ 前缀')
+    .includes('源分支：feature/login'), '来源分支去掉 refs/heads/ 前缀')
   assert.ok(worktreeInstructions(configOf(fakeTree({ baseRef: 'HEAD', baseCommit: '2'.repeat(40) })))
-    .includes(`来源分支：HEAD（${'2'.repeat(7)}）`), '无来源分支时回退显示基准提交')
+    .includes(`源分支：HEAD（${'2'.repeat(7)}）`), '无来源分支时回退显示基准提交')
   assert.equal(worktreeInstructions(configOf(undefined)), '', '非工作树会话不注入该说明')
 
   // allocate 默认 HEAD 解析为空间主目录当前分支，供提示词写出来源分支。
@@ -52,10 +68,34 @@ try {
     id: randomUUID(), name: 'test', primaryDirectory, additionalDirectories: [], createdAt: Date.now(), updatedAt: Date.now()
   })
 
+  const nonGit = join(sandbox, 'non-git')
+  await mkdir(nonGit)
+  const previousLocale = { LC_ALL: process.env.LC_ALL, LANGUAGE: process.env.LANGUAGE }
+  try {
+    for (const locale of ['C', 'zh_CN.UTF-8', 'fr_FR.UTF-8']) {
+      process.env.LC_ALL = locale
+      process.env.LANGUAGE = locale
+      const info = await service.inspect(project(nonGit))
+      assert.equal(info.canCreateWorktree, false, `${locale}: 非 Git 目录不能创建工作树`)
+      assert.equal(info.inspectionFailed, undefined, `${locale}: 非 Git 目录不是检测失败`)
+      assert.equal(info.unavailableReason, '主目录不是可用的 Git 仓库')
+      assert.equal(await service.defaultSelection(project(nonGit), undefined, true), undefined, `${locale}: 默认工作树不阻止普通任务`)
+    }
+  } finally {
+    for (const [key, value] of Object.entries(previousLocale)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+  const missing = project(join(sandbox, 'missing'))
+  assert.equal((await service.inspect(missing)).inspectionFailed, true, '不存在的目录仍保留真实检测失败')
+  await assert.rejects(service.defaultSelection(missing, undefined, true), /检测失败/)
+  assert.deepEqual(await service.defaultSelection(missing, { mode: 'local' }, true), { mode: 'local' }, '显式普通任务不依赖 Git 检测')
+
   const fromHead = await service.allocate(project(workdir), { mode: 'worktree', baseRef: 'HEAD', requestId: randomUUID() })
   assert.equal(fromHead.baseRef, 'refs/heads/main', '默认 HEAD 解析为空间主目录当前分支')
   assert.equal(fromHead.baseCommit, headCommit)
-  assert.ok(worktreeInstructions(configOf(fromHead)).includes('来源分支：main'), '提示词写出解析后的来源分支')
+  assert.ok(worktreeInstructions(configOf(fromHead)).includes('源分支：main'), '提示词写出解析后的来源分支')
 
   const explicit = await service.allocate(project(workdir), { mode: 'worktree', baseRef: 'refs/heads/main', requestId: randomUUID() })
   assert.equal(explicit.baseRef, 'refs/heads/main', '显式指定的基准分支保持不变')

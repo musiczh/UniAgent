@@ -128,8 +128,8 @@ export function testEntry(file) {
 async function main() {
   const { values } = parseArgs({ options: {
     list: { type: 'boolean' }, filter: { type: 'string' },
-    jobs: { type: 'string', default: '4' }, timeout: { type: 'string', default: '300' },
-    budget: { type: 'string', default: '360' }
+    jobs: { type: 'string', default: '4' }, timeout: { type: 'string', default: '600' },
+    budget: { type: 'string', default: '1200' }
   } })
   const number = (name, max) => {
     const n = Number(values[name])

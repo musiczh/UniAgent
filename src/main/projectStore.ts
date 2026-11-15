@@ -15,11 +15,22 @@ import {
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
-import type { Project, ProjectInput, SessionConfig } from '../shared/types.ts'
+import type { AgentDef, Project, ProjectInput, SessionConfig } from '../shared/types.ts'
 import { resolveUserDataHome } from './userData.ts'
 import { assertWorktreeAvailable } from './worktreeService.ts'
 
 export const DEFAULT_PROJECT_ID = 'default'
+
+export function resolveAgentWorkspaceConfig(
+  config: SessionConfig,
+  capabilities: Pick<AgentDef['capabilities'], 'additionalDirectoriesNew' | 'additionalDirectoriesResume'> | undefined,
+  resuming = false
+): SessionConfig {
+  if (!config.additionalDirectories?.length) return config
+  const supported = resuming ? capabilities?.additionalDirectoriesResume : capabilities?.additionalDirectoriesNew
+  const directories = supported ? config.additionalDirectories.filter(directory => directory !== config.requirementDir) : []
+  return directories.length === config.additionalDirectories.length ? config : { ...config, additionalDirectories: directories }
+}
 
 type StoredConfig = Partial<Pick<SessionConfig, 'projectId' | 'workdir' | 'additionalDirectories'>> &
   Omit<SessionConfig, 'projectId' | 'workdir' | 'additionalDirectories'>

@@ -22,26 +22,56 @@ const options = async (name: string) => {
 const pidOf = async (lease: Awaited<ReturnType<typeof acquireKimiWebService>>): Promise<number> => {
   const { pid } = await lease.transport.request<any>('GET', '/api/v1/meta')
   const inspected = await inspectACPProcess(pid)
-  assert.ok(inspected.ok && inspected.process); pids.set(pid, inspected.process)
+  if (!inspected.ok) throw new Error('fixture process inspection failed: ' + pid, { cause: inspected.error })
+  assert.ok(inspected.process, 'fixture process is no longer present: ' + pid); pids.set(pid, inspected.process)
   Object.defineProperty(lease.transport, 'timeoutMs', { value: 100 })
   return pid
 }
 try {
+  const diagnostic = await options('shutdown-diagnostic')
+  const diagnosticServer = await KimiWebServer.start(diagnostic)
+  const diagnosticPid = (await diagnosticServer.transport!.request<any>('GET', '/api/v1/meta')).pid
+  const inspect = (KimiWebServer.prototype as any).captureProcesses
+  const inspectionError = new Error('local process inspection failed')
+  ;(KimiWebServer.prototype as any).captureProcesses = async function () {
+    if (this === diagnosticServer) throw inspectionError
+    return inspect.call(this)
+  }
+  try {
+    await assert.rejects(diagnosticServer.closeAndWait(), (error: unknown) => {
+      assert.ok(error instanceof KimiWebError)
+      assert.equal(error.kind, 'shutdown_incomplete')
+      assert.equal(error.cause, inspectionError, 'local shutdown diagnostics retain the actual inspection error')
+      return true
+    })
+    assert.ok(alive(diagnosticPid), 'an unverified process cannot be signalled after a failed inspection')
+  } finally {
+    ;(KimiWebServer.prototype as any).captureProcesses = inspect
+    await diagnosticServer.closeAndWait()
+  }
+  assert.equal(alive(diagnosticPid), false, 'an explicit retry revalidates and closes the owned process')
+
   const transient = await options('transient-shutdown')
   const transientHome = await realpath(transient.env.KIMI_CODE_HOME)
   const stalled = await acquireKimiWebService(transient), stalledPid = await pidOf(stalled)
   const capture = (KimiWebServer.prototype as any).captureProcesses
   let failInspection = true
+  const transientInspectionError = new Error('transient process inspection failure')
   ;(KimiWebServer.prototype as any).captureProcesses = async function () {
     if (this.closed && this.options.env.KIMI_CODE_HOME === transientHome && failInspection) {
       failInspection = false
-      throw new Error('transient process inspection failure')
+      throw transientInspectionError
     }
     return capture.call(this)
   }
   try {
     process.kill(stalledPid, 'SIGSTOP')
-    await assert.rejects(stalled.transport.request('GET', '/api/v1/meta'), /shutdown_incomplete/)
+    await assert.rejects(stalled.transport.request('GET', '/api/v1/meta'), (error: unknown) => {
+      assert.ok(error instanceof KimiWebError && error.kind === 'shutdown_incomplete')
+      assert.ok(error.cause instanceof KimiWebError && error.cause.kind === 'shutdown_incomplete')
+      assert.equal(error.cause.cause, transientInspectionError, 'service recovery retains the original local shutdown cause')
+      return true
+    })
     assert.ok(alive(stalledPid), 'failed inspection must not signal a process without verified ownership')
     assert.equal((await read(transient.env.KIMI_CODE_HOME, 'boots.json')).items.length, 1)
     const resumed = await Promise.all([acquireKimiWebService(transient), acquireKimiWebService(transient)])

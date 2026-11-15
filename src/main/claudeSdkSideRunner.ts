@@ -1,4 +1,6 @@
 import { EventEmitter } from 'node:events'
+import { QoderRunner, qoderReviewInput } from './qoderRunner'
+import { qoderOperation } from './qoderSdk'
 import { TurnRunner } from './adapter'
 import { claudeSdkSessionOperation, claudeReviewPrompt, claudeGoal, claudeTurnPrompt } from './claudeSdk'
 import { nativeCredentialEnv } from './agentSetupCredentials'
@@ -21,12 +23,13 @@ export class ClaudeSdkSideRunner extends EventEmitter {
     super()
     if (resumeNativeId === sourceNativeId) throw new Error('侧边对话不能使用源会话 ID')
     this.nativeId = resumeNativeId
-    this.runner = new TurnRunner(sessionId, seqRef)
+    this.runner = agent.adapter === 'qoder' ? new QoderRunner(sessionId, seqRef) : new TurnRunner(sessionId, seqRef)
     this.runner.on('event', event => this.emit('event', event))
     this.runner.on('done', result => { this.running = false; this.emit('done', result) })
   }
 
   private operation(method: 'forkSession' | 'deleteSession', args: unknown): Promise<any> {
+    if (this.agent.adapter === 'qoder') return qoderOperation(this.agent.bin, method, method === 'deleteSession' ? { sessionId: args } : args, this.config.workdir)
     return claudeSdkSessionOperation(this.agent.bin, this.config.workdir, method, args, { ...process.env, ...nativeCredentialEnv('claude') })
   }
 
@@ -65,10 +68,15 @@ export class ClaudeSdkSideRunner extends EventEmitter {
   nativeThreadId(): string | undefined { return this.nativeId }
   processId(): number | undefined { return this.runner.processId() }
   isRunning(): boolean { return this.running }
-  supportsSteer(): boolean { return true }
+  supportsSteer(): boolean { return this.agent.capabilities.steer === true }
   updateConfig(config: SessionConfig): void { this.config = structuredClone(config) }
   async setCollaborationMode(mode: 'default' | 'plan'): Promise<void> {
     if (this.running && mode !== 'default') throw new Error('Claude 分支运行中，无法切换模式')
+    if (this.runner instanceof QoderRunner) {
+      await this.runner.initialize(this.agent, this.config, await this.ensureFork())
+      await this.runner.control('setPlanMode', mode === 'plan')
+      this.config = { ...this.config, collaborationMode: mode }; this.emit('collaborationModeChanged', mode); return
+    }
     await this.runner.setClaudePermissionMode(mode === 'plan' ? 'plan' : 'default')
     this.config = { ...this.config, collaborationMode: mode, permissionMode: mode === 'plan' ? 'plan' : 'ask' }
     this.emit('collaborationModeChanged', mode)
@@ -82,9 +90,13 @@ export class ClaudeSdkSideRunner extends EventEmitter {
   }
   async compact(): Promise<void> { await this.startTurn('/compact') }
   async startReview(draft: NativeReviewDraft): Promise<void> {
-    await this.startTurn(claudeReviewPrompt(draft, this.config))
+    await this.startTurn(this.agent.adapter === 'qoder' ? await qoderReviewInput(draft, this.config.workdir) : claudeReviewPrompt(draft, this.config))
   }
   async setGoal(input: { objective: string; tokenBudget?: number }): Promise<void> {
+    if (this.runner instanceof QoderRunner) {
+      const now = Date.now()
+      await this.runner.activateGoal(this.agent, this.config, { objective: input.objective, status: 'active', tokenBudget: input.tokenBudget ?? null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: now, updatedAt: now }, await this.ensureFork()); return
+    }
     const goal = claudeGoal(input.objective, input.tokenBudget)
     this.runner.configureClaudeGoal(goal)
     this.goalPrompt = `/goal ${goal.objective}`

@@ -4,6 +4,8 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import test from 'node:test'
 import { PrefsStore } from '../src/main/prefsStore'
+import { withAgentDefaults } from '../src/shared/agentChoices'
+import type { AgentDef, SessionConfig } from '../src/shared/types'
 
 test('explicit defaults do not replace the last-used agent', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'uniagent-prefs-'))
@@ -29,6 +31,33 @@ test('write failures are propagated without changing persisted preferences', asy
 
   assert.throws(() => store.set('traex', { model: 'seed-code' }))
   assert.equal(await readFile(file, 'utf8'), before)
+})
+
+test('clearing fixed defaults restores independent last choices across store restarts', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'uniagent-prefs-last-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const file = join(directory, 'prefs.json')
+  const store = new PrefsStore(file)
+  const agent = { id: 'codex', adapter: 'codex', defaultModel: 'native', capabilities: { modelSelect: true, reasoningEffort: true },
+    models: [{ id: 'native', efforts: ['low', 'high'], defaultEffort: 'low' }, { id: 'last', efforts: ['low', 'high'], defaultEffort: 'low' }] } as AgentDef
+  const config = { agentId: 'codex' } as SessionConfig
+  store.set('codex', { model: 'last', effort: 'high', defaultModel: 'native', defaultEffort: 'low' })
+  store.set('traex', { model: 'other', effort: 'medium' })
+  store.set('codex', { defaultModel: undefined })
+  let reloaded = new PrefsStore(file).get()
+  assert.equal(reloaded.lastAgentId, 'traex', 'changing Settings must not change the last-used agent')
+  let resolved = withAgentDefaults(agent, config, reloaded.lastByAgent.codex)
+  assert.equal(resolved.model, 'last')
+  assert.equal(resolved.effort, 'low', 'clearing the model leaves the fixed effort intact')
+  store.set('codex', { defaultEffort: undefined })
+  reloaded = new PrefsStore(file).get()
+  resolved = withAgentDefaults(agent, config, reloaded.lastByAgent.codex)
+  assert.equal(resolved.effort, 'high')
+  assert.deepEqual(reloaded.lastByAgent.codex, { model: 'last', effort: 'high' })
+  assert.deepEqual(reloaded.lastByAgent.traex, { model: 'other', effort: 'medium' }, 'per-agent histories remain independent')
+  store.set('kimi', { kimiThinking: 'fast', defaultThinking: 'balanced' })
+  store.set('kimi', { defaultThinking: undefined })
+  assert.deepEqual(new PrefsStore(file).get().lastByAgent.kimi, { kimiThinking: 'fast' }, 'native thinking history survives clearing its fixed default and restarting')
 })
 
 test('legacy Plan preferences migrate by the resolved agent adapter and round-trip independently', async (t) => {

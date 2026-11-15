@@ -25,6 +25,11 @@ try {
     plugins: [{
       name: 'offline-startup',
       setup(build) {
+        // Node/SSR tests do not load diagrams; real DOM fixtures supply the module URL.
+        build.onResolve({ filter: /^virtual:uniagent-mermaid-runtime-url$/ }, () => ({ path: 'mermaid-url', namespace: 'mermaid-url' }))
+        build.onLoad({ filter: /.*/, namespace: 'mermaid-url' }, () => ({ contents: 'export default "about:blank"', loader: 'js' }))
+        build.onResolve({ filter: /^virtual:uniagent-markdown-worker-url$/ }, () => ({ path: 'markdown-worker-url', namespace: 'markdown-worker-url' }))
+        build.onLoad({ filter: /.*/, namespace: 'markdown-worker-url' }, () => ({ contents: 'export default "about:blank"', loader: 'js' }))
         // Node component tests do not own the browser's startup splash lifecycle.
         build.onLoad({ filter: /\/src\/renderer\/startup\.ts$/ }, () => ({
           contents: 'export function updateStartup() {} export function enterStartup(onComplete) { onComplete(); return () => {} }',

@@ -68,6 +68,10 @@ export class SessionLogStore {
 
   get backgroundWrites(): boolean { return !!this.worker || !!this.workerError }
 
+  filePath(sessionId: string): string | undefined {
+    return this.root ? join(this.root, `${safeSessionId(sessionId)}.jsonl`) : undefined
+  }
+
   async close(): Promise<void> {
     await this.flush()
     const worker = this.worker
@@ -85,7 +89,7 @@ export class SessionLogStore {
     }
     try {
       mkdirSync(this.root, { recursive: true, mode: 0o700 })
-      const file = join(this.root, `${safeSessionId(sessionId)}.jsonl`)
+      const file = this.filePath(sessionId)!
       const line = this.serialize(sessionId, kind, data) + '\n'
       if (existsSync(file) && statSync(file).size + Buffer.byteLength(line) > this.maxFileBytes) {
         const interruptedReplies = this.loadInterruptedReplies(sessionId)
@@ -111,7 +115,7 @@ export class SessionLogStore {
     const latest = new Map<string, UAEvent>()
     try {
       for (const suffix of ['.1', '']) {
-        const file = join(this.root, `${safeSessionId(sessionId)}.jsonl${suffix}`)
+        const file = this.filePath(sessionId)! + suffix
         if (!existsSync(file)) continue
         for (const line of readFileSync(file, 'utf8').split('\n')) {
           if (!line) continue
@@ -142,7 +146,7 @@ export class SessionLogStore {
     if (!this.root) return []
     const latest = new Map<string, UAEvent>()
     for (const suffix of ['.1', '']) {
-      const file = join(this.root, `${safeSessionId(sessionId)}.jsonl${suffix}`)
+      const file = this.filePath(sessionId)! + suffix
       if (!existsSync(file)) continue
       try {
         for (const line of readFileSync(file, 'utf8').split('\n')) {

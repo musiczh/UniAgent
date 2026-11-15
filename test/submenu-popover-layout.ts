@@ -9,6 +9,7 @@ const alignedRight = computeSubmenuPlacement({
 assert.deepEqual(alignedRight, {
   left: 212,
   top: -6,
+  maxHeight: 520,
   placement: 'right'
 })
 
@@ -20,6 +21,7 @@ const shiftedAboveBottomEdge = computeSubmenuPlacement({
 assert.deepEqual(shiftedAboveBottomEdge, {
   left: 212,
   top: -212,
+  maxHeight: 520,
   placement: 'right'
 })
 
@@ -31,6 +33,7 @@ const flippedAtRightEdge = computeSubmenuPlacement({
 assert.deepEqual(flippedAtRightEdge, {
   left: -228,
   top: -6,
+  maxHeight: 520,
   placement: 'left'
 })
 
@@ -41,8 +44,21 @@ const clampedInsideNarrowViewport = computeSubmenuPlacement({
 })
 assert.deepEqual(clampedInsideNarrowViewport, {
   left: 2,
-  top: -8,
+  top: 20,
+  maxHeight: 468,
   placement: 'viewport'
+})
+
+const constrainedByTaskContent = computeSubmenuPlacement({
+  anchor: { top: 240, left: 100, right: 300 },
+  popover: { width: 300, height: 900 },
+  viewport: { width: 1280, height: 420, top: 96, bottom: 300 }
+})
+assert.deepEqual(constrainedByTaskContent, {
+  left: 212,
+  top: -144,
+  maxHeight: 204,
+  placement: 'right'
 })
 
 console.log('submenu popover layout tests passed')

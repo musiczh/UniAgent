@@ -91,13 +91,14 @@ test('app-server probing closes stdin for router-style launchers', async (t) => 
   assert.equal(await agentModels.probeAppServer(server, 3000), true)
 })
 
-test('Codex models come from the complete app-server catalog', async (t) => {
+test('Codex identifies itself to gateways and reads their complete app-server catalog', async (t) => {
   assert.equal(typeof agentModels.loadCodexModels, 'function')
   const dir = await mkdtemp(join(tmpdir(), 'uniagent-codex-models-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   const server = join(dir, 'fake-codex')
   await writeFile(server, `#!/usr/bin/env node
 const readline = require('node:readline')
+let codexClient = false
 const pages = {
   first: {
     data: [{
@@ -121,9 +122,11 @@ const pages = {
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
   const message = JSON.parse(line)
   if (message.method === 'initialize') {
+    codexClient = message.params.clientInfo.name === 'uniagent_codex'
     process.stdout.write(JSON.stringify({ id: message.id, result: {} }) + '\\n')
   } else if (message.method === 'model/list') {
-    const page = message.params && message.params.cursor === 'traex' ? pages.traex : pages.first
+    const page = !codexClient ? { data: [], nextCursor: null }
+      : message.params && message.params.cursor === 'traex' ? pages.traex : pages.first
     process.stdout.write(JSON.stringify({ id: message.id, result: page }) + '\\n')
   }
 })
@@ -163,20 +166,22 @@ if (process.argv[2] === 'models') {
   process.exit(0)
 }
 const readline = require('node:readline')
+let traeClient = false
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
   const message = JSON.parse(line)
   if (message.method === 'initialize') {
+    traeClient = message.params.clientInfo.name === 'uniagent'
     process.stdout.write(JSON.stringify({ id: message.id, result: {} }) + '\\n')
   } else if (message.method === 'model/list') {
     process.stdout.write(JSON.stringify({ id: message.id, result: {
-      data: [{
+      data: traeClient ? [{
         id: 'fake-sol', model: 'Fake-Sol', displayName: 'Fake Sol', hidden: false,
         supportedReasoningEfforts: [
           { reasoningEffort: 'low' }, { reasoningEffort: 'medium' },
           { reasoningEffort: 'high' }, { reasoningEffort: 'xhigh' }
         ],
         defaultReasoningEffort: 'medium'
-      }],
+      }] : [],
       nextCursor: null
     } }) + '\\n')
   }

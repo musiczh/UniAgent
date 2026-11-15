@@ -4,6 +4,7 @@ import type { UAEvent, SessionSummary } from '../shared/types.ts'
 import { kimiWebTranscriptEvents } from './kimiWebEventProjection.ts'
 import { acquireKimiWebService } from './kimiWebService.ts'
 import { KimiWebError, type KimiWebTransport } from './kimiWebTransport.ts'
+import { normalizeKimiWebTurns } from './kimiWebTranscriptState.ts'
 
 export async function listKimiWebSessions(bin = 'kimi', cwd?: string, env: NodeJS.ProcessEnv = {}): Promise<SessionSummary[]> {
   const lease = await acquireKimiWebService({ bin, cwd: cwd || process.cwd(), env })
@@ -48,16 +49,27 @@ export async function forkKimiWebSession(id: string, bin = 'kimi', cwd?: string,
 }
 
 /** The official transcript retains pre-compaction turns and message origins. */
-export async function readKimiTranscript(transport: KimiWebTransport, sessionId: string, agentId: string, knownTurns?: ReadonlySet<string>): Promise<{ items: any[]; meta: any }> {
+export async function readKimiTranscript(transport: KimiWebTransport, sessionId: string, agentId: string, knownTurns?: ReadonlySet<string>): Promise<{ items: any[]; meta: any; agents?: any[] }> {
   const pages: any[][] = []
   const cursors = new Set<string>()
   let before: string | undefined
   let meta: any
+  let agents: any[] | undefined
   let canStopAtKnownTurn = true
   for (;;) {
+    if (transport.turnsProtocol) {
+      const page = await transport.request<any>('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/agents/${encodeURIComponent(agentId)}/turns?page_size=100${before ? '&before_ordinal=' + encodeURIComponent(before) : ''}`)
+      if (!Array.isArray(page?.turns) || typeof page.has_more !== 'boolean') throw new KimiWebError('transcript_invalid')
+      pages.push(normalizeKimiWebTurns(page.turns))
+      if (!page.has_more) break
+      const oldest = page.turns[0]?.ordinal
+      if (!Number.isSafeInteger(oldest) || oldest < 0 || cursors.has(String(oldest))) throw new KimiWebError('transcript_cursor_repeated')
+      cursors.add(String(oldest)); before = String(oldest)
+      continue
+    }
     const page = await transport.request<any>('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/transcript?agent_id=${encodeURIComponent(agentId)}&page_size=100${before ? '&before_turn=' + encodeURIComponent(before) : ''}`)
     if (page?.agent_id !== agentId || !Array.isArray(page.items) || typeof page.has_more !== 'boolean') throw new KimiWebError('transcript_invalid')
-    if (!pages.length) meta = page.meta
+    if (!pages.length) { meta = page.meta; agents = page.agents }
     pages.push(page.items)
     if (page.items.some((item: any) => item.kind === 'marker' && item.marker === 'compaction')) canStopAtKnownTurn = false
     if (canStopAtKnownTurn && page.items.some((item: any) => item.kind === 'turn' &&
@@ -68,7 +80,7 @@ export async function readKimiTranscript(transport: KimiWebTransport, sessionId:
     cursors.add(oldest)
     before = oldest
   }
-  return { items: pages.reverse().flat(), meta }
+  return { items: pages.reverse().flat(), meta, ...(agents ? { agents } : {}) }
 }
 
 /**
@@ -94,13 +106,22 @@ export async function loadKimiSubAgentEvents(
   const server = await acquireKimiWebService({ bin, cwd: cwd || process.cwd(), env })
   try {
     const transport = server.transport!
-    const tasks = await transport.request<any>('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/tasks`)
-    if (!Array.isArray(tasks?.items)) throw new KimiWebError('task_list_invalid')
-    const owned = tasks.items.some((task: any) =>
-      task?.session_id === sessionId && task.kind === 'subagent' && task.agent_id === agentId)
-    if (!owned && (trusted?.parentNativeSessionId !== sessionId ||
-      !/^[A-Za-z0-9._-]{1,128}$/.test(trusted?.nativeTaskId || ''))) throw new KimiWebError('subagent_not_owned')
+    const persisted = trusted?.parentNativeSessionId === sessionId && /^[A-Za-z0-9._-]{1,128}$/.test(trusted?.nativeTaskId || '')
+    if (!transport.transcriptProtocol) {
+      const tasks = await transport.request<any>('GET', `/api/v1/sessions/${encodeURIComponent(sessionId)}/tasks`)
+      if (!Array.isArray(tasks?.items)) throw new KimiWebError('task_list_invalid')
+      const owned = tasks.items.some((task: any) => task?.session_id === sessionId && task.kind === 'subagent' && task.agent_id === agentId)
+      if (!owned && !persisted) throw new KimiWebError('subagent_not_owned')
+    }
     const transcript = await readKimiTranscript(transport, sessionId, agentId)
+    if (transport.turnsProtocol) {
+      const tasks = await transport.tasks(sessionId)
+      if (!tasks.items.some(task => task.kind === 'subagent' && task.agent_id === agentId && task.parent_agent_id === 'main') && !persisted) throw new KimiWebError('subagent_not_owned')
+    } else if (transport.transcriptProtocol) {
+      const child = transcript.agents?.find(row => row.agentId === agentId)
+      if (child?.type === 'independent' || child?.parentAgentId && child.parentAgentId !== 'main' ||
+        !(child?.type === 'sub' && child.parentAgentId === 'main') && !persisted) throw new KimiWebError('subagent_not_owned')
+    }
     const fallback = Date.now()
     return kimiWebTranscriptEvents(transcript.items)
       .map((event, seq) => ({ sessionId: '', seq, ...event, ts: event.ts ?? fallback }))
@@ -133,7 +154,7 @@ export async function loadKimiSessionEvents(
       events,
       cwd: typeof session.metadata?.cwd === 'string' ? session.metadata.cwd : cwd,
       model: typeof model === 'string' && model ? model : undefined,
-      kimiThinking: typeof status?.thinkingEffort === 'string' ? status.thinkingEffort : undefined,
+      kimiThinking: typeof (status?.thinkingEffort || session.agent_config?.thinking) === 'string' ? status?.thinkingEffort || session.agent_config.thinking : undefined,
       contextWindow: typeof status?.maxContextTokens === 'number' && status.maxContextTokens > 0 ? status.maxContextTokens : undefined
     }
   } finally {

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { createReadStream } from 'node:fs'
+import { createRequire } from 'node:module'
 import { access, readFile, realpath } from 'node:fs/promises'
 import { constants } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
@@ -9,6 +9,7 @@ import type { RestartTarget } from './appRestart'
 import { APP_NAME, APP_BUNDLE_ID } from '../shared/distribution'
 
 const exec = promisify(execFile)
+const { createReadStream } = createRequire(import.meta.url)(process.versions.electron ? 'original-fs' : 'node:fs') as typeof import('node:fs')
 export async function inspectRestartTarget(input: string): Promise<RestartTarget> {
   if (process.platform !== 'darwin' || !isAbsolute(input) || !input.endsWith('.app')) throw new Error(`请选择已准备好的 macOS ${APP_NAME}.app`)
   const bundle = await realpath(input)

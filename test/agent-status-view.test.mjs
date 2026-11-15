@@ -18,12 +18,12 @@ function agent(lifecycle, extra = {}) {
   }
 }
 
-test('外部状态只暴露可用 / 异常 / 可更新', () => {
+test('外部状态区分可用、待登录、异常和可更新', () => {
   assert.deepEqual(agentExternalStatus(agent({ updateStatus: 'current' })), { label: '可用', tone: 'ok' })
   assert.deepEqual(agentExternalStatus(agent({ updateStatus: 'idle' })), { label: '可用', tone: 'ok' })
   assert.deepEqual(agentExternalStatus(agent({ updateStatus: 'available' })), { label: '可更新', tone: 'warn' })
   assert.deepEqual(agentExternalStatus(agent({ availability: 'unhealthy' })), { label: '异常', tone: 'warn' })
-  assert.deepEqual(agentExternalStatus(agent({ availability: 'needs-auth' })), { label: '异常', tone: 'warn' })
+  assert.deepEqual(agentExternalStatus(agent({ availability: 'needs-auth' })), { label: '待登录', tone: 'warn' })
   assert.deepEqual(agentExternalStatus(agent({ availability: 'not-installed' })), { label: '异常', tone: 'warn' })
   assert.deepEqual(agentExternalStatus(agent({ detectionStatus: 'failed', availability: 'unhealthy' })), { label: '异常', tone: 'warn' })
   assert.deepEqual(agentExternalStatus(agent({ incompatible: true, availability: 'unhealthy' })), { label: '异常', tone: 'warn' })
@@ -42,6 +42,7 @@ test('外部状态不把过程态当成稳态结论', () => {
 test('运行状态仍区分未安装与待登录', () => {
   assert.deepEqual(agentRuntimeStatus(agent({ availability: 'not-installed' })), { label: '未安装', tone: 'off' })
   assert.deepEqual(agentRuntimeStatus(agent({ availability: 'needs-auth' })), { label: '待登录', tone: 'warn' })
+  assert.deepEqual(agentRuntimeStatus(agent({ availability: 'needs-auth' }, { incompatible: true })), { label: '待登录', tone: 'warn' })
   assert.deepEqual(agentRuntimeStatus(agent({ availability: 'available' })), { label: '可用', tone: 'ok' })
 })
 

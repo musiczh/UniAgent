@@ -133,7 +133,7 @@ try {
     modelConfigRules: { providerModelRules: [], manualProviderModelRules: [] } } }), { mode: 0o600 })
   await call('saveZCodeRuntime', { ...prepared, personalProviderConfigPath: provider, dataRootId: 'packaged-fixture' })
   await clickButton('刷新状态')
-  await waitFor(() => evaluate('!!document.querySelector(\'[aria-label="默认模型"]\')'), Boolean, 'default model settings')
+  await waitFor(() => evaluate('document.querySelector(\'[aria-label="默认模型"]\')?.disabled === false'), Boolean, 'ready default model settings')
   check('configured runtime exposes editable default model', await evaluate('!document.querySelector(\'[aria-label="默认模型"]\').disabled && document.querySelector(\'[aria-label="默认模型"]\').selectedOptions[0].textContent === "fixture"'))
   check('configured runtime exposes thinking settings', await evaluate('!!document.querySelector(\'[aria-label="默认思考级别"]\')'))
   const configuredShot = await cdp('Page.captureScreenshot', { format: 'png' })

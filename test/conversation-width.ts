@@ -83,7 +83,8 @@ const result = await renderEventStream([], 'idle', 'conversation-width', {
       measurements.push({label,expected,expanded,sessionWidth:rect.width,overflow:session.scrollWidth>session.clientWidth,
         fixed:{left:fixed.left,top:fixed.top},
         items:items.map(item=>{const bounds=item.getBoundingClientRect();return {
-          name:item.className,width:bounds.width,left:bounds.left-rect.left,right:rect.right-bounds.right
+          name:item.className,width:bounds.width,left:bounds.left-rect.left,right:rect.right-bounds.right,
+          scrollbar:item.closest('.event-stream') ? item.closest('.event-stream').getBoundingClientRect().width-item.closest('.event-stream').clientWidth : 0
         }}),
         side:side ? {width:sideRect.width,items:[...side.querySelectorAll('.user-msg,.agent-msg,.composer-wrap')].map(item=>{
           const bounds=item.getBoundingClientRect();return {name:item.className,left:bounds.left-sideRect.left,right:sideRect.right-bounds.right,width:bounds.width}
@@ -112,7 +113,7 @@ for (const entry of result.measurements) {
   }
   for (const item of entry.items) {
     assert.ok(Math.abs(item.width - entry.expected) <= 1, `${entry.label}/${item.name}: expected ${entry.expected}px, got ${item.width}px`)
-    assert.ok(Math.abs(item.left - item.right) <= 1, `${entry.label}/${item.name}: gutters must remain symmetric`)
+    assert.ok(Math.abs(item.left - (item.right - item.scrollbar)) <= 1, `${entry.label}/${item.name}: gutters within the scroll viewport must remain symmetric; ${JSON.stringify(item)}`)
     assert.ok(item.left >= 19 && item.left <= 121, `${entry.label}/${item.name}: gutter must stay within 20–120px`)
   }
   if (entry.side) {

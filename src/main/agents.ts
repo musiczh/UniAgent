@@ -2,7 +2,7 @@ import { isDistributionAgent } from '../shared/distribution.ts'
 import { execFile, spawn } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
 import type { AgentDef, ModelDef, PermissionModeDef, ReasoningEffort } from '../shared/types'
 import { AppServerRpcClient } from './appServerTransport.ts'
@@ -19,6 +19,7 @@ import { detectMCode } from './mcodeService.ts'
 import { findAgentExecutable } from './agentSetupProcess.ts'
 import { loadNativeCredentials, nativeCredentialEnv } from './agentSetupCredentials.ts'
 import { initializeClaudeSdk } from './claudeSdk'
+import { QoderSdkClient, projectQoderModels, type QoderRegion } from './qoderSdk.ts'
 import { parseCodexConfig } from './codexSourceConfig.ts'
 
 
@@ -36,14 +37,18 @@ export async function codexUsesExternalProvider(home = process.env.CODEX_HOME ||
 type CodexModelsProvider = (nativeModels: ModelDef[]) => ModelDef[]
 const nativeCodexModels: CodexModelsProvider = models => models
 let codexModelsProvider = nativeCodexModels
-let claudeModelsProvider = nativeCodexModels
-export function configureClaudeModelsProvider(provider?: CodexModelsProvider): void {
+type ClaudeModelsProvider = (nativeModels: ModelDef[]) => ModelDef[] | Promise<ModelDef[]>
+let claudeModelsProvider: ClaudeModelsProvider = nativeCodexModels
+export function configureClaudeModelsProvider(provider?: ClaudeModelsProvider): void {
   claudeModelsProvider = provider || nativeCodexModels
 }
 
 export function configureCodexModelsProvider(provider?: CodexModelsProvider): void {
   codexModelsProvider = provider || nativeCodexModels
 }
+
+let qoderRegionProvider: () => QoderRegion = () => 'cn'
+export function configureQoderRegionProvider(provider: () => QoderRegion): void { qoderRegionProvider = provider }
 
 const VALID_EFFORTS = new Set<ReasoningEffort>(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
 
@@ -169,7 +174,8 @@ export function projectModelCache(
 
 async function loadAppServerModels(
   bin: string,
-  idField: 'slug' | 'config_name' | 'model'
+  idField: 'slug' | 'config_name' | 'model',
+  clientName = 'uniagent'
 ): Promise<ModelDef[]> {
   const transport = new AppServerRpcClient({
     bin,
@@ -181,7 +187,7 @@ async function loadAppServerModels(
   try {
     await transport.start()
     await transport.request('initialize', {
-      clientInfo: { name: 'uniagent', version: '1.0.0' },
+      clientInfo: { name: clientName, version: '1.0.0' },
       capabilities: { experimentalApi: true }
     })
     transport.notify('initialized', {})
@@ -242,7 +248,7 @@ export async function loadTraexModels(bin: string): Promise<ModelDef[]> {
 export async function loadCodexModels(bin: string): Promise<ModelDef[]> {
   let nativeModels: ModelDef[]
   try {
-    nativeModels = await loadAppServerModels(bin, 'slug')
+    nativeModels = await loadAppServerModels(bin, 'slug', 'uniagent_codex')
   } catch {
     nativeModels = await loadModelCache(join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'models_cache.json'), 'slug')
   }
@@ -491,6 +497,20 @@ export const BUILTIN_AGENTS: AgentDef[] = [
     models: []
   },
   {
+    id: 'qoder', name: 'Qoder', bin: 'qoderclicn', adapter: 'qoder', icon: 'qoder', builtin: true,
+    capabilities: { modelSelect: true, reasoningEffort: true, permissionModes: [
+      { id: 'ask', label: '需要时询问', hint: '使用 Qoder 原生工具审批' },
+      { id: 'auto-edit', label: '自动编辑', hint: '自动允许文件编辑，命令仍按原生规则审批' },
+      { id: 'approve-for-me', label: '自动判断', hint: 'Qoder 原生 auto 策略' },
+      { id: 'deny-unapproved', label: '拒绝未批准', hint: '拒绝所有需要询问的工具' },
+      { id: 'full-access', label: '完全访问', hint: '绕过工具审批；不提供 OS 沙箱隔离' }
+    ], protocol: 'sdk', startupSystemPrompt: true, followup: true, steer: false,
+      sessionList: true, sessionLoad: true, sessionResume: true, sessionFork: true, sessionForkAtTurn: true,
+      crossAgentFork: true, sideChat: true, capabilityInventory: true,
+      structuredSubagents: true, structuredUsage: true, formElicitation: true, freeTextElicitation: true,
+      additionalDirectoriesNew: true, additionalDirectoriesResume: true }, models: []
+  },
+  {
     id: 'claude',
     name: 'Claude Code',
     bin: 'claude',
@@ -629,7 +649,7 @@ async function loadModels(agent: AgentDef, bin: string): Promise<ModelDef[]> {
     if (agent.adapter === 'claude') {
       const { models } = await loadClaudeModels()
       // Vanilla setup: the bare aliases hide the real versions, so ask the CLI.
-      return claudeModelsProvider(models === CLAUDE_MODELS ? await loadClaudeCliModels(bin) : models)
+      return await claudeModelsProvider(models === CLAUDE_MODELS ? await loadClaudeCliModels(bin) : models)
     }
   } catch {
     /* ignore, fall through */
@@ -641,7 +661,7 @@ export type AgentDetectionScope = 'all' | 'core' | 'protocol'
 export type AgentDetectionObserver = (agent: AgentDef) => void | Promise<void>
 
 export function matchesAgentDetectionScope(agent: AgentDef, scope: AgentDetectionScope): boolean {
-  const protocol = agent.capabilities.protocol === 'acp' || agent.capabilities.protocol === 'zcode-protocol' || agent.adapter === 'kimi' || agent.adapter === 'nika'
+  const protocol = agent.capabilities.protocol === 'sdk' || agent.capabilities.protocol === 'acp' || agent.capabilities.protocol === 'zcode-protocol' || agent.adapter === 'kimi' || agent.adapter === 'nika'
   return scope === 'all' || (scope === 'protocol' ? protocol : !protocol)
 }
 
@@ -763,6 +783,30 @@ export async function detectAgents(scope: AgentDetectionScope = 'all', agentId?:
           models: contract?.models || [],
           defaultModel: contract?.currentModelId
         } satisfies AgentDef
+      }
+      if (a.adapter === 'qoder') {
+        const region = qoderRegionProvider()
+        const names = isAbsolute(a.bin) ? [a.bin] : region === 'cn' ? ['qoderclicn', 'qodercn'] : ['qodercli', 'qoder']
+        let found: Awaited<ReturnType<typeof probe>> = null
+        for (const name of names) { found = await probe(name); if (found) break }
+        if (!found) return { ...a, name: region === 'cn' ? 'Qoder CN' : 'Qoder', installed: false, bin: names[0], qoder: { region } } satisfies AgentDef
+        const client = new QoderSdkClient({ region, options: {
+          pathToQoderCLIExecutable: found.path, cwd: homedir(), persistSession: false, tools: [], settingSources: ['user'], permissionMode: 'default', env: { ...process.env, ...nativeCredentialEnv(region === 'cn' ? 'qoder-cn' : 'qoder') }
+        }, initializeTimeoutMs: 30_000 })
+        try {
+          const initialized = await client.ready
+          const authenticated = await client.request('auth')
+          const nativeModels = authenticated ? await client.request('models') : []
+          const models = projectQoderModels(nativeModels)
+          return { ...a, name: region === 'cn' ? 'Qoder CN' : 'Qoder', installed: true, bin: found.path, version: found.version, qoder: { region },
+            authenticationRequired: !authenticated, models, defaultModel: nativeModels.find((m: any) => m.isDefault)?.value || models[0]?.id,
+            capabilities: { ...a.capabilities, streaming: true, nativeGoal: initialized.capabilities?.includes('goal_v1') === true, nativeReview: initialized.commands?.some((command: any) => command.name === 'review') === true, commands: initialized.commands?.map((command: any) => command.name) || [], collaborationModes: initialized.capabilities?.includes('plan_mode_v1') ? ['default', 'plan'] : ['default'],
+              reasoningEffort: models.some(m => m.efforts.length > 0), imageAttachments: models.some(m => m.imageInput), fileAttachments: true },
+            ...(!authenticated ? { unavailableReason: `Qoder ${region === 'cn' ? '中国大陆' : 'Global'} 尚未登录` } : {}) } satisfies AgentDef
+        } catch (error) {
+          return { ...a, installed: true, bin: found.path, version: found.version, qoder: { region }, incompatible: true,
+            unavailableReason: 'Qoder 连接检测失败，已有原生配置已保留', lifecycle: { availability: 'unhealthy', auth: 'unknown', health: 'unknown', updateStatus: 'idle', detectionStatus: 'failed', detectionError: String(error), checkedAt: Date.now() } } satisfies AgentDef
+        } finally { await client.close() }
       }
       const installedCodex = a.adapter === 'codex' ? await probe(a.bin) : null
       const preferredBin = a.adapter === 'codex' ? resolveCodexRuntimeBin(installedCodex?.path || a.bin) : a.bin

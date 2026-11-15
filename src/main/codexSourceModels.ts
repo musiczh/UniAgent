@@ -25,7 +25,7 @@ function httpError(status: number): Error {
   return new Error(`模型查询失败（HTTP ${status || 502}）`)
 }
 
-export async function fetchSourceModels(baseUrl: string, apiKey: string, timeoutMs = 8000): Promise<string[]> {
+export async function fetchSourceModelCatalog(baseUrl: string, apiKey: string, timeoutMs = 8000): Promise<unknown> {
   const input = modelRequestFor(baseUrl, apiKey)
   const destination = new URL(input.url)
   const raw = await new Promise<unknown>((resolve, reject) => {
@@ -54,5 +54,9 @@ export async function fetchSourceModels(baseUrl: string, apiKey: string, timeout
     req.once('error', error => finish(error))
     req.end()
   })
-  return normalizeSourceModels(raw)
+  return raw
+}
+
+export async function fetchSourceModels(baseUrl: string, apiKey: string, timeoutMs = 8000): Promise<string[]> {
+  return normalizeSourceModels(await fetchSourceModelCatalog(baseUrl, apiKey, timeoutMs))
 }

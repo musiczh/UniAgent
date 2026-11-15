@@ -25,12 +25,15 @@ export class PerformanceMonitor {
     this.record('resume', {})
   }
 
-  constructor(root: string, private readonly runtime: () => Record<string, number>) {
+  constructor(root: string, private readonly runtime: () => Record<string, number>, cloudSample?: (kind: string, data: Record<string, unknown>, at: number) => void) {
     try {
       this.worker = new Worker(new URL('./performanceWorker.js', import.meta.url), {
-        workerData: { root: join(root, 'performance-logs'), pid: process.pid, appVersion: app.getVersion() }
+        workerData: { root: join(root, 'performance-logs'), pid: process.pid, appVersion: app.getVersion(), cloudMonitor: !!cloudSample }
       })
       this.worker.unref()
+      this.worker.on('message', message => {
+        if (!this.stopped && message.kind === 'cloud_sample') cloudSample?.(message.code, message.data, message.at)
+      })
       this.worker.on('error', () => { console.warn('[performance-monitor] 后台监测不可用') })
       this.worker.on('exit', code => {
         this.exited = true

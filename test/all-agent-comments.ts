@@ -48,7 +48,7 @@ const selectionUi = await renderEventStream([
 ], 'idle', 'all-agent-comments', {
   setup: `window.__eventStreamProps = { selection: ${selectionActions} };`,
   inspect: `(async () => {
-    const text = document.querySelector('.agent-msg .agent-md').firstChild;
+    const text = document.querySelector('.agent-msg .agent-md p');
     const range = document.createRange();
     range.selectNodeContents(text);
     const nativeSelection = window.getSelection();
@@ -86,7 +86,7 @@ const codexUi = await renderEventStream([
     onSide: () => {}
   } };`,
   inspect: `(async () => {
-    const text = document.querySelector('.agent-msg .agent-md').firstChild;
+    const text = document.querySelector('.agent-msg .agent-md p');
     const range = document.createRange(); range.selectNodeContents(text);
     const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
     text.parentElement.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
@@ -96,4 +96,34 @@ const codexUi = await renderEventStream([
 })
 
 assert.deepEqual(codexUi, ['评论', '解释', '侧边聊天'], 'Codex and TraeX retain all existing selection actions')
+
+const initialSelection = await renderEventStream([], 'idle', 'initial-selection', {
+  setup: `
+    function ImmediateSelection() {
+      React.useLayoutEffect(() => {
+        const text = document.querySelector('#initial-selection-fixture .agent-md p');
+        const range = document.createRange(); range.selectNodeContents(text);
+        const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+        text.dispatchEvent(new MouseEvent('mouseup', {bubbles:true}));
+      }, []);
+      return React.createElement(EventStream, {
+        events:[{sessionId:'initial-selection',seq:1,ts:1,type:'agent_message',state:'success',payload:{text:'First visible reply',phase:'final_answer'}}],
+        status:'idle',sessionId:'initial-selection',selection:{
+          ...${selectionActions},onDetail:value=>{window.initialSelection=value}
+        }
+      });
+    }
+    const host=document.body.appendChild(document.createElement('div'));host.id='initial-selection-fixture';
+    createRoot(host).render(React.createElement(ImmediateSelection));
+  `,
+  inspect: `(async()=>{
+    for(let i=0;i<100&&!document.querySelector('.sel-pop');i++)await new Promise(resolve=>setTimeout(resolve,10));
+    const actions=[...document.querySelectorAll('.sel-pop .sel-btn')];
+    actions.find(button=>button.textContent.includes('解释'))?.click();
+    return {actions:actions.map(button=>button.textContent.trim()),selection:{quote:window.initialSelection?.quote,selectedMessageText:window.initialSelection?.selectedMessageText}};
+  })()`
+})
+assert.deepEqual(initialSelection.actions, ['评论', '解释'], 'the first visible reply must accept selection before passive effects run')
+assert.equal(initialSelection.selection.quote, 'First visible reply')
+assert.equal(initialSelection.selection.selectedMessageText, 'First visible reply\n')
 console.log('all agent comments: neutral prompts and capability-scoped selection actions passed')

@@ -5,6 +5,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { acquireKimiWebService, closeKimiWebServices } from '../src/main/kimiWebService.ts'
 import { KimiWebError } from '../src/main/kimiWebTransport.ts'
+import { KimiWebServer } from '../src/main/kimiWebServer.ts'
+import { probeKimiWeb } from '../src/main/kimiWebContract.ts'
+import { ACPRecoveryError, closeACPConnections, inspectACPProcess, prepareACPConnections } from '../src/main/acp/acpProcessLifecycle.ts'
 
 // Regression: discovery must reuse a live kimi web service even though kimi
 // rewrites its process title to "kimi-code" (ps can never show the executable
@@ -77,6 +80,41 @@ const startFixture = async (home: string, banner: 'ready' | 'banner'): Promise<{
 const versionBin = (root: string): string => binPath(root, '#!/bin/sh\necho not-a-version\n')
 
 try {
+  {
+    const { root, home } = fixtureHome()
+    const { pid } = await startFixture(home, 'ready')
+    const directory = join(root, 'acp-processes')
+    mkdirSync(directory)
+    const parent = await inspectACPProcess(process.ppid)
+    assert.ok(parent.ok && parent.process)
+    const owner = { ...parent.process, startTime: 'Mon Jan 1 00:00:00 2001' }
+    const recordedRoot = { pid: process.pid, ppid: owner.pid, uid: owner.uid, pgid: process.pid, startTime: owner.startTime }
+    const record = { version: 1, owner, root: recordedRoot, processes: [], provider: 'kimi' }
+    const file = join(directory, `${owner.pid}-${recordedRoot.pid}.json`)
+    writeFileSync(file, JSON.stringify(record))
+    try {
+      await assert.rejects(prepareACPConnections(directory), /进程归属无法确认/)
+      const options = { bin: versionBin(root), cwd: root, env: { KIMI_CODE_HOME: home }, timeoutMs: 5000 }
+      await assert.rejects(acquireKimiWebService(options), /本地进程恢复未完成/, 'a borrowed Kimi service must wait for its own recovery')
+      assert.ok(alive(pid), 'a failed recovery must not signal the unrelated borrowed service')
+      writeFileSync(file, JSON.stringify({ ...record, owner: parent.process }))
+      const lease = await acquireKimiWebService(options)
+      assert.equal(lease.version, '2.2.0')
+      await lease.release()
+      assert.ok(alive(pid))
+    } finally { process.kill(pid, 'SIGTERM') }
+  }
+  {
+    const { root, home } = fixtureHome()
+    const bin = binPath(root, '#!/bin/sh\necho 2.3.0\n')
+    const start = KimiWebServer.start
+    try {
+      KimiWebServer.start = async () => { throw new ACPRecoveryError() }
+      const blocked = await probeKimiWeb(bin, root, { KIMI_CODE_HOME: home })
+      assert.equal(blocked.status, 'incompatible')
+      assert.match(blocked.reason || '', /本地进程恢复未完成/)
+    } finally { KimiWebServer.start = start }
+  }
   // 1. Live service with rewritten process title must be reused, not rejected.
   {
     const { root, home } = fixtureHome()
@@ -118,7 +156,7 @@ try {
     const { root, home } = fixtureHome()
     writeFileSync(join(home, 'server', 'instances', 'stale.json'), JSON.stringify({ server_id: 'stale', pid: 2147483646, host: '127.0.0.1', port: 1, started_at: Date.now(), heartbeat_at: Date.now(), host_version: '2.2.0' }))
     const message = await expectError(acquireKimiWebService({ bin: versionBin(root), cwd: root, env: { KIMI_CODE_HOME: home }, timeoutMs: 5000 }))
-    assert.equal(message, 'kimi_web_version_unsupported', 'dead-pid registration must be skipped, not fail identity checks')
+    assert.equal(message, 'kimi_web_process_exited', 'dead-pid registration falls through to actual startup rather than software version rejection')
   }
 
   // 3. A recycled pid that does not listen on the recorded port is also stale.
@@ -129,7 +167,7 @@ try {
     try {
       writeFileSync(join(home, 'server', 'instances', 'recycled.json'), JSON.stringify({ server_id: 'recycled', pid: bystander.pid, host: '127.0.0.1', port: 9, started_at: Date.now(), heartbeat_at: Date.now(), host_version: '2.2.0' }))
       const message = await expectError(acquireKimiWebService({ bin: versionBin(root), cwd: root, env: { KIMI_CODE_HOME: home }, timeoutMs: 5000 }))
-      assert.equal(message, 'kimi_web_version_unsupported', 'non-listening pid must be treated as stale registration')
+      assert.equal(message, 'kimi_web_process_exited', 'non-listening pid falls through to actual startup rather than software version rejection')
     } finally { bystander.kill('SIGTERM') }
     console.log('skipped stale registrations (dead pid and recycled pid)')
   }
@@ -170,5 +208,6 @@ try {
   console.log('Kimi web service discovery: live reuse, stale registration and quit cleanup passed')
 } finally {
   for (const child of children) { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL') }
+  await closeACPConnections()
   for (const root of roots) rmSync(root, { recursive: true, force: true })
 }

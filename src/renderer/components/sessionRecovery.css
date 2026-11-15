@@ -1,0 +1,16 @@
+.recovery-settings .recovery-rule-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; margin-top: 28px; }
+.recovery-rule-row { padding: 15px; }
+.recovery-rule-row + .recovery-rule-row { border-top: 1px solid var(--border); }
+.recovery-rule-description { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; min-height: 46px; }
+.recovery-rule-controls { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
+.recovery-rule-controls > span:first-child { color: var(--text-dim); flex: 1; font-size: 12px; }
+.recovery-error-message { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--mono); margin: 4px 0; }
+.recovery-error-check { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+.recovery-error-toolbar { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; color: var(--text-dim); }
+.recovery-error-search, .recovery-rule-input { background: var(--bg-elev); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font: inherit; }
+.recovery-error-search { flex: 1; min-width: 0; }
+.recovery-rule-input { display: block; width: 100%; box-sizing: border-box; resize: vertical; margin: 18px 0; }
+.recovery-error-search:focus, .recovery-rule-input:focus { outline: 1px solid var(--accent); }
+.session-recovery-status { display: flex; align-items: center; gap: 16px; padding: 12px 18px; border-bottom: 1px solid var(--border); background: var(--bg-elev); font-size: 13px; }
+.session-recovery-status > div { flex: 1; min-width: 0; }
+.session-recovery-status p { margin: 4px 0 0; color: var(--text-dim); overflow-wrap: anywhere; }

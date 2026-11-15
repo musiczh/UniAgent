@@ -1,16 +1,23 @@
 import { SetGroup, SetRow, SetSelect } from './SettingsPrimitives'
+import { WorktreeSettings } from './WorktreeSettings'
+import { DefinedSettingsGroup } from './DefinedSettingsGroup'
+import { ColorThemePicker } from './ColorThemePicker'
+import { SessionRecoverySettings } from './SessionRecoverySettings'
 import { INTERNAL_DISTRIBUTION, APP_REPOSITORY, APP_NAME } from '@shared/distribution'
-import { resolveAgentModel, resolveAgentPermission, resolveModelEffort, resolveModelThinking } from '@shared/agentChoices'
+import { resolveAgentModel, resolveAgentPermission, resolveModelEffort, resolveModelThinking, withLastAgentChoices } from '@shared/agentChoices'
 import { useAgentPreferences } from '../hooks'
 import { AssistantSettings } from './AssistantSettings'
 import { FeishuBinding } from './AssistantFeishuBinding'
 import { FeishuNotificationSettings } from './FeishuNotificationSettings'
+import { FeishuRoutingSettings } from './FeishuRoutingSettings'
 import { TeamManagement } from './TeamManagement'
 import type { TeamDefinition } from '@shared/teamTypes'
 import { RequirementSettings } from './RequirementSettings'
+import { RequirementTaskSettings } from './RequirementTaskSettings'
 import { CodexModelSettings } from './CodexModelSettings'
 
 import { DeepSeekSettings } from './DeepSeekSettings'
+import { AgentVersionWarning } from './AgentVersionWarning'
 import { MCodeSettings } from './MCodeSettings'
 import { CliAgentSettings } from './CliAgentSettings'
 
@@ -36,6 +43,7 @@ import type {
   PermissionModeId,
   PrefsData,
   Project,
+  Session,
   QueueWaitEvaluation,
   QueueWaitQualityReport,
   ReasoningEffort,
@@ -52,8 +60,8 @@ import { ResumePanel } from './ResumePanel'
 import { TokenUsagePanel } from './TokenUsagePanel'
 import { AutomationsPanel } from './AutomationsPanel'
 import { ClockIcon, RefreshIcon, ToggleSwitch, UiIcon } from './Icons'
-import { ProjectEditorDialog } from './ProjectEditorDialog'
-import { ProjectWorktrees } from './ProjectWorktrees'
+import { ProjectSettings } from './ProjectSettings'
+import type { BrowserLocation } from '../scopeBrowser'
 
 /** Actionable copy for a failed update check, keyed by the error code from appUpdater. */
 const APP_UPDATE_ERROR_TEXT: Record<NonNullable<AppUpdateState['error']>, string> = INTERNAL_DISTRIBUTION ? {
@@ -216,7 +224,7 @@ function QueueWaitQuality({ detail = false, onOpen, onBack }: {
 
   return (
     <>
-      <SetBackTop label="返回通用" onBack={() => onBack?.()}>
+      <SetBackTop label="返回开发者选项" onBack={() => onBack?.()}>
         <div className="set-detail-headrow">
           <div className="set-detail-title"><div className="sdt-main">
             <h2>等待时间预测质量</h2>
@@ -371,6 +379,7 @@ export class AppUpdateRequestController {
  */
 export function SettingsPanel({
   agents,
+  sessions = [],
   detecting = false,
   onRedetect,
   onInitialize,
@@ -379,7 +388,7 @@ export function SettingsPanel({
   onOpenSync,
   onBack, initialCategory = 'general', initialTeamId, windowed = false,
   onCategoryChange, onSidebarShortcutsChange, navigationGuard, navigationKey, onOpenSession,
-  onRequirementsEnabledChange, e2eFixtures = false, onForkSame = () => {}, onImport = () => {}, onForkCross = () => {}
+  onRequirementsEnabledChange, onSidebarStyleChange, onOpenScope, e2eFixtures = false, onForkSame = () => {}, onImport = () => {}, onForkCross = () => {}
 }: {
   initialCategory?: SettingsCategory
   initialTeamId?: string
@@ -388,6 +397,8 @@ export function SettingsPanel({
   onCategoryChange?: (category: SettingsCategory) => void
   onSidebarShortcutsChange?: (shortcuts: SettingsCategory[]) => void
   onRequirementsEnabledChange?: (enabled: boolean) => void
+  onSidebarStyleChange?: (enabled: boolean) => void
+  onOpenScope?: (location: BrowserLocation) => void
   onOpenSession?: (id: string) => void
   /** 页内「导入会话」的分叉 / 导入动作（与全窗 ResumePanel 同一套回调）。 */
   e2eFixtures?: boolean
@@ -397,6 +408,7 @@ export function SettingsPanel({
   navigationGuard?: MutableRefObject<(() => boolean) | null>
   navigationKey?: number
   agents: AgentDef[]
+  sessions?: Session[]
   detecting?: boolean
   onRedetect: () => void
   onInitialize: (targetAgentId: string) => void
@@ -733,7 +745,7 @@ export function SettingsPanel({
                 onCategoryChange?.(c.id)
               }}
             >
-              <span className="ic"><UiIcon name={c.icon} /></span>
+              <span className="ic"><UiIcon name={c.icon} size={15} /></span>
               <span className="lbl">{c.label}</span>
             </button>
           ))}
@@ -746,7 +758,7 @@ export function SettingsPanel({
           <div className="set-page" hidden={category !== 'general'}>
             {!detailView ? (
               <>
-                <SetGroup title="应用更新">
+                <DefinedSettingsGroup path="/general/updates" settings={appConfig} onSaved={setAppConfig}>
                   <SetRow
                     label={`${APP_NAME} 版本`}
                     sub={`当前 ${appVersion || '读取中…'}${appUpdate?.checkedAt ? ` · ${new Date(appUpdate.checkedAt).toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit' })} 检查过` : ''}`}
@@ -756,76 +768,22 @@ export function SettingsPanel({
                     </>}
                     onClick={() => setDetailView('update')}
                   />
-                  <SetRow
-                    label="自动检查更新"
-                    sub={INTERNAL_DISTRIBUTION ? '启动时后台检查 Bits 版本目录' : '启动时后台检查 GitHub 公开版本'}
-                    control={<ToggleSwitch checked={appConfig?.autoCheckUpdate ?? true} label="自动检查更新" onChange={(checked) => { void window.uniagent.setAppSettings({ autoCheckUpdate: checked }).then(setAppConfig) }} />}
-                  />
+                </DefinedSettingsGroup>
+                <SetGroup title="颜色风格">
+                  <ColorThemePicker settings={appConfig} onSaved={setAppConfig} />
                 </SetGroup>
-                <SetGroup title="通知">
-                  <SetRow
-                    label="桌面通知"
-                    sub="任务完成、失败、提问或等待批准时发送 macOS 通知"
-                    control={<SetSelect ariaLabel="桌面通知" value={appConfig?.notificationMode ?? 'unfocused'} onChange={(v) => { void window.uniagent.setAppSettings({ notificationMode: v as AppSettings['notificationMode'] }).then(setAppConfig) }}>
-                      <option value="unfocused">离开 {APP_NAME} 时通知</option>
-                      <option value="always">始终通知</option>
-                      <option value="off">关闭通知</option>
-                    </SetSelect>}
-                  />
+                <SetGroup title="会话错误恢复">
+                  <SetRow label="自动恢复失败会话" sub="通过错误类型和自然语言规则判断，等待后接续原会话。"
+                    control={<span>{appConfig?.sessionRecovery?.enabled ? '已开启' : '未开启'}</span>} onClick={() => setDetailView('session_recovery')} />
                 </SetGroup>
-                <SetGroup title="电源">
-                  <SetRow
-                    label="防止电脑休眠"
-                    sub={`${APP_NAME} 运行期间阻止电脑自动休眠，屏幕仍可熄灭；关闭开关或退出应用后恢复。`}
-                    control={<ToggleSwitch checked={appConfig?.preventSleep ?? false} label="防止电脑休眠" onChange={(checked) => { void window.uniagent.setAppSettings({ preventSleep: checked }).then(setAppConfig) }} />}
-                  />
+                <WorktreeSettings settings={appConfig} onSaved={setAppConfig} />
+                <DefinedSettingsGroup path="/general/notifications" settings={appConfig} onSaved={setAppConfig} />
+                <DefinedSettingsGroup path="/general/power" settings={appConfig} onSaved={setAppConfig} />
+                <DefinedSettingsGroup path="/general/files" settings={appConfig} onSaved={setAppConfig} />
+                <SetGroup>
+                  <SetRow icon={<UiIcon name="code" size={15} />} label="开发者选项"
+                    sub="开发与调试工具" onClick={() => setDetailView('developer_options')} />
                 </SetGroup>
-                <SetGroup title="文件浏览与审查">
-                  <SetRow
-                    label="默认覆盖左侧侧栏"
-                    sub="打开文件浏览器或代码审查时是否直接铺满整个窗口；关闭则保留左侧会话侧栏。可在标题栏按钮随时切换。"
-                    control={<ToggleSwitch checked={appConfig?.coverSidebar ?? false} label="默认覆盖左侧侧栏" onChange={(checked) => { void window.uniagent.setAppSettings({ coverSidebar: checked }).then(setAppConfig) }} />}
-                  />
-                </SetGroup>
-                <SetGroup title="诊断与日志">
-                  <SetRow
-                    icon={<UiIcon name="warn" size={15} />}
-                    label="Session 导入错误"
-                    sub="导入、预览、同 Agent 分叉及跨 Agent 迁移中的异常"
-                    control={(() => {
-                      const err = diag.filter((e) => e.category === 'session_import' && e.level === 'error').length
-                      const warn = diag.filter((e) => e.category === 'session_import' && e.level === 'warn').length
-                      return (
-                        <>
-                          {err > 0 && <span className="diag-stat err">{err} 错误</span>}
-                          {warn > 0 && <span className="diag-stat warn">{warn} 警告</span>}
-                        </>
-                      )
-                    })()}
-                    onClick={() => { setLogFilter('all'); setSelectedDiagnostics([]); setDetailView('session_import') }}
-                  />
-                  <SetRow
-                    icon={<UiIcon name="diagnostics" size={15} />}
-                    label="App 运行错误日志"
-                    sub="Agent、主进程、渲染、更新、飞书及能力同步异常"
-                    control={(() => {
-                      const err = diag.filter((e) => e.category === 'app_runtime' && e.level === 'error').length
-                      const warn = diag.filter((e) => e.category === 'app_runtime' && e.level === 'warn').length
-                      return (
-                        <>
-                          {err > 0 && <span className="diag-stat err">{err} 错误</span>}
-                          {warn > 0 && <span className="diag-stat warn">{warn} 警告</span>}
-                        </>
-                      )
-                    })()}
-                    onClick={() => { setLogFilter('all'); setSelectedDiagnostics([]); setDetailView('app_runtime') }}
-                  />
-                  <SetRow icon={<UiIcon name="diagnostics" size={15} />} label="工具能力排查日志"
-                    sub="各 Agent 的工具扫描、读取来源与配置异常" control={<span>查看日志</span>}
-                    onClick={() => setDetailView('capabilities_log')} />
-                  <SetRow label="清空全部日志" sub={`当前共 ${diag.length} 条`} control={<button className="set-mini-btn danger" disabled={!diag.length} onClick={handleClearDiag}>清空全部</button>} />
-                </SetGroup>
-                {category === 'general' && <QueueWaitQuality key="queue-quality-summary" onOpen={() => setDetailView('queue_wait_quality')} />}
                 <SetGroup title="侧栏快捷入口" action={<span className="set-shortcut-count">已选 {sidebarShortcuts.length} / {MAX_SIDEBAR_SHORTCUTS}</span>} pad>
                   <p className="set-shortcut-hint">选择要显示在左侧的功能，最多 {MAX_SIDEBAR_SHORTCUTS} 个；选择后自动保存。</p>
                   <div className="set-shortcut-options">
@@ -842,6 +800,8 @@ export function SettingsPanel({
                   <p className="set-shortcut-hint" role="status">{shortcutError || (shortcutSaving ? '保存中…' : sidebarShortcuts.length >= MAX_SIDEBAR_SHORTCUTS ? '已选满 5 个，取消一项后可添加其它功能。' : '按设置菜单顺序显示；全部入口统一计入 5 个上限。')}</p>
                 </SetGroup>
               </>
+            ) : detailView === 'session_recovery' ? (
+              <SessionRecoverySettings agents={agents} settings={appConfig} onSaved={setAppConfig} onBack={() => setDetailView(null)} />
             ) : detailView === 'update' ? (
               <>
                 <SetBackTop label="返回通用" onBack={() => setDetailView(null)}>
@@ -911,10 +871,55 @@ export function SettingsPanel({
                   )}
                 </div>
               </>
+            ) : detailView === 'developer_options' ? (
+              <>
+                <SetBackTop label="返回通用" onBack={() => setDetailView(null)}>
+                  <div className="set-detail-title"><div className="sdt-main"><h2>开发者选项</h2></div></div>
+                </SetBackTop>
+                <SetGroup title="诊断与日志">
+                  <SetRow
+                    icon={<UiIcon name="warn" size={15} />}
+                    label="Session 导入错误"
+                    sub="导入、预览、同 Agent 分叉及跨 Agent 迁移中的异常"
+                    control={(() => {
+                      const err = diag.filter((e) => e.category === 'session_import' && e.level === 'error').length
+                      const warn = diag.filter((e) => e.category === 'session_import' && e.level === 'warn').length
+                      return (
+                        <>
+                          {err > 0 && <span className="diag-stat err">{err} 错误</span>}
+                          {warn > 0 && <span className="diag-stat warn">{warn} 警告</span>}
+                        </>
+                      )
+                    })()}
+                    onClick={() => { setLogFilter('all'); setSelectedDiagnostics([]); setDetailView('session_import') }}
+                  />
+                  <SetRow
+                    icon={<UiIcon name="diagnostics" size={15} />}
+                    label="App 运行错误日志"
+                    sub="Agent、主进程、渲染、更新、飞书及能力同步异常"
+                    control={(() => {
+                      const err = diag.filter((e) => e.category === 'app_runtime' && e.level === 'error').length
+                      const warn = diag.filter((e) => e.category === 'app_runtime' && e.level === 'warn').length
+                      return (
+                        <>
+                          {err > 0 && <span className="diag-stat err">{err} 错误</span>}
+                          {warn > 0 && <span className="diag-stat warn">{warn} 警告</span>}
+                        </>
+                      )
+                    })()}
+                    onClick={() => { setLogFilter('all'); setSelectedDiagnostics([]); setDetailView('app_runtime') }}
+                  />
+                  <SetRow icon={<UiIcon name="diagnostics" size={15} />} label="工具能力排查日志"
+                    sub="各 Agent 的工具扫描、读取来源与配置异常" control={<span>查看日志</span>}
+                    onClick={() => setDetailView('capabilities_log')} />
+                  <SetRow label="清空全部日志" sub={`当前共 ${diag.length} 条`} control={<button className="set-mini-btn danger" disabled={!diag.length} onClick={handleClearDiag}>清空全部</button>} />
+                </SetGroup>
+                {category === 'general' && <QueueWaitQuality key="queue-quality-summary" onOpen={() => setDetailView('queue_wait_quality')} />}
+              </>
             ) : detailView === 'capabilities_log' ? (
-              <AgentCapabilitiesPanel embedded logOnly agents={agents.filter(agent => agent.builtin)} onOpenSync={onOpenSync} onBack={() => setDetailView(null)} />
+              <AgentCapabilitiesPanel embedded logOnly agents={agents.filter(agent => agent.builtin)} onOpenSync={onOpenSync} onBack={() => setDetailView('developer_options')} />
             ) : detailView === 'queue_wait_quality' ? (
-              <QueueWaitQuality key="queue-quality-detail" detail onBack={() => setDetailView(null)} />
+              <QueueWaitQuality key="queue-quality-detail" detail onBack={() => setDetailView('developer_options')} />
             ) : detailView === 'session_import' || detailView === 'app_runtime' ? (() => {
               const visibleRows = diag.filter((e) =>
                 e.category === detailView && (logFilter === 'all' || e.level === logFilter)
@@ -924,8 +929,8 @@ export function SettingsPanel({
               return (
               <>
                 <div className="set-detail-top">
-                  <button className="set-back" onClick={() => { setDetailView(null); setSelectedDiagnostics([]) }}>
-                    <span className="set-caret"><UiIcon name="chevron-right" size={15} /></span>返回通用
+                  <button className="set-back" onClick={() => { setDetailView('developer_options'); setSelectedDiagnostics([]) }}>
+                    <span className="set-caret"><UiIcon name="chevron-right" size={15} /></span>返回开发者选项
                   </button>
                   <div className="set-detail-headrow">
                     <div className="set-detail-title">
@@ -1027,6 +1032,7 @@ export function SettingsPanel({
               status={feishu}
               onStatus={setFeishu}
               onPatch={patchFeishu}
+              onOpenRouter={() => setCategory('requirement-tasks')}
             />}
           </div>}
           {category === 'codex-sources' && <div className="set-page"><CodexModelSettings navigationGuard={sourceNavigationGuard} onModelsChanged={async () => onAgentsChanged(await window.uniagent.getLifecycleSnapshot())} /></div>}
@@ -1034,13 +1040,15 @@ export function SettingsPanel({
           {category === 'teams' && <div className="set-page">{teamError && <p className="team-error">{teamError}</p>}<TeamManagement kind="teams" initialTeamId={detailView || undefined} teams={teams} agents={agents} spaces={projects} onChanged={refreshTeams} /></div>}
           {category === 'requirements'  && <div className="set-page"><RequirementSettings
             enabled={appConfig?.requirementsEnabled === true}
+            onBrowse={id => onOpenScope?.({ kind: 'requirement', id })}
             onToggle={(checked) => {
               void window.uniagent.setAppSettings({ requirementsEnabled: checked }).then(setAppConfig).then(() => onRequirementsEnabledChange?.(checked))
             }}
           /></div>}
-          <div className="set-page" hidden={category !== 'projects'}>
-            <ProjectSettings projects={projects} onProjectsChange={setProjects} onOpenSession={onOpenSession} />
-          </div>
+          {category === 'requirement-tasks' && <div className="set-page"><RequirementTaskSettings agents={agents} settings={appConfig} onSaved={settings => { setAppConfig(settings); onSidebarStyleChange?.(settings.spaceRequirementSidebar !== false) }} navigationGuard={sourceNavigationGuard} onOpenSession={onOpenSession} /></div>}
+          {category === 'projects' && <div className="set-page">
+            <ProjectSettings projects={projects} sessions={sessions} agents={agents} navigationGuard={sourceNavigationGuard} onProjectsChange={setProjects} onOpenSession={onOpenSession} onBrowse={id => onOpenScope?.({ kind: 'space', id })} />
+          </div>}
 
           {/* ---- Agent：CLI 状态（主页面） / 单 Agent 详情 ---- */}
           <div className="set-page" hidden={category !== 'agent'}>
@@ -1062,11 +1070,13 @@ export function SettingsPanel({
                   ? { label: '检查中', tone: 'off' }
                   : agentUpdateStatus(a)
                 const pref = prefs?.lastByAgent[a.id]
-                const effectiveModel = resolveAgentModel(a, pref?.defaultModel)
-                const defaultModel = effectiveModel?.id || ''
+                const effectiveModel = resolveAgentModel(a, withLastAgentChoices(pref).defaultModel)
+                const defaultModel = pref?.defaultModel ? effectiveModel?.id || '' : ''
                 const nativeThinking = a.adapter === 'kimi' || a.adapter === 'zcode'
                 const efforts = nativeThinking ? effectiveModel?.thinkingOptions || [] : effectiveModel?.efforts || []
-                const defaultEffort = (nativeThinking ? resolveModelThinking(effectiveModel, pref?.defaultThinking, pref?.defaultEffort) : resolveModelEffort(effectiveModel, pref?.defaultEffort)) || ''
+                const defaultEffort = (nativeThinking
+                  ? (pref?.defaultThinking || pref?.defaultEffort) && resolveModelThinking(effectiveModel, pref?.defaultThinking, pref?.defaultEffort)
+                  : pref?.defaultEffort && resolveModelEffort(effectiveModel, pref.defaultEffort)) || ''
                 const installation = (
                     <SetGroup
                       title="安装信息"
@@ -1101,6 +1111,7 @@ export function SettingsPanel({
                         sub={retrying ? progress.text : detectionText || a.lifecycle?.message}
                         control={<span className={`status-pill${retrying ? ' settings-agent-progress' : ''}`} role={retrying ? 'status' : undefined}>{retrying ? <RefreshIcon size={12} className="is-spinning" /> : <span className={`dot ${runtimeStatus.tone}`} />}<span className={`txt-${runtimeStatus.tone}`}>{runtimeStatus.label}</span></span>}
                       />
+                      <AgentVersionWarning agent={a}/>
                       <SetRow
                         label="更新状态"
                         sub={agentUpdateStatusSub(a)}
@@ -1124,21 +1135,27 @@ export function SettingsPanel({
                     <SetGroup title="该 Agent 默认参数">
                       <SetRow
                         label="默认模型"
-                        control={<SetSelect ariaLabel="默认模型" value={defaultModel} disabled={retrying || !prefs || !a.capabilities.modelSelect || a.models.length === 0} onChange={(v) => {
-                          const model = resolveAgentModel(a, v)
-                          void patchAgentDefault(a.id, { defaultModel: model?.id,
-                            defaultEffort: nativeThinking ? undefined : resolveModelEffort(model, pref?.defaultEffort),
-                            defaultThinking: nativeThinking ? resolveModelThinking(model, pref?.defaultThinking, pref?.defaultEffort) : undefined })
+                        control={<SetSelect className="agent-default-select" ariaLabel="默认模型" value={defaultModel} disabled={retrying || !prefs || !a.capabilities.modelSelect || a.models.length === 0} onChange={(v) => {
+                          const model = resolveAgentModel(a, v || pref?.model)
+                          void patchAgentDefault(a.id, { defaultModel: v || undefined,
+                            defaultEffort: !nativeThinking && pref?.defaultEffort ? resolveModelEffort(model, pref.defaultEffort) : undefined,
+                            defaultThinking: nativeThinking && (pref?.defaultThinking || pref?.defaultEffort) ? resolveModelThinking(model, pref?.defaultThinking, pref?.defaultEffort) : undefined })
                         }}>
+                          <option value="">沿用上一次的选择</option>
                           {a.models.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
                         </SetSelect>}
                       />
                       <SetRow
                         label={nativeThinking ? '默认思考级别' : '默认推理强度'}
-                        control={<SetSelect ariaLabel={nativeThinking ? '默认思考级别' : '默认推理强度'} value={defaultEffort} disabled={retrying || !prefs || (!nativeThinking && !a.capabilities.reasoningEffort) || efforts.length === 0} onChange={(v) => void patchAgentDefault(a.id, nativeThinking ? { defaultThinking: v } : { defaultEffort: v as ReasoningEffort })}>
+                        control={<SetSelect className="agent-default-select" ariaLabel={nativeThinking ? '默认思考级别' : '默认推理强度'} value={defaultEffort} disabled={retrying || !prefs || (!nativeThinking && !a.capabilities.reasoningEffort) || efforts.length === 0} onChange={(v) => void patchAgentDefault(a.id, nativeThinking ? { defaultThinking: v || undefined, defaultEffort: undefined } : { defaultEffort: (v || undefined) as ReasoningEffort | undefined })}>
+                          <option value="">沿用上一次的选择</option>
                           {efforts.map((e) => <option key={e} value={e}>{EFFORT_LABEL[e] ?? e}</option>)}
                         </SetSelect>}
                       />
+                      {a.adapter === 'qoder' && !!effectiveModel?.qoderContextWindows?.length && <SetRow label="默认上下文窗口" control={<SetSelect ariaLabel="默认上下文窗口" value={String(pref?.qoderContextWindow || effectiveModel.contextWindow || '')} disabled={retrying || !prefs} onChange={value => void patchAgentDefault(a.id, { qoderContextWindow: Number(value) })}>
+                        {effectiveModel.qoderContextWindows.map(window => <option key={window} value={window}>{window.toLocaleString()} Token</option>)}
+                      </SetSelect>} />}
+                      {a.adapter === 'qoder' && effectiveModel?.qoderThinkingDisabled && <SetRow label="默认思考" control={<SetSelect ariaLabel="默认思考" value={pref?.qoderThinkingDisabled ? 'disabled' : 'auto'} disabled={retrying || !prefs} onChange={value => void patchAgentDefault(a.id, { qoderThinkingDisabled: value === 'disabled' })}><option value="auto">自动</option><option value="disabled">关闭思考</option></SetSelect>} />}
                     </SetGroup>
                 )
                 return (
@@ -1354,7 +1371,7 @@ export function SettingsPanel({
                           sub={<>
                             {agentName(agents, role.agentId)} · {modelLabel}{role.kimiThinking || role.zcodeThinking || role.effort ? ` · ${EFFORT_LABEL[role.kimiThinking || role.zcodeThinking || role.effort!] || role.kimiThinking || role.zcodeThinking || role.effort}` : ''} · {permissionLabel}
                             <br />
-                            {role.projectId ? projects.find((project) => project.id === role.projectId)?.name || '空间不可用' : '跟随调用方空间'} · {skillsLabel} · {toolsLabel}
+                            {role.projectId ? projects.find((project) => project.id === role.projectId)?.name || '项目不可用' : '跟随调用方项目'} · {skillsLabel} · {toolsLabel}
                             {!entry.executable && entry.unavailableReason && <><br /><span className="txt-warn">{entry.unavailableReason}</span></>}
                           </>}
                           control={<span className="status-pill"><span className={`dot ${entry.executable ? 'ok' : 'warn'}`} /><span className={`txt-${entry.executable ? 'ok' : 'warn'}`}>{entry.executable ? '可调用' : '不可调用'}</span></span>}
@@ -1384,7 +1401,7 @@ export function SettingsPanel({
               />
             )}
             {category === 'tokens' && <TokenUsagePanel embedded />}
-            {category === 'automations' && <AutomationsPanel embedded onOpenSession={onOpenSession} />}
+            {category === 'automations' && <AutomationsPanel embedded onOpenSession={onOpenSession} requirementsEnabled={appConfig?.requirementsEnabled === true} />}
           </div>
 
           {/* ---- 任务模板（主列表 rowlink → 详情编辑器，对齐 mockup） ---- */}
@@ -1453,77 +1470,6 @@ function agentName(agents: AgentDef[], id?: string): string {
   return agents.find((a) => a.id === id)?.name || id
 }
 
-function ProjectSettings({
-  projects,
-  onProjectsChange,
-  onOpenSession
-}: {
-  projects: Project[]
-  onProjectsChange: (projects: Project[]) => void
-  onOpenSession?: (id: string) => void
-}): JSX.Element {
-  const [editing, setEditing] = useState<Project | 'new' | null>(null)
-  const [expanded, setExpanded] = useState<string | null>(null)
-  const [error, setError] = useState('')
-
-  async function remove(project: Project): Promise<void> {
-    if (!window.confirm(`确定删除空间「${project.name}」吗？\n\n该空间下的所有会话会移动到默认空间，磁盘文件不会被删除。`)) return
-    setError('')
-    try {
-      onProjectsChange(await window.uniagent.deleteProject(project.id))
-      window.dispatchEvent(new Event('uniagent-projects-changed'))
-    } catch (reason) {
-      setError(String(reason).includes('project_has_active_sessions')
-        ? '空间仍有运行中的会话，请等待会话结束后再删除。'
-        : reason instanceof Error ? reason.message : String(reason))
-    }
-  }
-
-  return (
-    <>
-      <SetGroup
-        title={`空间 · 共 ${projects.length} 个`}
-        action={<button className="set-add-btn" onClick={() => setEditing('new')}><UiIcon name="plus" size={13} />新建空间</button>}
-      >
-        {projects.map((project) => (
-          <div className="project-settings-item" key={project.id}>
-          <div className="project-settings-row">
-            <div className="project-settings-icon"><UiIcon name="folder" size={17} /></div>
-            <div className="project-settings-main">
-              <div className="r-label">{project.name}{project.isDefault && <span className="auto-badge kind">默认</span>}</div>
-              <div className="r-sub" title={[project.primaryDirectory, ...project.additionalDirectories].join('\n')}>
-                {project.primaryDirectory}{project.additionalDirectories.length ? ` · 另有 ${project.additionalDirectories.length} 个目录` : ''}
-              </div>
-            </div>
-            <div className="project-settings-actions">
-              <button className="set-mini-btn ghost" aria-expanded={expanded === project.id} onClick={() => setExpanded(expanded === project.id ? null : project.id)}><UiIcon name="fork" size={13} />工作树<UiIcon name={expanded === project.id ? 'chevron-down' : 'chevron-right'} size={13} /></button>
-              {!project.isDefault && <>
-              <button className="set-mini-btn ghost" onClick={() => setEditing(project)}><UiIcon name="edit" size={13} />编辑</button>
-              <button className="set-mini-btn danger" onClick={() => void remove(project)}><UiIcon name="trash" size={13} />删除</button>
-              </>}
-            </div>
-          </div>
-          {expanded === project.id && <ProjectWorktrees project={project} onOpenSession={onOpenSession} />}
-          </div>
-        ))}
-      </SetGroup>
-      <div className="set-detail-sub">每个空间包含一个主目录和可选的附加目录。新会话只选择空间，由 Agent 按各自方式加载目录。</div>
-      {error && <div className="update-alert" role="alert"><span className="update-alert-ic"><UiIcon name="warn" size={16} /></span><div className="update-alert-body"><div className="update-alert-sub">{error}</div></div></div>}
-      {editing && <ProjectEditorDialog
-        project={editing === 'new' ? undefined : editing}
-        onClose={() => setEditing(null)}
-        onSaved={(saved) => {
-          onProjectsChange(editing === 'new'
-            ? [...projects, saved]
-            : projects.map((project) => project.id === saved.id ? saved : project))
-          window.dispatchEvent(new Event('uniagent-projects-changed'))
-          setEditing(null)
-        }}
-      />}
-    </>
-  )
-}
-
 /** The bot binding gates Session defaults and notification settings. */
 function FeishuSection({
   agents,
@@ -1531,7 +1477,8 @@ function FeishuSection({
   config,
   status,
   onStatus,
-  onPatch
+  onPatch,
+  onOpenRouter
 }: {
   agents: AgentDef[]
   projects: Project[]
@@ -1539,6 +1486,7 @@ function FeishuSection({
   status: FeishuStatus | null
   onStatus: (status: FeishuStatus) => void
   onPatch: (patch: Record<string, unknown>) => void
+  onOpenRouter: () => void
 }): JSX.Element {
   const configured = !!status?.appId && !status.configuring
 
@@ -1546,7 +1494,7 @@ function FeishuSection({
   const installed = agents.filter((a) => a.lifecycle?.availability === 'available')
   const defAgent = installed.find((a) => a.id === config?.defaultAgentId) || installed[0]
   const prefs = useAgentPreferences()
-  const pref = prefs?.lastByAgent[defAgent?.id || '']
+  const pref = withLastAgentChoices(prefs?.lastByAgent[defAgent?.id || ''])
   const model = resolveAgentModel(defAgent, config?.defaultModel, pref?.defaultModel)
   const models = defAgent?.capabilities.modelSelect ? defAgent.models : []
   const efforts = defAgent?.capabilities.reasoningEffort ? model?.efforts || [] : []
@@ -1558,13 +1506,14 @@ function FeishuSection({
     <>
       <FeishuBinding scope="session" />
       {configured && <>
+      <FeishuRoutingSettings config={config} onPatch={onPatch} onOpenRouter={onOpenRouter} />
       <SetGroup title="新建会话默认参数">
         <SetRow
           label="驱动 Agent"
-          sub="私聊建会话时默认使用"
-          control={<SetSelect ariaLabel="驱动 Agent" value={defAgent?.id || ''} disabled={!installed.length} onChange={(v) => {
+          sub="选择卡片预选；自动路由新建任务时使用"
+          control={<SetSelect className="agent-default-select" ariaLabel="驱动 Agent" value={defAgent?.id || ''} disabled={!installed.length} onChange={(v) => {
             const next = installed.find(agent => agent.id === v)
-            const pref = prefs?.lastByAgent[v]
+            const pref = withLastAgentChoices(prefs?.lastByAgent[v])
             const model = resolveAgentModel(next, pref?.defaultModel)
             onPatch({ defaultAgentId: v, defaultModel: model?.id, defaultEffort: next?.capabilities.reasoningEffort ? resolveModelEffort(model, pref?.defaultEffort) : undefined, defaultPermissionMode: resolveAgentPermission(next) })
           }}>
@@ -1573,26 +1522,26 @@ function FeishuSection({
         />
         <SetRow
           label="默认模型"
-          control={<SetSelect ariaLabel="默认模型" value={model?.id || ''} disabled={!defAgent || models.length === 0} onChange={(v) => onPatch({ defaultModel: v, defaultEffort: defAgent?.capabilities.reasoningEffort ? resolveModelEffort(resolveAgentModel(defAgent, v), pref?.defaultEffort) : undefined })}>
+          control={<SetSelect className="agent-default-select" ariaLabel="默认模型" value={model?.id || ''} disabled={!defAgent || models.length === 0} onChange={(v) => onPatch({ defaultModel: v, defaultEffort: defAgent?.capabilities.reasoningEffort ? resolveModelEffort(resolveAgentModel(defAgent, v), pref?.defaultEffort) : undefined })}>
             {models.map((m) => (<option key={m.id} value={m.id}>{m.label}</option>))}
           </SetSelect>}
         />
         <SetRow
           label="默认推理强度"
-          control={<SetSelect ariaLabel="默认推理强度" value={defaultEffort || ''} disabled={efforts.length === 0} onChange={(v) => onPatch({ defaultEffort: v })}>
+          control={<SetSelect className="agent-default-select" ariaLabel="默认推理强度" value={defaultEffort || ''} disabled={efforts.length === 0} onChange={(v) => onPatch({ defaultEffort: v })}>
             {efforts.map((e) => (<option key={e} value={e}>{EFFORT_LABEL[e] || e}</option>))}
           </SetSelect>}
         />
         <SetRow
           label="默认权限"
-          control={<SetSelect ariaLabel="默认权限" value={defaultPermission || ''} disabled={permModes.length === 0} onChange={(v) => onPatch({ defaultPermissionMode: v })}>
+          control={<SetSelect className="agent-default-select" ariaLabel="默认权限" value={defaultPermission || ''} disabled={permModes.length === 0} onChange={(v) => onPatch({ defaultPermissionMode: v })}>
             {permModes.map((m) => (<option key={m.id} value={m.id}>{m.label}</option>))}
           </SetSelect>}
         />
         <SetRow
-          label="默认空间"
-          sub="飞书新话题创建会话时预先选择"
-          control={<SetSelect ariaLabel="默认空间" value={config?.defaultProjectId || projects.find((project) => project.isDefault)?.id || 'default'} onChange={(value) => onPatch({ defaultProjectId: value })}>
+          label="默认项目"
+          sub="用于手动归属；自动路由不受默认项目限制"
+          control={<SetSelect className="agent-default-select" ariaLabel="默认项目" value={config?.defaultProjectId || projects.find((project) => project.isDefault)?.id || 'default'} onChange={(value) => onPatch({ defaultProjectId: value })}>
             {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
           </SetSelect>}
         />
@@ -1714,7 +1663,7 @@ export function RoleDetail({ agents, projects, entry, role, onBack, onSave, onDe
   const kimi = agent?.adapter === 'kimi'
   const zcode = agent?.adapter === 'zcode'
   const nativeThinking = kimi || zcode
-  const pref = prefs?.lastByAgent[agentId]
+  const pref = withLastAgentChoices(prefs?.lastByAgent[agentId])
   const selectedModel = resolveAgentModel(agent, model, pref?.defaultModel)
   const selectedThinking = resolveModelThinking(selectedModel, kimiThinking, pref?.defaultThinking, pref?.defaultEffort)
   const selectedEffort = !nativeThinking && agent?.capabilities.reasoningEffort ? resolveModelEffort(selectedModel, effort, pref?.defaultEffort) : undefined
@@ -1797,7 +1746,7 @@ export function RoleDetail({ agents, projects, entry, role, onBack, onSave, onDe
       <div className="set-detail-top role-detail-top">
         {teamScope ? <button className="team-back-icon" aria-label={inline ? '返回成员列表' : '返回团队'} disabled={busy} onClick={onBack}><UiIcon name="chevron-right" size={20} /></button> : <button className="set-back" onClick={onBack}><span className="set-caret"><UiIcon name="chevron-right" size={15} /></span>返回角色</button>}
         <div className="set-detail-title">
-          <div className="sdt-main"><h2>{inline ? '创建团队专属角色' : role.id ? name || '角色' : '新建角色'}</h2><div className="set-detail-sub">{teamScope ? '角色在团队项目的空间中运行' : '保存后立即出现在 MCP 角色列表中'}</div></div>
+          <div className="sdt-main"><h2>{inline ? '创建团队专属角色' : role.id ? name || '角色' : '新建角色'}</h2><div className="set-detail-sub">{teamScope ? '角色在团队项目绑定的目录中运行' : '保存后立即出现在 MCP 角色列表中'}</div></div>
           {role.id && <span className="auto-badge paused">自定义</span>}
           {!inline && saveGlobal && <span className="team-switch-label">同时保存到角色列表<ToggleSwitch checked={saveGlobal.checked} label="同时保存到角色列表" disabled={busy} onChange={saveGlobal.onChange} /></span>}
           {!inline && <button className="set-save-btn" disabled={!valid || !dirty || busy} onClick={() => void submit()}><UiIcon name="check" size={13} />{busy ? '保存中…' : dirty ? '保存' : '已保存'}</button>}
@@ -1825,8 +1774,8 @@ export function RoleDetail({ agents, projects, entry, role, onBack, onSave, onDe
           <div className="set-fld"><label>权限</label><SetSelect ariaLabel="角色权限" value={selectedPermission || ''} disabled={permissionModes.length === 0} onChange={setPermissionMode}>{permissionModes.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</SetSelect></div>
         </div>
         {!teamScope && <div className="set-fld">
-          <label>空间策略</label>
-          <div className="set-radio-grid" role="radiogroup" aria-label="角色空间策略">
+          <label>项目策略</label>
+          <div className="set-radio-grid" role="radiogroup" aria-label="角色项目策略">
             <label className={`set-radio-card ${projectMode === 'follow' ? 'is-selected' : ''}`}>
               <input
                 type="radio"
@@ -1835,8 +1784,8 @@ export function RoleDetail({ agents, projects, entry, role, onBack, onSave, onDe
                 onChange={() => setProjectMode('follow')}
               />
               <span className="set-radio-copy">
-                <strong>跟随调用方空间（默认）</strong>
-                <small>从 MCP 调用方会话继承空间及全部目录。</small>
+                <strong>跟随调用方项目（默认）</strong>
+                <small>从 MCP 调用方会话继承项目及全部目录。</small>
               </span>
             </label>
             <label className={`set-radio-card ${projectMode === 'fixed' ? 'is-selected' : ''}`}>
@@ -1847,17 +1796,17 @@ export function RoleDetail({ agents, projects, entry, role, onBack, onSave, onDe
                 onChange={() => setProjectMode('fixed')}
               />
               <span className="set-radio-copy">
-                <strong>固定空间</strong>
-                <small>始终在指定空间的多目录工作空间中运行。</small>
+                <strong>固定项目</strong>
+                <small>始终在指定项目的多目录工作空间中运行。</small>
               </span>
             </label>
           </div>
         </div>}
-        {!teamScope && projectMode === 'fixed' && <div className="set-fld"><label>固定空间</label><SetSelect ariaLabel="角色固定空间" value={projectId} onChange={setProjectId}><option value="">选择空间</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</SetSelect></div>}
+        {!teamScope && projectMode === 'fixed' && <div className="set-fld"><label>固定项目</label><SetSelect ariaLabel="角色固定项目" value={projectId} onChange={setProjectId}><option value="">选择项目</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</SetSelect></div>}
       </SetGroup>
 
       <SetGroup title="Skills 与工具" pad>
-        {agent && <div className="set-detail-sub">{stableACP ? `${agent.name}：${zcode ? '支持模型、思考深度、权限与空间预设' :  '稳定 ACP 仅支持模型、权限与空间预设'}；角色系统指令、Skills 筛选与工具限制暂不开放。` : <>{agent.name}：支持角色指令；Skills {skillsSupported ? '支持全部、禁用及精确指定' : '仅支持全部'}；工具{toolsSupported ? '支持继承、仅允许及禁止指定' : '仅支持继承 Agent 默认工具'}。</>}</div>}
+        {agent && <div className="set-detail-sub">{stableACP ? `${agent.name}：${zcode ? '支持模型、思考深度、权限与项目预设' :  '稳定 ACP 仅支持模型、权限与项目预设'}；角色系统指令、Skills 筛选与工具限制暂不开放。` : <>{agent.name}：支持角色指令；Skills {skillsSupported ? '支持全部、禁用及精确指定' : '仅支持全部'}；工具{toolsSupported ? '支持继承、仅允许及禁止指定' : '仅支持继承 Agent 默认工具'}。</>}</div>}
         <div className="set-fld-row">
           <div className="set-fld"><label>Skills</label><SetSelect ariaLabel="角色 Skills 策略" value={skillsMode} onChange={(value) => setSkillsMode(value as 'all' | 'none' | 'allowlist')}><option value="all">全部 Skills（默认）</option><option value="none" disabled={!skillsSupported}>禁用全部 Skills{!skillsSupported ? '（暂不支持）' : ''}</option><option value="allowlist" disabled={!skillsSupported}>仅指定 Skills{!skillsSupported ? '（暂不支持）' : ''}</option></SetSelect>{skillsSupportNote && <div className="set-detail-sub">{skillsSupportNote}</div>}</div>
           <div className="set-fld"><label>工具策略</label><SetSelect ariaLabel="角色工具策略" value={toolMode} onChange={(value) => setToolMode(value as 'inherit' | 'allow-only' | 'deny-only')}><option value="inherit">继承 Agent 默认工具</option><option value="allow-only" disabled={!toolsSupported}>仅允许指定工具{!toolsSupported ? '（暂不支持）' : ''}</option><option value="deny-only" disabled={!toolsSupported}>禁止指定工具{!toolsSupported ? '（暂不支持）' : ''}</option></SetSelect>{!toolsSupported && <div className="set-detail-sub">当前 Agent 不支持此角色工具限制；请继承默认工具。</div>}</div>
@@ -1904,7 +1853,7 @@ function PresetDetail({
 
   const agent = agents.find((a) => a.id === agentId)
   const models = agent?.models ?? []
-  const pref = prefs?.lastByAgent[agentId]
+  const pref = withLastAgentChoices(prefs?.lastByAgent[agentId])
   const selectedModel = resolveAgentModel(agent, model, pref?.defaultModel)
   const efforts = agent?.capabilities.reasoningEffort ? selectedModel?.efforts || [] : []
   const selectedEffort = efforts.length ? resolveModelEffort(selectedModel, effort, pref?.defaultEffort) : undefined

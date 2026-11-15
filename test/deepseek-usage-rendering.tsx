@@ -32,10 +32,10 @@ native('turn/end', { turn: 1, reason: { kind: 'completed' } })
 const firstTurn = [...raw]
 const usageEvents = (events: UAEvent[]) => events.filter(e => e.type === 'system_notice' && e.payload.kind === 'usage')
 const cards = (events: UAEvent[]) => renderEventStream(events, 'completed', 'usage-session', {
-  inspect: "document.querySelectorAll('.card.system-notice.usage').length"
+  inspect: "document.querySelectorAll('.message-usage > button').length"
 })
 
-assert.equal(await cards(firstTurn), 1, 'saved duplicate snapshots must render ONE usage card, not fifteen')
+assert.equal(await cards(firstTurn), 1, 'saved duplicate snapshots must render ONE usage icon, not fifteen')
 const live = firstTurn.reduce<UAEvent[]>((events, event) => mergeSessionEvent(events, event), [])
 const inPlace: UAEvent[] = []
 firstTurn.forEach(event => assert.equal(mergeSessionEvent(inPlace, event, true), inPlace))
@@ -75,7 +75,7 @@ native('assistant/message', { turn: 2, step: 0, message: { id: 'second', content
 native('turn/end', { turn: 2, reason: { kind: 'aborted' } })
 const tables = await renderEventStream(JSON.parse(JSON.stringify(raw)), 'completed', 'usage-session', {
   inspect: `(async () => {
-    document.querySelectorAll('.usage-line').forEach(line => line.click());
+    document.querySelectorAll('.message-usage > button').forEach(button => button.click());
     await new Promise(resolve => setTimeout(resolve, 50));
     return [...document.querySelectorAll('.usage-table')].map(table => [...table.querySelectorAll('tbody tr')].map(row => [...row.querySelectorAll('td')].map(cell => cell.textContent)));
   })()`
@@ -95,7 +95,7 @@ const unknownHistory: UAEvent[] = [{
 }]
 const unknownTable = await renderEventStream(unknownHistory, 'completed', 'usage-session', {
   inspect: `(async () => {
-    document.querySelector('.usage-line').click();
+    document.querySelector('.message-usage > button').click();
     await new Promise(resolve => setTimeout(resolve, 50));
     return [...document.querySelectorAll('.usage-table tbody tr')].map(row => [...row.querySelectorAll('td')].map(cell => cell.textContent));
   })()`
@@ -110,7 +110,7 @@ const partialHistory: UAEvent[] = [
 ]
 const partialTables = await renderEventStream(partialHistory, 'completed', 'usage-session', {
   inspect: `(async () => {
-    document.querySelectorAll('.usage-line').forEach(line => line.click());
+    document.querySelectorAll('.message-usage > button').forEach(button => button.click());
     await new Promise(resolve => setTimeout(resolve, 50));
     return [...document.querySelectorAll('.usage-table')].map(table => table.querySelectorAll('tbody tr')[1].lastElementChild.textContent);
   })()`

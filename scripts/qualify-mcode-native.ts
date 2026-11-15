@@ -27,7 +27,7 @@ const server = createServer(async (request, response) => {
   const body = text ? JSON.parse(text) : {}
   if (!Array.isArray(body.messages)) { response.end(JSON.stringify({ data: [] })); return }
   requests++
-  const titleTool = body.tools?.find((tool: any) => tool.name === 'submit_session_title')
+  const titleTool = body.tools?.find((tool: any) => ['submit_session_title', 'review_session_title'].includes(tool.name))
   if (!titleTool) mainRequests++
   if (mode === 'hold' && !titleTool) return
   const toolResult = toolIssued
@@ -40,7 +40,7 @@ const server = createServer(async (request, response) => {
   const frames = [
     { type: 'message_start', message: { id: 'msg_ua_local_' + requests, type: 'message', role: 'assistant', model: body.model, content: [], stop_reason: null, usage: { input_tokens: 128, output_tokens: 0 } } },
     { type: 'content_block_start', index: 0, content_block: tool ? { type: 'tool_use', id: 'write-' + requests, name: tool.name, input: {} } : { type: 'text', text: '' } },
-    { type: 'content_block_delta', index: 0, delta: tool ? { type: 'input_json_delta', partial_json: JSON.stringify(titleTool ? { title: 'Native qualification' } : mode === 'permission' ? { command: `rm -rf '${join(root, 'risky-target')}' && mkdir -p '${join(root, 'risky-target')}' && printf owned > '${join(root, 'risky-target/marker')}'`, description: 'Operate only on the isolated qualification marker' } : { path: join(workdir, 'marker.txt'), content: 'owned native fixture' }) } : { type: 'text_delta', text: 'UA_MCODE_NATIVE_OK' } },
+    { type: 'content_block_delta', index: 0, delta: tool ? { type: 'input_json_delta', partial_json: JSON.stringify(titleTool ? titleTool.name === 'review_session_title' ? { action: 'keep' } : { title: 'Native qualification' } : mode === 'permission' ? { command: `rm -rf '${join(root, 'risky-target')}' && mkdir -p '${join(root, 'risky-target')}' && printf owned > '${join(root, 'risky-target/marker')}'`, description: 'Operate only on the isolated qualification marker' } : { path: join(workdir, 'marker.txt'), content: 'owned native fixture' }) } : { type: 'text_delta', text: 'UA_MCODE_NATIVE_OK' } },
     { type: 'content_block_stop', index: 0 },
     { type: 'message_delta', delta: { stop_reason: tool ? 'tool_use' : 'end_turn' }, usage: { output_tokens: 16 } },
     { type: 'message_stop' }

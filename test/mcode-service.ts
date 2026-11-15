@@ -6,6 +6,8 @@ import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { cancelMCodeOperation, checkMCodeConnection, detectMCode, installMCode, mcodeRuntimeEnv, mcodeSnapshot, reopenMCodeSignIn, signInMCode } from '../src/main/mcodeService.ts'
+import { ACPConnection } from '../src/main/acp/acpConnection.ts'
+import { ACPRecoveryError } from '../src/main/acp/acpProcessLifecycle.ts'
 import type { AgentDef } from '../src/shared/types.ts'
 
 const root = await mkdtemp(join(tmpdir(), 'uniagent-mcode-service-'))
@@ -35,6 +37,13 @@ try {
   assert.equal(detected.incompatible, false)
   assert.ok(detected.models.length > 0)
   assert.equal((await mcodeSnapshot()).status, 'ready')
+  const initialize = ACPConnection.prototype.initialize
+  try {
+    ACPConnection.prototype.initialize = async () => { throw new ACPRecoveryError() }
+    const blocked = await detectMCode(agent)
+    assert.equal(blocked.authenticationRequired, false)
+    assert.match(blocked.unavailableReason || '', /本地进程恢复未完成/)
+  } finally { ACPConnection.prototype.initialize = initialize }
   assert.equal(existsSync(join(data, 'sessions.json')), false, 'detection must not create sessions in the native history')
   assert.equal(mcodeRuntimeEnv().MINIMAX_DATA_DIR, data, 'runtime and history use the same native data root')
   await chmod(nativeBin, 0o600)
@@ -71,7 +80,8 @@ try {
   while (!opened.length) await new Promise(done => setTimeout(done, 10))
   await reopenMCodeSignIn()
   assert.equal(opened.length, 2)
-  assert.equal((await login).status, 'ready', 'browser login is reused automatically')
+  const authenticated = await login
+  assert.equal(authenticated.status, 'ready', 'browser login is reused automatically: ' + JSON.stringify({ phase: authenticated.phase, message: authenticated.message }))
   assert.equal((await mcodeSnapshot()).status, 'ready')
   const log = (await readFile(process.env.FAKE_MCODE_LOG!, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
   assert.ok(log.some(row => row.kind === 'argv' && row.argv.join(' ') === 'login --region global --no-browser' && row.dataDir === data))

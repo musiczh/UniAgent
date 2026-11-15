@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
+import ts from 'typescript'
 
 const main = readFileSync(new URL('../src/main/index.ts', import.meta.url), 'utf8')
 const orchestrator = readFileSync(new URL('../src/main/orchestrator.ts', import.meta.url), 'utf8')
@@ -12,9 +13,9 @@ const html = readFileSync(new URL('../src/renderer/index.html', import.meta.url)
 const startupHtml = readFileSync(new URL('../src/renderer/startup.html', import.meta.url), 'utf8')
 const launch = readFileSync(new URL('../src/main/launch.ts', import.meta.url), 'utf8')
 const windowFactory = readFileSync(new URL('../src/main/startupWindow.ts', import.meta.url), 'utf8')
+const mainAst = ts.createSourceFile('index.ts', main, ts.ScriptTarget.Latest, true)
 
 const startup = main.slice(main.indexOf('app.whenReady().then'))
-const ipcRegistration = main.slice(main.indexOf('function registerIpc'))
 const createWindowAt = startup.indexOf('createWindow(showStartupProgress)')
 const pathHydrationAt = startup.indexOf('await hydratePathFromLoginShell()')
 const detectionAt = startup.indexOf('agentLifecycle.detectStartup()')
@@ -47,13 +48,28 @@ assert.ok(backgroundStatusCheckAt > autoUpdateAt, 'the background update-status 
 const backgroundReadinessAt = startup.lastIndexOf('startupProtocolSettled.then(', backgroundStatusCheckAt)
 assert.ok(backgroundReadinessAt > autoUpdateAt && backgroundReadinessAt < backgroundStatusCheckAt, 'the background update-status check waits for the startup protocol to settle')
 
+let mutationWrapper
+function findMutationWrapper(node) {
+  if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === 'handleUserSessionMutation') mutationWrapper = node.initializer
+  ts.forEachChild(node, findMutationWrapper)
+}
+findMutationWrapper(mainAst)
+assert.ok(mutationWrapper, 'user session mutations have a shared guard')
+
 function ipcHandler(name) {
-  const channelAt = ipcRegistration.indexOf('IPC.' + name)
-  assert.ok(channelAt >= 0, 'missing IPC handler for ' + name)
-  const start = ipcRegistration.lastIndexOf('ipcMain.handle', channelAt)
-  const next = ipcRegistration.indexOf('ipcMain.handle', channelAt + name.length + 4)
-  assert.ok(start >= 0, 'missing handler start for ' + name)
-  return ipcRegistration.slice(start, next < 0 ? ipcRegistration.length : next)
+  let handler
+  function visit(node) {
+    if (ts.isCallExpression(node) && node.arguments.length >= 2 && ts.isPropertyAccessExpression(node.arguments[0]) &&
+        ts.isIdentifier(node.arguments[0].expression) && node.arguments[0].expression.text === 'IPC' && node.arguments[0].name.text === name &&
+        (ts.isIdentifier(node.expression) && node.expression.text === 'handleUserSessionMutation' ||
+         ts.isPropertyAccessExpression(node.expression) && ts.isIdentifier(node.expression.expression) && node.expression.expression.text === 'ipcMain' && node.expression.name.text === 'handle')) handler = node
+    ts.forEachChild(node, visit)
+  }
+  visit(mainAst)
+  assert.ok(handler, 'missing IPC handler for ' + name)
+  const sharedGuard = ts.isIdentifier(handler.expression) && handler.expression.text === 'handleUserSessionMutation'
+    ? mutationWrapper.getText(mainAst) + '\n' : ''
+  return sharedGuard + handler.getText(mainAst)
 }
 
 assert.ok(createWindowAt >= 0, 'startup must create a BrowserWindow')
@@ -70,7 +86,7 @@ assert.match(supplementalDetection, /await detection\.core[\s\S]*refreshDetected
 assert.doesNotMatch(supplementalDetection, /refreshDetectedAgents\(/, 'supplemental Codex models must not restart every Agent probe')
 assert.ok(main.includes('if (capabilityRecoveryFlight) await capabilityRecoveryFlight'))
 assert.match(main, /async function awaitSessionHydration\(\)[\s\S]{0,160}if \(hydration\) await hydration/)
-assert.match(main, /async function awaitAgentReady\(agentId: string\)[\s\S]{0,300}const isProtocolAgent = agentId === 'grok'[\s\S]{0,160}startupProtocolSettled[\s\S]{0,120}startupCoreReady/)
+assert.match(main, /async function awaitAgentReady\(agentId: string\)[\s\S]{0,300}const isProtocolAgent = agentId === 'qoder' \|\| agentId === 'grok'[\s\S]{0,180}startupProtocolSettled[\s\S]{0,120}startupCoreReady/)
 assert.match(main, /if \(isProtocolAgent && !agents\.some\(\(agent\) => agent\.id === agentId\)\)[\s\S]{0,700}await agentLifecycle\.detectAll\(\)[\s\S]{0,200}agent_not_available/)
 assert.match(main, /async function awaitSessionAgentReady\(sessionId: string\)[\s\S]{0,180}await awaitSessionHydration\(\)[\s\S]{0,220}session\.config\.agentId/)
 assert.match(main, /async function awaitAgentsReady\(agentIds: readonly string\[\]\)[\s\S]{0,220}new Set\(agentIds\)[\s\S]{0,120}awaitAgentReady/)
@@ -79,7 +95,67 @@ const coreJoin = startup.slice(startup.indexOf('startupCoreReady ='), startup.in
 assert.match(coreJoin, /startupCoreReady = Promise\.all\(\[startupSessionHydration, coreDetection\]\)/)
 assert.match(coreJoin, /resumePendingQueues\(readyCoreIds\)/)
 assert.match(startup, /startupProtocolSettled = Promise\.all\(\[startupSessionHydration, protocolResult\]\)[\s\S]{0,900}resumePendingQueues\(readyProtocolIds\)/)
-assert.doesNotMatch(coreJoin, /startupProtocolSettled/, 'core readiness must not wait for ACP providers')
+// Execute the actual readiness expression: later fire-and-forget consumers may
+// reference the protocol barrier without making it a core readiness dependency.
+let coreExpression, cloudExpression
+function findReadiness(node) {
+  if (ts.isBinaryExpression(node) && ts.isIdentifier(node.left) && node.left.text === 'startupCoreReady' &&
+      ts.isCallExpression(node.right) && ts.isPropertyAccessExpression(node.right.expression) && node.right.expression.name.text === 'then') coreExpression = node
+  if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'then' &&
+      node.arguments.length === 1 && ts.isArrowFunction(node.arguments[0]) && ts.isCallExpression(node.arguments[0].body)) {
+    const target = node.arguments[0].body.expression
+    if (ts.isPropertyAccessExpression(target) && ts.isIdentifier(target.expression) && target.expression.text === 'cloudMonitor' && target.name.text === 'start') cloudExpression = node
+  }
+  ts.forEachChild(node, findReadiness)
+}
+findReadiness(mainAst)
+assert.ok(coreExpression, 'core readiness expression exists')
+assert.ok(cloudExpression, 'background monitoring is wired to readiness settlement')
+const executeReadiness = (node, context) => vm.runInNewContext(ts.transpileModule('(' + node.getText(mainAst) + ')', {
+  compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+}).outputText, context)
+let readyIds
+const coreAgents = [{ id: 'codex', models: [], lifecycle: { availability: 'available' } }, { id: 'grok', models: [], lifecycle: { availability: 'available' } }]
+const coreReadiness = executeReadiness(coreExpression, {
+  startupCoreReady: undefined, startupSessionHydration: Promise.resolve(), coreDetection: Promise.resolve(coreAgents), startupProtocolSettled: new Promise(() => {}),
+  agents: [], agentLifecycle: { snapshot: () => coreAgents }, orchestrator: { migrateLegacyPlanSessions() {}, reconcileAgentConfigs() {}, resumePendingQueues(ids) { readyIds = Array.from(ids) } },
+  personalAssistant: { enforceAgentSupport: async () => [] }, assistantFeishuThreads: { remove() {} }, appSettings: { pendingInitializations: () => [] },
+  reconcilePricing() {}, publishHandoffCatalog() {}, recordRuntime() {}, mainWindow: null
+})
+let readinessTimeout
+await Promise.race([coreReadiness, new Promise((_, reject) => { readinessTimeout = setTimeout(() => reject(new Error('core readiness waited for unresolved ACP')), 1000) })]).finally(() => clearTimeout(readinessTimeout))
+assert.deepEqual(readyIds, ['codex'], 'only available core Agent queues resume before protocol settlement')
+function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no }); return { promise, resolve, reject } }
+const mutationHydration = deferred()
+let registeredMutation, mutations = 0, enabledChecks = 0
+const registerMutation = executeReadiness(mutationWrapper, {
+  ipcMain: { handle(_channel, listener) { registeredMutation = listener } },
+  assertTrustedCapabilitySyncIpc() {}, awaitSessionHydration: () => mutationHydration.promise,
+  orchestrator: { getSessionById: () => ({ config: {} }), assertUserSessionEnabled() { enabledChecks++ } }
+})
+registerMutation('test:mutation', (_event, sessionId) => { mutations++; return sessionId })
+await assert.rejects(registeredMutation({}, ''), /invalid_session_id/)
+const pendingMutation = registeredMutation({}, 'session-1')
+await new Promise(resolve => setImmediate(resolve))
+assert.equal(mutations, 0, 'shared mutation guard must await session hydration before the listener')
+assert.equal(enabledChecks, 0, 'session checks must use hydrated state')
+mutationHydration.resolve()
+assert.equal(await pendingMutation, 'session-1')
+assert.equal(mutations, 1)
+assert.equal(enabledChecks, 1)
+const coreBarrier = deferred(), protocolBarrier = deferred(), recoveryBarrier = deferred()
+let cloudStarts = 0
+const cloudReadiness = executeReadiness(cloudExpression, { startupCoreReady: coreBarrier.promise, startupProtocolSettled: protocolBarrier.promise,
+  capabilityRecoveryFlight: recoveryBarrier.promise, cloudMonitor: { start() { cloudStarts++ } } })
+coreBarrier.reject(new Error('core recovery failed'))
+await new Promise(resolve => setImmediate(resolve))
+assert.equal(cloudStarts, 0)
+protocolBarrier.resolve()
+await new Promise(resolve => setImmediate(resolve))
+assert.equal(cloudStarts, 0, 'monitoring waits until all startup recovery has settled')
+recoveryBarrier.resolve()
+await cloudReadiness
+assert.equal(cloudStarts, 1, 'monitoring can report a startup failure after all barriers settle')
 assert.ok(startup.includes('Promise.all([startupHandoffReady, startupSessionHydration, startupProtocolSettled])'))
 assert.ok(main.includes('function createWindow(onLoaded?: () => void)'))
 assert.ok(main.includes("if (onLoaded) window.webContents.once('did-finish-load', onLoaded)"))
@@ -87,11 +163,43 @@ assert.ok(startup.includes('createWindow(rendererReadySettled ? undefined : show
 
 for (const name of [
   'dequeue', 'promoteQueueItem', 'interrupt', 'listSessions', 'listQueues',
-  'archiveSession', 'unarchiveSession', 'deleteSession', 'renameSession', 'pinSession',
+  'archiveSession', 'unarchiveSession', 'renameSession', 'pinSession',
   'respondRequest', 'reviewGetFilePair', 'reviewGetChangeSet'
 ]) {
   assert.ok(ipcHandler(name).includes('await awaitSessionHydration()'), name + ' must wait for session hydration')
 }
+
+let deletionRegistration
+function findDeletionRegistration(node) {
+  if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'registerSessionDeletionIpc') deletionRegistration = node
+  ts.forEachChild(node, findDeletionRegistration)
+}
+findDeletionRegistration(mainAst)
+assert.ok(deletionRegistration, 'session deletion IPC is registered')
+const hydration = deletionRegistration.arguments[1].properties.find(property => property.name?.getText(mainAst) === 'hydrate')
+assert.equal(hydration?.initializer.getText(mainAst), 'awaitSessionHydration', 'delegated deletion uses the startup hydration barrier')
+const deletionSource = readFileSync(new URL('../src/main/sessionDeletionIpc.ts', import.meta.url), 'utf8')
+const deletionAst = ts.createSourceFile('sessionDeletionIpc.ts', deletionSource, ts.ScriptTarget.Latest, true)
+const deletionFunction = deletionAst.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'registerSessionDeletionIpc')
+assert.ok(deletionFunction)
+const deletionCode = ts.transpileModule(deletionFunction.getText(deletionAst).replace(/^export /, ''), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
+const deletionIpc = { deleteSession: 'delete', previewSessionDeletion: 'preview', cancelSessionDeletionPreview: 'cancel' }
+const registerDeletion = vm.runInNewContext(deletionCode + '\nregisterSessionDeletionIpc', { IPC: deletionIpc, AbortController })
+const deletionHandlers = new Map()
+let releaseDeletionHydration, deletionCompleted = false, deletionTrusted = false
+const deletionBarrier = new Promise(resolve => { releaseDeletionHydration = resolve })
+registerDeletion({ handle: (name, handler) => deletionHandlers.set(name, handler) }, {
+  assertTrusted: () => { deletionTrusted = true }, hydrate: () => deletionBarrier,
+  orchestrator: { assertUserSessionEnabled: () => {}, getSessionById: () => ({ config: {} }), deleteSession: async () => { deletionCompleted = true } },
+  teams: { catalog: () => ({ projects: [] }) }, deletingIds: new Set(), changed: () => {}
+})
+const deletionFlight = deletionHandlers.get(deletionIpc.deleteSession)({}, 'hydrated-session')
+await Promise.resolve()
+assert.equal(deletionTrusted, true)
+assert.equal(deletionCompleted, false, 'deleteSession cannot run before startup hydration')
+releaseDeletionHydration()
+await deletionFlight
+assert.equal(deletionCompleted, true, 'deleteSession resumes once startup hydration finishes')
 
 for (const name of [
   'sendMessage', 'forceSend', 'getEvents', 'getSessionRuntimeState',

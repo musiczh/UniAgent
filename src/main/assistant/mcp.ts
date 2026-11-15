@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { resolveUserDataHome } from '../userData'
 import type { MemoryRequest, SessionSearchRequest } from '../../shared/assistant'
 import { UNIAGENT_MANAGE_TOOL, type ManageRequest } from '../../shared/uniagentManage'
+import { SETTINGS_TOOL } from '../../shared/settingsDefinition'
 
 export interface AssistantScope { sessionId: string; token: string; active: boolean; jobId?: string; calls: number }
 const scopes = new Map<string, AssistantScope>()
@@ -19,7 +20,7 @@ export const ASSISTANT_REVIEW_TOOLS = [
     query: { type: 'string' }, sessionId: { type: 'string' }, aroundMessageId: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 20 }, window: { type: 'integer', minimum: 1, maximum: 20 }, after: { type: 'string' }, before: { type: 'string' }, roles: { type: 'array', items: { enum: ['user','assistant','tool'] } }, sort: { enum: ['newest','oldest'] }
   }, additionalProperties: false } }
 ]
-export const ASSISTANT_TOOLS = [...ASSISTANT_REVIEW_TOOLS, UNIAGENT_MANAGE_TOOL]
+export const ASSISTANT_TOOLS = [...ASSISTANT_REVIEW_TOOLS, UNIAGENT_MANAGE_TOOL, SETTINGS_TOOL]
 export function bindAssistantScope(sessionId: string, jobId?: string): AssistantScope {
   if (!jobId && scopes.has(sessionId)) return scopes.get(sessionId)!
   const scope = { sessionId, jobId, token: randomBytes(32).toString('hex'), active: !!jobId, calls: 0 }
@@ -59,7 +60,7 @@ export async function watchAssistantInbox(handle: (scope: AssistantScope, tool: 
           pending.add(req.id)
           void Promise.resolve().then(() => {
             const scope = scopes.get(req.sessionId)
-            if (!scope || !scope.active || scope.token !== req.token || !['assistant_memory','session_search','uniagent_manage'].includes(req.tool) || scope.jobId && req.tool === 'uniagent_manage') throw new Error('assistant_scope_expired')
+            if (!scope || !scope.active || scope.token !== req.token || !(scope.jobId ? ASSISTANT_REVIEW_TOOLS : ASSISTANT_TOOLS).some(tool => tool.name === req.tool)) throw new Error('assistant_scope_expired')
             return handle(scope, req.tool, req.args)
           }).then(value => ({ ok: true, value }), error => ({ ok: false, error: error instanceof Error ? error.message : String(error) })).then(async value => {
             if (closed) return

@@ -67,7 +67,7 @@ async function state(id: string, status: string, text = '', ts = Date.now()): Pr
 }
 try {
   const tools = (await rpc('tools/list', {})).result.tools
-  assert.deepEqual(tools.map((tool: any) => tool.name).sort(), ['send_to_feishu', 'send_to_weixin', 'uniagent_query', 'uniagent_task'])
+  assert.deepEqual(tools.map((tool: any) => tool.name).sort(), ['send_to_feishu', 'send_to_weixin', 'uniagent_automation', 'uniagent_query', 'uniagent_task'])
   assert.deepEqual(tools.find((tool: any) => tool.name === 'send_to_weixin').inputSchema, tools.find((tool: any) => tool.name === 'send_to_feishu').inputSchema)
   assert.equal((await call('send_to_weixin', { text: 'missing caller' })).error.code, -32000)
   assert.deepEqual(tools.find((tool: any) => tool.name === 'uniagent_task').inputSchema.properties.action.enum, ['create', 'followup', 'stop', 'get'])

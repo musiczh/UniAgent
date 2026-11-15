@@ -52,6 +52,8 @@ export class CodexModelSources {
   mergeModels(nativeModels: ModelDef[]): ModelDef[] {
     this.nativeIds = new Set(nativeModels.map(model => model.id))
     const native = nativeModels.map(model => ({ ...model, modelSource: { kind: 'native' as const } }))
+    const ferry = native.filter(model => model.id.startsWith('ferry-'))
+    const subscription = native.filter(model => !model.id.startsWith('ferry-'))
     const thirdParty = this.thirdParty.supplementalModels()
     const local = this.local.availability === 'ready' && this.local.connection && this.local.activeModelId
       ? this.local.models
@@ -62,7 +64,7 @@ export class CodexModelSources {
             modelSource: { kind: 'local' as const, sourceId: 'bonsai' }
           })))
       : []
-    return mergeCodexSourceModels(native, [...thirdParty, ...local])
+    return mergeCodexSourceModels(subscription, [...thirdParty, ...local, ...ferry])
   }
 
   normalize(config: SessionConfig): SessionConfig {

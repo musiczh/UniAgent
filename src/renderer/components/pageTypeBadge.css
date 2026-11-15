@@ -1,0 +1,6 @@
+.page-type-title { display:flex; align-items:flex-start; gap:12px; flex:1; min-width:0; }
+.page-type-title>h1 { flex:1; min-width:0; }
+.page-type-badge { display:inline-flex; align-items:center; justify-content:center; flex:none; gap:5px; height:24px; padding:0 8px; border-radius:5px; color:var(--text-dim); background:var(--bg-elev2); font-size:12px; font-weight:500; line-height:1.5; white-space:nowrap; }
+.page-type-badge.task { color:var(--blue); background:var(--blue-soft); }
+.page-type-badge.requirement { color:var(--purple); background:var(--purple-soft); }
+.scope-heading-title { flex:1; min-width:0; }

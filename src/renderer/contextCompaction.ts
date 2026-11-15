@@ -1,5 +1,6 @@
 import type { AgentDef } from '@shared/types'
 import { isSessionBusy } from '@shared/sessionStatus'
+import { hasRunningContextCompaction } from '@shared/eventSnapshots'
 
 export interface ContextCompactionEvent {
   type: string
@@ -18,7 +19,7 @@ export function supportsManualContextCompaction(
   agent: Pick<AgentDef, 'adapter' | 'capabilities'> | null | undefined
 ): boolean {
   return !!agent &&
-    (agent.adapter === 'codex' || agent.adapter === 'traex' || agent.adapter === 'claude' || (['kimi', 'grok', 'deepseek', 'mcode'].includes(agent.adapter) && agent.capabilities.commands?.some(command => command.replace(/^\//, '') === 'compact') === true)) &&
+    (agent.adapter === 'codex' || agent.adapter === 'traex' || agent.adapter === 'claude' || agent.adapter === 'qoder' || (['kimi', 'grok', 'deepseek', 'mcode'].includes(agent.adapter) && agent.capabilities.commands?.some(command => command.replace(/^\//, '') === 'compact') === true)) &&
     agent.capabilities.streaming === true
 }
 
@@ -34,12 +35,8 @@ export function contextCompactionAvailability(
   hasLiveStreamer: boolean,
   preparingModel = false
 ): ContextCompactionAvailability {
-  const compacting = events.some(
-    (event) => event.type === 'context_compaction' && event.state === 'running'
-  )
-  const providerSwitchCompacting = events.some(
-    (event) => event.type === 'context_compaction' && event.state === 'running' && event.payload?.reason === 'provider-switch'
-  )
+  const compacting = hasRunningContextCompaction(events)
+  const providerSwitchCompacting = hasRunningContextCompaction(events, 'provider-switch')
 
   let disabledReason: string | undefined
   if (!supportsCompact) disabledReason = '当前 Agent 不支持手动压缩上下文。'

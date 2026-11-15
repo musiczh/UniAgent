@@ -10,6 +10,7 @@ const HOVER_CLOSE_GRACE_MS = 260
  */
 export function ContextMeter({
   used,
+  usedPercentage,
   window: ctx,
   onCompact,
   canCompact,
@@ -17,6 +18,7 @@ export function ContextMeter({
   disabledReason
 }: {
   used: number
+  usedPercentage?: number
   window?: number
   onCompact: () => Promise<void>
   canCompact: boolean
@@ -33,7 +35,7 @@ export function ContextMeter({
   const pinnedOpen = useRef(false)
   const hoverCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const popoverId = useId()
-  const pct = ctx && ctx > 0 ? Math.min(100, Math.round((used / ctx) * 100)) : null
+  const pct = usedPercentage !== undefined ? Math.round(Math.max(0, Math.min(100, usedPercentage))) : ctx && ctx > 0 ? Math.min(100, Math.round((used / ctx) * 100)) : null
   const level = pct == null ? '' : pct >= 90 ? ' danger' : pct >= 70 ? ' warn' : ''
   const compactBusy = compacting || compactRequested
 
@@ -205,7 +207,7 @@ export function ContextMeter({
         </span>
         <span className="ctx-nums">
           {pct != null && <b className="ctx-pct">{pct}%</b>}
-          <span className="ctx-tok">{fmtTokens(used)}{ctx ? ` / ${fmtTokens(ctx)}` : ''} tok</span>
+          <span className="ctx-tok">{usedPercentage !== undefined ? '原生占用比例' : <>{fmtTokens(used)}{ctx ? ` / ${fmtTokens(ctx)}` : ''} tok</>}</span>
         </span>
       </button>
       {open && (
@@ -224,7 +226,7 @@ export function ContextMeter({
           >
             <div className="ctx-pop-row">
               <span>上下文占用</span>
-              <span>{used.toLocaleString()} token{pct != null ? ` · ${pct}%` : ''}</span>
+              <span>{usedPercentage !== undefined ? `原生占用 ${pct}% · 未提供精确 Token` : `${used.toLocaleString()} token${pct != null ? ` · ${pct}%` : ''}`}</span>
             </div>
             {ctx != null && (
               <div className="ctx-pop-row">

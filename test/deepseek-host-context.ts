@@ -11,12 +11,18 @@ try {
   const plugin = await import('data:text/javascript;base64,' + Buffer.from(deepseekHostContextPlugin).toString('base64'))
   let handler: any, busy = false, fail = false
   const mounts: any[] = [], disposals: any[] = []
+  const prompts: any[] = []
   await plugin.apply({ loader: { import: async (name: string) => { assert.equal(name, '@deepseek-ai/dsh-mcp-client'); return {} } }, commands: { register: (definition: any) => { handler = definition.handler } } }, {
     directory: join(root, 'uniagent-context')
   })
   const agent = { session: { id: '../../native/path' },
     runMaintenance: async (callback: any) => { if (busy) throw new Error('busy'); return callback() },
     ctx: { plugin: (_module: any, config: any) => {
+      if (_module.name === 'uniagent-router-policy') _module.apply({
+        systemPrompt: { section: (value: any) => prompts.push(value) },
+        tools: { guard: () => { throw new Error('Router must retain all native tools') } },
+        on: () => { throw new Error('Router must not filter the model tool assembly') }
+      })
       mounts.push(config)
       const fiber = { dispose: async () => { disposals.push(config) } }
       return Object.assign(fail ? Promise.reject(new Error('startup failed')) : Promise.resolve(fiber), fiber)
@@ -46,6 +52,16 @@ try {
   await bindDeepSeekHostContext(client, agent.session.id, 'local-three', root)
   assert.equal(mounts.length, 4, 'failed activation does not masquerade as a bound context')
   assert.equal((await handler({ agent, rawInput: 'arbitrary-command' })).kind, 'error')
+  registerDeepSeekHostContext(client, root, () => [
+    { name: 'uniagent-router', command: '/node', args: ['router.cjs'], env: [] },
+    { name: 'uniagent', command: '/node', args: ['server.cjs'], env: [] }
+  ])
+  await bindDeepSeekHostContext(client, agent.session.id, 'router-session', root)
+  assert.equal(prompts.length, 1, 'Router instructions are injected alongside normal UniAgent MCP')
+  assert.match(prompts[0].text, /全部正常工具/)
+  assert.match(prompts[0].text, /不修改项目／文档、发送消息/)
+  assert.match(prompts[0].text, /router_assign_task/)
+  assert.deepEqual(mounts.slice(-2).map(mount => mount.serverName), ['uniagent-router', 'uniagent'])
   await assert.rejects(readFile(join(root, 'path.json')), { code: 'ENOENT' })
   console.log('DeepSeek Host context: exact caller, idempotence, rebind cleanup, busy and failed activation passed')
 } finally { await rm(root, { recursive: true, force: true }) }

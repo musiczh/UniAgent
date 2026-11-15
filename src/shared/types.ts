@@ -1,5 +1,7 @@
 // Shared types between main and renderer.
 import { isDistributionAgent } from './distribution.ts'
+import type { AutomationDayMode } from './automationSchedule'
+import type { TaskScope } from './task'
 
 import type {
   CollaborationModeId,
@@ -12,6 +14,8 @@ import type {
 } from './nativeCapabilities.ts'
 import type { ZCodeEventCursor, ZCodeModelSelection, ZCodeSessionState } from './zcode'
 import type { SettingsCategory } from './settingsNavigation'
+import type { ThemePreference } from './colorThemes'
+export type { ThemePreference } from './colorThemes'
 import type { NikaBinding, NikaSnapshot } from './nika'
 export type {
   CollaborationModeId,
@@ -149,6 +153,8 @@ export interface ModelDef {
   modelSource?: CodexModelSourceRef
   zcodeSelection?: ZCodeModelSelection
   zcodeThoughtLevels?: string[]
+  qoderContextWindows?: number[]
+  qoderThinkingDisabled?: boolean
   zcodeProviderLabel?: string
 }
 
@@ -159,7 +165,7 @@ export interface AgentDef {
   /** Executable name resolved on PATH, or absolute path. */
   bin: string
   /** Which built-in adapter drives this agent. */
-  adapter: 'codex' | 'traex' | 'claude' | 'grok' | 'kimi' | 'deepseek' | 'mcode' | 'zcode' | 'nika' | 'generic'
+  adapter: 'codex' | 'traex' | 'claude' | 'grok' | 'kimi' | 'deepseek' | 'mcode' | 'zcode' | 'nika' | 'qoder' | 'generic'
   icon: string
   builtin: boolean
   /** Capability manifest — UI collapses config accordingly. */
@@ -188,6 +194,8 @@ export interface AgentDef {
      * The personal assistant may only be carried by agents with this capability.
      */
     startupSystemPrompt?: boolean
+    /** A tool-free auxiliary call can inject a native system message without a role session. */
+    auxiliarySystemPrompt?: boolean
     /** Protocol-backed attachment gates; omitted keeps legacy adapters unchanged. */
     imageAttachments?: boolean
     fileAttachments?: boolean
@@ -221,13 +229,14 @@ export interface AgentDef {
     /** Collaboration modes advertised by the live protocol session. */
     collaborationModes?: CollaborationModeId[]
     /** `acp` for protocol-native providers such as Grok. */
-    protocol?: 'acp' | 'web' | 'app-server' | 'stream-json' | 'exec' | 'zcode-protocol'
+    protocol?: 'sdk' | 'acp' | 'web' | 'app-server' | 'stream-json' | 'exec' | 'zcode-protocol'
   }
   /** Real, per-model list (populated from the CLI's model cache at detect time). */
   models: ModelDef[]
   defaultModel?: string
   /** Whether the underlying CLI was detected on this machine. */
   installed?: boolean
+  qoder?: { region: 'cn' | 'global' }
   nika?: NikaSnapshot
   /** MiniMax Code 账号区域，决定额度控制台的站点域名。 */
   mcode?: { region: 'cn' | 'global' }
@@ -271,14 +280,13 @@ export interface AgentLifecycleProgress {
   availableVersion?: string
 }
 
-/** UI color theme preference. `system` follows the OS appearance. */
-export type ThemePreference = 'system' | 'dark' | 'light'
 export type NotificationMode = 'unfocused' | 'always' | 'off'
 
 /** Agent choices exposed by default in the new-task composer. */
 export const DEFAULT_ENABLED_AGENT_IDS = (['codex', 'traex'] as const).filter(id => isDistributionAgent(id))
 
 export interface AppSettings {
+  sessionRecovery?: import('./sessionRecovery').RecoverySettings
   schemaVersion: 1
   autoUpdateAgentsOnLaunch: boolean
   /** Update enabled Agent CLIs after five minutes without pending or active work; default false. */
@@ -287,7 +295,7 @@ export interface AppSettings {
   enabledAgentIds?: string[]
   /** Check the Bits version manifest on launch and once per day. */
   autoCheckUpdate: boolean
-  /** UI color theme (default `system`). */
+  /** Color style; absent/legacy preferences retain the original black theme. */
   theme?: ThemePreference
   /** macOS desktop notifications: while unfocused (default), always, or never. */
   notificationMode?: NotificationMode
@@ -299,6 +307,10 @@ export interface AppSettings {
    * default false keeps the sidebar visible.
    */
   coverSidebar?: boolean
+  defaultTaskWorktree?: boolean
+  autoSyncWorktree?: boolean
+  /** Organize the sidebar by spaces and requirements; absent legacy data defaults to true. */
+  spaceRequirementSidebar?: boolean
   /** Up to five settings shortcuts in the main sidebar; an empty list hides all. */
   sidebarShortcuts?: SettingsCategory[]
   /**
@@ -314,6 +326,10 @@ export interface AppSettings {
    */
   feishu?: FeishuSettings
   assistantFeishu?: FeishuSettings
+  taskTitleGeneration?: TaskTitleGenerationConfig
+  requirementCuration?: TaskTitleGenerationConfig
+  quickRepliesEnabled?: boolean
+  router?: import('./router').RouterConfig
 }
 
 /**
@@ -322,6 +338,7 @@ export interface AppSettings {
  * `feishu: null` clears the block.
  */
 export interface AppSettingsPatch {
+  sessionRecovery?: Partial<import('./sessionRecovery').RecoverySettings>
   autoUpdateAgentsOnLaunch?: boolean
   autoUpdateAgentsWhenIdle?: boolean
   enabledAgentIds?: string[]
@@ -330,10 +347,71 @@ export interface AppSettingsPatch {
   notificationMode?: NotificationMode
   preventSleep?: boolean
   coverSidebar?: boolean
+  defaultTaskWorktree?: boolean
+  autoSyncWorktree?: boolean
+  spaceRequirementSidebar?: boolean
   sidebarShortcuts?: SettingsCategory[]
   requirementsEnabled?: boolean
   feishu?: Partial<FeishuSettings> | null
   assistantFeishu?: Partial<FeishuSettings> | null
+  taskTitleGeneration?: Partial<TaskTitleGenerationConfig> | null
+  requirementCuration?: Partial<TaskTitleGenerationConfig> | null
+  quickRepliesEnabled?: boolean
+  router?: import('./router').RouterConfig
+}
+
+export interface TaskTitleGenerationConfig {
+  enabled: boolean
+  agentId?: string
+  model?: string
+  modelSource?: CodexModelSourceRef
+  effort?: ReasoningEffort
+  kimiThinking?: string
+}
+
+export interface TaskTitleSeed {
+  primaryIntent: string
+  inputId?: string
+  currentInput?: string
+  previousAssistantResponse?: string
+  assistantResponse?: string
+  clarifications?: string[]
+  attachmentHints?: string[]
+  images?: Attachment[]
+}
+
+export type TaskTitleSource = 'fallback' | 'generated' | 'manual' | 'legacy-preserved'
+export type TaskTitleGenerationState = 'pending' | 'running' | 'ready' | 'needs-context' | 'deferred' | 'failed'
+
+export interface TaskTitleGeneratorRef {
+  agentId: string
+  model: string
+  modelSource?: CodexModelSourceRef
+  effort?: ReasoningEffort
+  kimiThinking?: string
+}
+
+export interface TaskTitleMetadata {
+  formatVersion: 1
+  taskId: string
+  version: number
+  configVersion: number
+  title?: string
+  description?: string
+  conversationId?: string
+  generatedInputId?: string
+  source: TaskTitleSource
+  generationState: TaskTitleGenerationState
+  generationId?: string
+  contextVersion?: string
+  contextGeneration: number
+  clarificationCount: number
+  attempts: number
+  nextEligibleAt?: number
+  lastErrorCode?: string
+  generator?: TaskTitleGeneratorRef
+  generatedAt?: number
+  seed?: TaskTitleSeed
 }
 
 export type AppUpdateError =
@@ -374,6 +452,8 @@ export interface FeishuSettings {
   defaultModel?: string
   defaultEffort?: ReasoningEffort
   defaultPermissionMode?: PermissionMode
+  /** Route new remote-bot topics without showing the configuration card. */
+  autoRouteNewConversations?: boolean
   /** Project used when a Feishu message starts a new topic. */
   defaultProjectId?: string
   /** @deprecated Read-only migration source for settings written before projects. */
@@ -579,12 +659,13 @@ export interface BubbleComment {
 }
 
 /**
- * 选中即评论 — the bubble decorations a renderer sends alongside a turn: the
- * quote+comment cards and the instruction shown as the bubble's main text (the
- * wire prompt itself embeds the quotes). Persisted so the bubble survives an
- * App restart.
+ * Original input and optional quote+comment cards shown alongside a turn.
+ * The wire prompt may contain host instructions; an empty displayText explicitly
+ * represents image-only input. Persisted so the bubble survives an App restart.
  */
 export interface TurnBubbleInput {
+  /** Local send identity, echoed with the user event and queued delivery. */
+  clientTurnKey?: string
   comments?: BubbleComment[]
   displayText?: string
 }
@@ -595,6 +676,9 @@ export interface TurnBubbleInput {
  * commands, so SessionStore keeps these decorations alongside session metadata.
  */
 export interface SubmittedUserMessage {
+  clientTurnKey?: string
+  routedInputId?: string
+  automaticRecovery?: string
   /** Assistant-only original input, separate from the native memory context. */
   assistantText?: string
   assistantMessageId?: string
@@ -613,7 +697,7 @@ export interface SubmittedUserMessage {
   nativeContext?: ResolvedNativeTurnContext
   /** 选中即评论 — the quote+comment cards shown under this sent bubble. */
   comments?: BubbleComment[]
-  /** 选中即评论 — the instruction shown as the bubble's main text (wire prompt embeds quotes). */
+  /** Original user input, including an empty string for an image-only message. */
   displayText?: string
 }
 
@@ -626,6 +710,10 @@ export interface SubmittedUserMessage {
 export interface TurnUsage {
   /** Native cancellation may return partial counters; never price these as final usage. */
   usageIsIncomplete?: boolean
+  tokensAvailable?: boolean
+  contextUsedPercentage?: number
+  credits?: number
+  sessionCredits?: number
   reasoningTokens?: number
   totalTokens?: number
   modelCalls?: number
@@ -718,12 +806,19 @@ export interface SessionWorktree {
   workdir: string
   baseRef: string
   baseCommit: string
+  branch?: string
+  lastSourceCommit?: string
+  lastSyncedCommit?: string
+  autoSyncBack?: boolean
+  /** Retained when worktree cleanup succeeded but deleting the task record failed. */
+  removedAt?: number
   creationRequestId: string
   state: 'creating' | 'ready' | 'failed'
   lastError?: string
 }
 
 export interface ProjectGitInfo {
+  inspectionFailed?: boolean
   currentBranch?: string
   branches: Array<{ ref: string; name: string }>
   canCreateWorktree: boolean
@@ -741,17 +836,30 @@ export interface ProjectWorktree {
   sessions: Array<{ id: string; title: string }>
 }
 
+export interface SessionDeletionPreview {
+  confirmationId: string
+  title: string
+  team: boolean
+  worktrees: Array<{ path: string; branch?: string; dirty: boolean; sharedCount: number; removed: boolean }>
+}
+
 export type WorktreeTask =
   | { kind: 'message'; prompt: string; attachments?: Attachment[]; selection?: NativeTurnSelectionRequest; activatePlan?: boolean }
   | { kind: 'native'; action: NativeThreadAction }
 
 export interface SessionConfig {
+  /** App creation retry identity. Removed before resolving execution config. */
+  taskRequestId?: string
+  /** Creation-only business ownership, resolved and removed by the host. */
+  taskScope?: import('./task').TaskScope
   nikaBinding?: NikaBinding
   /** Creation request only; the host supplies the immutable snapshot. */
   useAssistant?: boolean
   assistantSnapshot?: import('./assistant').PersonalAssistantSnapshot
   /** Main-process channel ownership; excludes this session from Feishu auto-binding. */
-  assistantChannel?: 'weixin'
+  assistantChannel?: 'weixin' | 'app'
+  /** Main-owned management session; excluded from ordinary business tasks. */
+  managedPurpose?: 'router'
   agentId: string
   zcodeModelSelection?: ZCodeModelSelection
   /** Kimi's native thinking selection, separate from the common effort enum. */
@@ -788,6 +896,8 @@ export interface SessionConfig {
    * mode at the orchestrator boundary before they are allowed to run.
    */
   permissionMode?: PermissionMode
+  qoderContextWindow?: number
+  qoderThinkingDisabled?: boolean
   /** One-shot lifecycle initialization target, registered by main at creation. */
   initializationTargetAgentId?: string
   initializationJobId?: string
@@ -818,7 +928,8 @@ export function isCrossForkTargetAgent(
   return !!agent && (
     (agent.id === 'codex' && agent.adapter === 'codex') ||
     (agent.id === 'traex' && agent.adapter === 'traex') ||
-    (agent.id === 'claude' && agent.adapter === 'claude')
+    (agent.id === 'claude' && agent.adapter === 'claude') ||
+    (agent.id === 'qoder' && agent.adapter === 'qoder')
   )
 }
 
@@ -908,8 +1019,16 @@ export interface ClaudeForkOrigin {
 }
 
 export interface Session {
+  quickReplies?: import('./quickReplies').QuickReply[]
+  taskState?: import('./taskLifecycle').TaskStateSummary
+  taskMetadata?: TaskTitleMetadata
+  taskRegistration?: import('./task').TaskRegistration
+  /** Logical request remains busy while a failed native turn is being recovered. */
+  recovery?: import('./sessionRecovery').RecoveryProgress
   worktreeTask?: WorktreeTask
   worktreeTaskError?: string
+  /** Transient first-turn preparation; not restored from persisted sessions. */
+  worktreePreparing?: boolean
   previousSessionId?: string
   assistantEndReason?: 'new' | 'clear'
   id: string
@@ -966,7 +1085,7 @@ export interface Session {
    * lossless same-agent byte-copy fork ('same') from normalized rebuilds within
    * the same Agent ('compatible') or across Agents ('cross').
    */
-  forkedFrom?: { agentId: string; nativeId: string; mode: 'same' | 'cross' | 'compatible' }
+  forkedFrom?: { agentId: string; nativeId: string; mode: 'same' | 'cross' | 'compatible'; exportId?: string }
   /**
    * Doc5 — live snapshot of child (sub-)agents spawned during collaboration,
    * upserted by agentThreadId as `subagent` events arrive. Empty/absent for
@@ -1046,6 +1165,7 @@ export function agentForSession(agent: AgentDef, session?: Session | null): Agen
     defaultModel: contract.currentModelId,
     capabilities: {
       ...agent.capabilities,
+      ...(agent.adapter === 'nika' ? { attachments: contract.imageAttachments } : {}),
       ...(agent.adapter === 'zcode' ? { modelSelect: contract.models.length > 0, reasoningEffort: contract.models.some(model => (model.thinkingOptions?.length ?? 0) > 0) } : {}),
       permissionModes: contract.permissionModes,
       imageAttachments: contract.imageAttachments,
@@ -1146,6 +1266,9 @@ export function deriveSessionTitle(raw: string | undefined, max = 40): string {
 
 /** A single item in a session's message queue (Doc4 需求2). */
 export interface QueueItem {
+  clientTurnKey?: string
+  /** Stable host-owned input identity, retained through dispatch and recovery. */
+  routedInputId?: string
   /** Side queue delivery reservation, persisted as uncertain after restart. */
   state?: QueueDeliveryState
   /** Provider receipt is unknown; never auto-replay. Explicit edit clears it. */
@@ -1156,7 +1279,7 @@ export interface QueueItem {
   source?: 'feishu' | 'weixin' | 'app' | 'mcp'
   attachments?: Attachment[]
   nativeContext?: ResolvedNativeTurnContext
-  /** 选中即评论 — bubble display text (instruction) when the wire prompt embeds quotes. */
+  /** Original user input, including an empty string for an image-only message. */
   displayText?: string
   /** 选中即评论 — structured comment cards to re-render under the sent bubble. */
   comments?: BubbleComment[]
@@ -1617,6 +1740,7 @@ export interface PlanStep {
 export interface UASubAgent {
   /** The child agent's thread id — the stable identity + detail-fetch key. */
   agentThreadId: string
+  nativeHistoryId?: string
   /** Native task identity for a verified child within its parent session. */
   nativeTaskId?: string
   /** Display name / path of the child agent (from agentPath or a derived label). */
@@ -1657,12 +1781,15 @@ export interface UASubAgent {
 /** A scheduled/automation task listed in the automations panel (Doc4 需求4). */
 export interface AutomationTask {
   id: string
+  taskScope?: TaskScope
+  projectId?: string
   source?: 'uniagent'
   agentId: string
   name: string
   prompt?: string
   schedule?: string
-  status: 'active' | 'paused' | 'unknown'
+  dayMode?: AutomationDayMode
+  status: 'active' | 'paused' | 'completed' | 'unknown'
   model?: string
   /** Absolute path of the backing config file (for enable/pause writes). */
   path?: string
@@ -1672,6 +1799,11 @@ export interface AutomationTask {
    */
   editable?: boolean
   nextRunAt?: number
+  lastRunAt?: number
+  lastSessionId?: string
+  /** Outcome of the most recent run, when the backing store records it. */
+  lastRunStatus?: 'success' | 'error' | 'running' | 'awaiting-approval' | 'unknown'
+  lastRunError?: string
 }
 
 /**
@@ -1683,10 +1815,7 @@ export interface AutomationTask {
  * partial/legacy config still renders.
  */
 export interface AutomationDetail extends AutomationTask {
-  projectId?: string
   permissionMode?: PermissionMode
-  lastRunAt?: number
-  lastSessionId?: string
   /** Reasoning effort for the scheduled turn (codex/traex local tasks). */
   reasoningEffort?: ReasoningEffort
   /** Sandbox / execution environment string as written in the config. */
@@ -1703,10 +1832,6 @@ export interface AutomationDetail extends AutomationTask {
   weekdayOnly?: boolean
   /** IANA timezone the schedule is evaluated in, when known. */
   timezone?: string
-  /** Outcome of the most recent run, when the backing store records it. */
-  lastRunStatus?: 'success' | 'error' | 'running' | 'awaiting-approval' | 'unknown'
-  /** Error text from the most recent failed run. */
-  lastRunError?: string
   /** Originating handoff-preset / template id, when the task was created from one. */
   templateId?: string
   /** Raw form/template value blob (opaque JSON string) if the config carried one. */
@@ -1719,6 +1844,8 @@ export interface AutomationDetail extends AutomationTask {
  * for the local toml).
  */
 export interface AutomationEditPatch {
+  taskScope?: TaskScope
+  dayMode?: AutomationDayMode
   agentId?: string
   projectId?: string
   permissionMode?: PermissionMode
@@ -1732,11 +1859,13 @@ export interface AutomationEditPatch {
 }
 
 export interface NativeAutomationInput {
+  taskScope?: TaskScope
+  dayMode?: AutomationDayMode
   name: string
   prompt: string
   schedule: string
   agentId: string
-  projectId: string
+  projectId?: string
   permissionMode: PermissionMode
   model?: string
   reasoningEffort?: ReasoningEffort
@@ -1779,10 +1908,14 @@ export interface DiagnosticEntry {
 
 /** Per-agent last-choice UI preference (Doc5 T2). */
 export interface AgentPref {
+  qoderContextWindow?: number
+  qoderThinkingDisabled?: boolean
+  qoderRegion?: 'cn' | 'global'
   model?: string
   effort?: ReasoningEffort
+  kimiThinking?: string
   zcodeThinking?: string
-  /** Explicit defaults configured in Settings; preferred over last-used values. */
+  /** Explicit defaults configured in Settings; omitted fields follow last-used values. */
   defaultModel?: string
   defaultEffort?: ReasoningEffort
   defaultThinking?: string
@@ -1823,11 +1956,16 @@ export const IPC = {
   listQueues: 'session:queues',
   getEvents: 'session:events',
   getSessionRuntimeState: 'session:runtimeState',
+  getSessionInfo: 'session:info',
+  revealSessionInfoFile: 'session:revealInfoFile',
   refreshNativeSession: 'session:refreshNative',
   enableToolSession: 'session:enableTool',
   // G2-4: archive / unarchive / permanently delete a session.
   archiveSession: 'session:archive',
   unarchiveSession: 'session:unarchive',
+  previewSessionDeletion: 'session:delete:preview',
+  cancelSessionDeletionPreview: 'session:delete:preview:cancel',
+  sessionDeletionChecking: 'session:delete:checking',
   deleteSession: 'session:delete',
   // 需求4: rename + pin/unpin a session (manual title locks auto-titling).
   renameSession: 'session:rename',
@@ -1974,11 +2112,17 @@ export const IPC = {
   prefsChanged: 'prefs:changed',
   getAppSettings: 'settings:get',
   setAppSettings: 'settings:set',
+  testTaskTitleGeneration: 'task-title:test',
+  cancelTaskTitleGenerationTest: 'task-title:cancel-test',
+  getRecoveryErrors: 'recovery:errors',
+  cancelRecovery: 'recovery:cancel',
   // App release checks are read-only; downloads open in the system browser.
   checkAppUpdate: 'appUpdate:check',
   appUpdateAvailable: 'appUpdate:available',
   appNotificationOpenSession: 'appNotification:openSession',
   sessionBadgeVisible: 'sessionBadge:visible',
+  sessionAttentionGet: 'sessionAttention:get',
+  sessionAttentionChanged: 'sessionAttention:changed',
   getAppVersion: 'app:getVersion',
   // Kaboo is the primary Token-usage source; no response is persisted locally.
   getTokenUsage: 'tokenUsage:get',

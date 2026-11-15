@@ -4,6 +4,7 @@ export const SETTINGS_CATEGORIES = [
   { id: 'general', label: '通用', icon: 'settings' },
   { id: 'projects', label: '空间', icon: 'folder' },
   { id: 'requirements', label: '需求', icon: 'file' },
+  { id: 'requirement-tasks', label: 'superAgent配置', icon: 'file' },
   { id: 'agent', label: 'Agent', icon: 'bot' },
   { id: 'assistants', label: '飞书&助手', icon: 'identity' },
   { id: 'codex-sources', label: '模型配置', icon: 'model' },

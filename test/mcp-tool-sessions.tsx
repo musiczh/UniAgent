@@ -10,7 +10,7 @@ import { SessionStore } from '../src/main/sessionStore'
 import { isToolSession, type AgentDef, type Session } from '../src/shared/types'
 import { emptyNativeCapabilitySnapshot } from '../src/shared/nativeCapabilities'
 import { isSidebarSessionEligible } from '../src/renderer/sessionVisibility'
-import { unreadAfterReplyStatus } from '../src/renderer/App'
+import { SessionAttentionBadge } from '../src/main/appNotifications'
 import { SessionList } from '../src/renderer/components/SessionList'
 import { Composer } from '../src/renderer/components/Composer'
 import { ViewDropdown } from '../src/renderer/components/ViewDropdown'
@@ -31,8 +31,13 @@ assert.equal(isSidebarSessionEligible(tool, [agent]), false)
 assert.equal(isSidebarSessionEligible(archived, [agent]), false)
 assert.equal(isSidebarSessionEligible(enabled, [agent]), true, 'legacy human-continued sessions stay normal')
 for (const kind of ['main', 'side'] as const) {
-  assert.equal(unreadAfterReplyStatus('main', 'running', 'idle', kind, true, tool), undefined)
-  assert.equal(unreadAfterReplyStatus(undefined, 'running', 'completed', kind, true, enabled), kind)
+  const attention = new SessionAttentionBadge(() => {}, () => false)
+  for (const owner of [tool, enabled]) {
+    attention.handleStatus(owner, 'running', owner, kind)
+    attention.handleStatus(owner, 'completed', owner, kind)
+  }
+  assert.equal(attention.snapshot().unreadBySession.tool, undefined)
+  assert.equal(attention.snapshot().unreadBySession.enabled, kind)
 }
 
 // Exercise the existing component handlers without starting Electron or live agents.

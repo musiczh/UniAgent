@@ -17,6 +17,12 @@ for (const path of ['', '   ', null, 123, '/repo/bad\0.png']) {
 assert.equal(viewImagePath(event(3, 'read_file', '/repo/first.png')), undefined)
 assert.equal(viewImagePath({ ...first, type: 'command_exec' }), undefined)
 
+const mouseEvent = (selector: string, type: string, button = 'left'): string => `(() => {
+  const rect = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
+  window.imageClickPoint = {x: rect.x + rect.width / 2, y: rect.y + rect.height / 2};
+  return {type: ${JSON.stringify(type)}, button: ${JSON.stringify(button)}, clickCount: 1, ...window.imageClickPoint};
+})()`
+
 // Exercise the real React components in the existing offline Electron DOM fixture.
 const result = await renderEventStream([
   { sessionId: 'view-session', seq: 0, ts: 1_000, type: 'user_message', payload: { text: '查看图片' } },
@@ -31,7 +37,9 @@ const result = await renderEventStream([
 ], 'running', 'view-session', {
   setup: `
     window.imageReads = [];
+    window.copiedImages = [];
     window.uniagent = {
+      copyImageToClipboard: async source => { window.copiedImages.push(source); return true; },
       fsReadAttachmentImage: async (sessionId, path) => {
         window.imageReads.push({ sessionId, path });
         if (path.endsWith('missing.png')) return null;
@@ -50,9 +58,24 @@ const result = await renderEventStream([
       return {host, render, unmount: () => root.unmount()};
     };
   `,
+  mouseEvents: [
+    mouseEvent('button.tool-image-thumbnail', 'mousePressed'),
+    mouseEvent('button.tool-image-thumbnail', 'mouseReleased'),
+    mouseEvent('.bubble-image-preview > img', 'mousePressed', 'right'),
+    mouseEvent('.bubble-image-preview > img', 'mouseReleased', 'right'),
+    mouseEvent('.image-lightbox-menu button', 'mousePressed'),
+    // Keep the release at the same position even if mousedown removed the menu.
+    `({type: 'mouseReleased', button: 'left', clickCount: 1, ...window.imageClickPoint})`,
+  ],
   inspect: `(async () => {
     const check = (value, message) => { if (!value) throw new Error(message); };
     const settle = () => new Promise(resolve => setTimeout(resolve, 30));
+    check(window.copiedImages.length === 1, 'a real mouse press and release must invoke image copy exactly once');
+    check(window.copiedImages[0] === document.querySelector('.bubble-image-preview > img').src, 'copy must receive the displayed image data');
+    check(document.querySelector('.image-lightbox-menu')?.textContent.includes('已复制'), 'the copy menu must survive mousedown and show the result');
+    document.querySelector('.image-lightbox-menu-backdrop').click(); await settle();
+    check(!document.querySelector('.image-lightbox-menu') && document.querySelector('.bubble-image-preview'), 'outside click must dismiss only the menu');
+    window.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'})); await settle();
     const row = document.querySelector('.step-call-image-row');
     const thumbs = [...row.querySelectorAll('button.tool-image-thumbnail')];
     check(thumbs.length === 2, 'each batched view_image keeps its thumbnail');

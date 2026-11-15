@@ -120,6 +120,7 @@ export function agentRoleUnavailableReason(
     return undefined
   }
   if (agent.adapter === 'claude') return claudeRoleUnavailableReason(agent, role)
+  if (agent.adapter === 'qoder') return undefined
   if (role.instructions?.trim() && agent.adapter !== 'codex' && agent.adapter !== 'traex') {
     return 'role_instructions_unsupported'
   }

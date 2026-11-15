@@ -13,7 +13,7 @@ const result = await renderEventStream([], 'idle', 'sdk-hydration', {
       {sessionId:'target',seq:3,ts:3,type:'system_notice',payload:{kind:'context_usage',contextUsage:{totalTokens:123,rawMaxTokens:200000}}}
     ];
     const agent={id:'claude',name:'Claude',adapter:'claude',bin:'claude',installed:true,models:[],lifecycle:{availability:'available'},capabilities:{permissionModes:[{id:'ask',label:'请求批准',hint:''}]}};
-    const api={startupState:async()=>({ready:true}),teamCatalog:async()=>({teams:[],projects:[],errors:[]}),getLifecycleSnapshot:async()=>[agent],getAppSettings:async()=>({}),listSessions:async()=>sessions,
+    const api={startupState:async()=>({ready:true}),teamCatalog:async()=>({teams:[],projects:[],errors:[]}),getLifecycleSnapshot:async()=>[agent],getWorktreeArchiveReviews:async()=>[],listForkJobs:async()=>[],getAppSettings:async()=>({spaceRequirementSidebar:false}),listSessions:async()=>sessions,
       getAssistantPrivateSessions:async()=>[],listQueues:async()=>({}),e2eEnabled:async()=>false,listProjects:async()=>[],listRequirements:async()=>[],listPresets:async()=>[],getPrefs:async()=>({lastByAgent:{}}),
       getSessionRuntimeState:async(id,includeEvents=true)=>{if(includeEvents)loads.push(id);return{events:includeEvents&&id==='target'?history:[],hasLiveStreamer:false,nativeSessionOccupancy:{state:'unsupported'}}},
       onEvent:subscribe('event'),onStatusChange:subscribe('status')};

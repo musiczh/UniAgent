@@ -31,6 +31,7 @@ function codexAgent(): AgentDef {
 
 class ImageTransport extends EventEmitter implements AppServerRpc {
   requests: Array<{ method: string; params: any }> = []
+  constructor(private readonly imageResult: Record<string, unknown>) { super() }
 
   async start(): Promise<void> {}
   notify(): void {}
@@ -54,7 +55,7 @@ class ImageTransport extends EventEmitter implements AppServerRpc {
             type: 'imageGeneration',
             status: 'completed',
             revisedPrompt: 'dark path header',
-            result: 'large-base64-that-must-not-enter-the-event-log',
+            ...this.imageResult,
             failure: null,
             savedPath: SAVED_PATH
           }
@@ -74,8 +75,8 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   }
 }
 
-async function runnerReconcilesGeneratedImage(): Promise<UAEvent> {
-  const transport = new ImageTransport()
+async function runnerReconcilesGeneratedImage(imageResult: Record<string, unknown>): Promise<UAEvent> {
+  const transport = new ImageTransport(imageResult)
   const runner = new AppServerRunner(
     'session-1',
     { n: 0 },
@@ -133,7 +134,9 @@ async function runnerReconcilesGeneratedImage(): Promise<UAEvent> {
   }
 }
 
-const completed = await runnerReconcilesGeneratedImage()
+const completed = await runnerReconcilesGeneratedImage({ result: 'large-base64-that-must-not-enter-the-event-log' })
+const fileImage = await runnerReconcilesGeneratedImage({ fileId: 'file-image-1', inputImages: [{ path: '/repo/reference.png', sha256: 'a'.repeat(64) }] })
+assert.deepEqual(fileImage.payload.result, completed.payload.result, 'Codex fileId results retain the same saved-image behavior without a base64 result')
 const markup = renderToStaticMarkup(createElement(EventStream, {
   events: [completed],
   status: 'running'

@@ -1,12 +1,27 @@
-import { useContext, useEffect, useLayoutEffect, useMemo, useRef, type MouseEvent, type KeyboardEvent } from 'react'
+import { Fragment, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, type MouseEvent, type KeyboardEvent } from 'react'
 import DOMPurify from 'dompurify'
+import { Streamdown, defaultRehypePlugins, type Components } from 'streamdown'
 import type { FileBrowserListResult } from '@shared/types'
-import { applyAnnotations, type Annotation } from '../textAnnotations'
-import { parsePreviewMarkdown } from '../htmlPreview'
+import { applyAnnotations, stripAnnotations, type Annotation } from '../textAnnotations'
+import { parsePreviewMarkdown, splitMarkdownMetadata } from '../htmlPreview'
+import { markdownCode } from '../markdownHighlight'
 import { HtmlPreview, HtmlPreviewSessionContext } from './HtmlPreview'
 import { MermaidDiagram } from './MermaidDiagram'
 
 const useBrowserLayoutEffect = typeof window === 'undefined' ? useEffect : useLayoutEffect
+// Input HTML has already passed DOMPurify; preserve guarded local URLs and our path spans.
+const markdownRehypePlugins = [defaultRehypePlugins.raw]
+const markdownPlugins = { code: markdownCode }
+const markdownTranslations = {
+  close: '关闭', copied: '已复制', copyCode: '复制代码', downloadFile: '下载代码',
+  copyTable: '复制表格', copyTableAsCsv: '复制为 CSV', copyTableAsMarkdown: '复制为 Markdown',
+  copyTableAsTsv: '复制为 TSV', downloadTable: '下载表格', downloadTableAsCsv: '下载 CSV',
+  downloadTableAsMarkdown: '下载 Markdown', viewFullscreen: '全屏查看', exitFullscreen: '退出全屏',
+}
+const markdownComponents: Components = {
+  strong: ({ node: _node, ...props }) => <strong {...props} />,
+  img: ({ node: _node, ...props }) => <img {...props} />,
+}
 
 /**
  * A local file reference detected in agent prose (需求8). `path` is the raw
@@ -333,7 +348,7 @@ function verifyLocalPaths(
 }
 
 /**
- * Render Markdown text into sanitized HTML for agent replies. When `onOpenFile`
+ * Render sanitized Markdown through the shared Streamdown reader. When `onOpenFile`
  * is provided, verified local files in prose become clickable and open in the
  * built-in file browser instead of the external shell (需求8). When
  * `annotations` is provided, matching char ranges are re-highlighted with a
@@ -353,16 +368,25 @@ export function Markdown({
   filePath?: string
 }): JSX.Element {
   const bodyRef = useRef<HTMLDivElement>(null)
+  const portalRef = useRef<HTMLDivElement>(null)
+  const portal = useCallback(() => portalRef.current, [])
   const sessionId = useContext(HtmlPreviewSessionContext)
   const supportsFileLinks = !!onOpenFile
   const editableAnnotations = !!onEditAnnotation
-  const parts = useMemo(() => parsePreviewMarkdown(text || '').map((part) => (
-    'html' in part ? { html: DOMPurify.sanitize(part.html, { ADD_ATTR: ['target', 'rel'], ALLOWED_URI_REGEXP: MARKDOWN_URI_ALLOWLIST }) } : part
-  )), [text])
+  const document = useMemo(() => splitMarkdownMetadata(text || ''), [text])
+  const parts = useMemo(() => parsePreviewMarkdown(document.body).map((part) => {
+    if (!('html' in part)) return part
+    const html = DOMPurify.sanitize(part.html, { ADD_ATTR: ['target', 'rel'], ALLOWED_URI_REGEXP: MARKDOWN_URI_ALLOWLIST })
+    if (!supportsFileLinks || typeof window === 'undefined') return { html }
+    // Decorate a detached tree, so React never owns text nodes that linkification replaces.
+    const container = window.document.createElement('div')
+    container.innerHTML = html
+    linkifyContainer(container)
+    return { html: container.innerHTML }
+  }), [document.body, supportsFileLinks])
 
   useBrowserLayoutEffect(() => {
     if (!bodyRef.current) return
-    if (supportsFileLinks) linkifyContainer(bodyRef.current)
     return verifyLocalPaths(bodyRef.current, sessionId || '', window.uniagent.homeDir || '', supportsFileLinks, filePath)
   }, [parts, supportsFileLinks, sessionId, filePath])
 
@@ -375,8 +399,17 @@ export function Markdown({
   // change. Same DOM-mutation pattern as linkifyContainer; applyAnnotations
   // strips its own marks first, so it stays idempotent and leaves `.md-path`
   // spans intact. No-op (and cleans up) when there are no annotations.
-  useEffect(() => {
-    if (bodyRef.current) applyAnnotations(bodyRef.current, annotations || [], editableAnnotations)
+  useBrowserLayoutEffect(() => {
+    const root = bodyRef.current
+    if (!root || !annotations?.length) return
+    const observer = new MutationObserver(() => refresh())
+    const refresh = (): void => {
+      observer.disconnect()
+      applyAnnotations(root, annotations, editableAnnotations)
+      observer.observe(root, { childList: true, characterData: true, subtree: true })
+    }
+    refresh()
+    return () => { observer.disconnect(); stripAnnotations(root) }
   }, [parts, annotations, editableAnnotations])
 
   const openLink = (event: MouseEvent<HTMLDivElement>): void => {
@@ -425,23 +458,26 @@ export function Markdown({
     }
   }
 
-  if (parts.length === 1 && 'html' in parts[0]) return (
-    <div
-      ref={bodyRef}
-      className="agent-md"
-      onClick={openLink}
-      onKeyDown={editWithKeyboard}
-      dangerouslySetInnerHTML={{ __html: parts[0].html }}
-    />
-  )
-
   return (
     <div ref={bodyRef} className="agent-md" onClick={openLink} onKeyDown={editWithKeyboard}>
+      {document.metadata && <details className="md-frontmatter">
+        <summary>
+          <span>{document.metadata.type || '文档属性'}</span>
+          {document.metadata.status && <span className="md-frontmatter-status">{document.metadata.status}</span>}
+          {!!document.metadata.tags.length && <span>{document.metadata.tags.join(' · ')}</span>}
+          <span className="md-frontmatter-toggle">文档属性</span>
+        </summary>
+        <pre>{document.metadata.raw}</pre>
+      </details>}
       {parts.map((part, index) => 'html' in part
-        ? <div key={index} className="md-fragment" dangerouslySetInnerHTML={{ __html: part.html }} />
+        ? <Fragment key={annotations?.length ? part.html : index}><Streamdown mode="static" plugins={markdownPlugins}
+          components={markdownComponents} rehypePlugins={markdownRehypePlugins} linkSafety={{ enabled: false }} translations={markdownTranslations} portal={portal}>
+          {part.html}
+        </Streamdown>{part.html.endsWith('\n') && <span className="md-tail" dangerouslySetInnerHTML={{ __html: part.html.match(/\n+$/)![0] }} />}</Fragment>
         : 'preview' in part
           ? <HtmlPreview key={index} reference={part.preview} onOpenFile={onOpenFile} />
           : <MermaidDiagram key={index} source={part.mermaid} />)}
+      <div ref={portalRef} className="md-overlays" />
     </div>
   )
 }

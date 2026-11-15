@@ -3,8 +3,8 @@ import { join } from 'node:path'
 import { resolveUserDataHome } from './userData.ts'
 import { decryptLocalSecretAsync, encryptLocalSecretAsync } from './localSecretStore.ts'
 
-type Owner = 'claude' | 'grok'
-const variables = { claude: 'ANTHROPIC_API_KEY', grok: 'XAI_API_KEY' } as const
+type Owner = 'claude' | 'grok' | 'qoder' | 'qoder-cn'
+const variables = { claude: 'ANTHROPIC_API_KEY', grok: 'XAI_API_KEY', qoder: 'QODER_PERSONAL_ACCESS_TOKEN', 'qoder-cn': 'QODERCN_PERSONAL_ACCESS_TOKEN' } as const
 let root = '', loading: Promise<void> | undefined
 let keys: Partial<Record<Owner, string>> = {}, encrypted: Partial<Record<Owner, string>> = {}
 let writer: Promise<unknown> = Promise.resolve()

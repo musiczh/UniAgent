@@ -25,17 +25,15 @@ export function hydrateSubmittedUserMessages(
     userOrdinal++
     const snapshot = byOrdinal.get(userOrdinal)
     const nativeText = String(event.payload?.text || '')
-    let text = snapshot?.assistantText !== undefined ? stripAssistantContext(nativeText) : nativeText
+    let text = stripAssistantContext(nativeText)
     // Claude's adapter folds attachment paths into the prompt text because its
     // native faces have no image flag. That copy is duplicate bookkeeping: the
     // snapshot already carries the attachments, so strip it before matching and
     // rendering (assistant sessions and native sessions alike).
-    let strippedAttachmentSuffix = false
     if (snapshot?.attachments?.length) {
       const suffix = `\n\n附件:\n${snapshot.attachments.map(attachment => `- ${attachment.path}`).join('\n')}`
       if (text.endsWith(suffix)) {
         text = text.slice(0, -suffix.length)
-        strippedAttachmentSuffix = true
       }
     }
     if (
@@ -47,8 +45,10 @@ export function hydrateSubmittedUserMessages(
         ...event,
         payload: {
           ...event.payload,
+          ...(snapshot.clientTurnKey ? { clientTurnKey: snapshot.clientTurnKey } : {}),
+          ...(snapshot.routedInputId ? { routedInputId: snapshot.routedInputId } : {}),
           ...(snapshot.assistantText === undefined
-            ? (strippedAttachmentSuffix ? { text } : {})
+            ? (text !== nativeText ? { text } : {})
             : { text: snapshot.assistantText }),
           ...(snapshot.assistantMessageId === undefined ? {} : { assistantMessageId: snapshot.assistantMessageId }),
           ...(snapshot.source === undefined ? {} : { source: snapshot.source }),
@@ -57,7 +57,8 @@ export function hydrateSubmittedUserMessages(
           ...(snapshot.nativeContext === undefined ? {} : { nativeContext: structuredClone(snapshot.nativeContext) }),
           ...(snapshot.comments === undefined ? {} : { comments: structuredClone(snapshot.comments) }),
           ...(snapshot.displayText === undefined ? {} : { displayText: snapshot.displayText }),
-          ...(snapshot.appendedToTurn ? { appendedToTurn: true } : {})
+          ...(snapshot.appendedToTurn ? { appendedToTurn: true } : {}),
+          ...(snapshot.automaticRecovery ? { automaticRecovery: snapshot.automaticRecovery } : {})
         }
       }
   }

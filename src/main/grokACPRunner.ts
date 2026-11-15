@@ -9,6 +9,7 @@ import { homedir, tmpdir } from 'node:os'
 import { promisify } from 'node:util'
 import { createHash, randomUUID } from 'node:crypto'
 import { ACPConnection, ACPRemoteError, ACPTimeoutError } from './acp/acpConnection.ts'
+import { ACPRecoveryError } from './acp/acpProcessLifecycle.ts'
 import { ACPHistoryProjection, projectACPTool, projectGrokUsage } from './acp/acpEventProjection.ts'
 import { grokNativeHandshake, grokCapabilityAvailable, projectGrokContract, grokModelContextWindows } from './grokNativeCapabilities.ts'
 import { GrokNativeControls } from './grokNativeControls.ts'
@@ -25,6 +26,7 @@ import { isProviderQuotaExceeded } from '../shared/providerErrors.ts'
 import { nativeCredentialEnv } from './agentSetupCredentials.ts'
 import { findAgentExecutable } from './agentSetupProcess.ts'
 import { handoffMcpServers } from './handoff.ts'
+import { resolveAgentWorkspaceConfig } from './projectStore'
 import type { ACPInitialize, ACPJsonRpcMessage } from './acp/acpTypes.ts'
 import type { GoalState, NativeGoalUpdate } from '../shared/nativeCapabilities.ts'
 import type { AgentDef, Attachment, GrokNativeContract, GrokNativeCapability, UASubAgent, SessionAgentContract, SessionConfig, SessionSummary, TurnUsage, UAEvent } from '../shared/types.ts'
@@ -625,7 +627,7 @@ export class GrokACPRunner extends EventEmitter {
     }
     const args = acpLaunchArgs(this.provider,this.config)
     if (this.provider === 'deepseek' && env.UNIAGENT_DEEPSEEK_ACP_PATCH) args.push('--patch', env.UNIAGENT_DEEPSEEK_ACP_PATCH)
-    const connection = new ACPConnection({ bin:this.agent.bin,args,cwd:this.config.workdir,env:{...process.env,...(this.provider === 'grok' ? {GROK_GOAL:process.env.GROK_GOAL || '1'} : {}),...env},providerLabel:this.providerLabel,validateInitialize:v => validateACPInitialize(v,this.providerLabel) })
+    const connection = new ACPConnection({ bin:this.agent.bin,args,cwd:this.config.workdir,env:{...process.env,...(this.provider === 'grok' ? {GROK_GOAL:process.env.GROK_GOAL || '1'} : {}),...env},providerLabel:this.providerLabel,recoveryScope:this.provider,validateInitialize:v => validateACPInitialize(v,this.providerLabel) })
     this.connection = connection; this.runtimeFingerprint = fingerprint; this.connecting = true; this.openingUpdates = []; this.commands = []; this.response = {}
     connection.on('notification',(message: ACPJsonRpcMessage) => { if (this.connection === connection) this.onNotification(message) })
     connection.on('request',(message: ACPJsonRpcMessage) => { if (this.connection === connection) this.onRequest(connection,message) })
@@ -664,11 +666,9 @@ export class GrokACPRunner extends EventEmitter {
         // MiniMax Code does not advertise extra directories; drop them instead
         // of failing the whole session, and tell the user what was ignored.
         if (this.provider === 'mcode') {
-          this.config.additionalDirectories = undefined
           this.emitEvent({type:'system_notice',payload:{kind:'warning',text:'MiniMax Code 不支持会话级额外目录，已忽略多目录设置。'}})
-        } else {
-          throw new Error('当前 ACP 未声明额外目录支持；请选择单目录空间后继续。')
         }
+        this.config = resolveAgentWorkspaceConfig(this.config, { additionalDirectoriesNew: false, additionalDirectoriesResume: false }, !!requestedId)
       }
       this.replayingHistory = method === 'session/load'
       const response = await connection.request(method,{...(requestedId ? {sessionId:requestedId} : {}),cwd:this.config.workdir,mcpServers:this.includeMcp ? handoffMcpServers(this.sessionId) : [],...(this.config.additionalDirectories?.length ? {additionalDirectories:this.config.additionalDirectories} : {})})
@@ -1125,6 +1125,7 @@ export async function probeGrokACP(
   } catch (error: any) {
     const needsAuth = error instanceof ACPRemoteError && /authentication required|not authenticated|invalid api key/i.test(error.remoteMessage || error.message)
     const reason = needsAuth ? 'Grok 连接需要认证，请登录或配置 API Key'
+      : error instanceof ACPRecoveryError ? error.message
       : error instanceof ACPTimeoutError ? 'Grok 检测超时，请检查服务与网络后重试'
       : `Grok 协议或服务检测失败${error instanceof ACPRemoteError ? `（错误码 ${error.code}）` : ''}，请检查程序版本、权限与配置后重试`
     return { status: needsAuth ? 'needs-auth' : 'incompatible', path, version, reason }
@@ -1412,8 +1413,7 @@ async function loadStableSessionEvents(provider: ACPProvider,id: string,bin: str
     const modelOption = acpOption(response, 'model')
     // Grok's replayed usage footer is the turn's cumulative spend, not the
     // window occupancy. Replayed updates stamp the bounded context in `_meta`;
-    // persisted signals are the fallback for versions that omit it. Both are
-    // trusted only on the version whose semantics were verified.
+    // persisted signals are the fallback when the validated replay omits it.
     if (provider === 'grok' && grokNativeHandshake(initialize).confirmed) {
       let contextUsage: GrokContextUsage | undefined = replayedContextTokens === undefined ? undefined : { contextTokens: replayedContextTokens }
       if (contextUsage === undefined) {

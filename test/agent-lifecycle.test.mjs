@@ -34,6 +34,18 @@ const kimiBase = {
   capabilities: { ...base.capabilities, streaming: true, protocol: 'acp' }
 }
 
+test('unrecognized software version output does not fail an otherwise healthy Agent', async () => {
+  for (const adapter of ['codex', 'claude', 'traex']) {
+    const service = new AgentLifecycleService({
+      detect: async () => [{ ...base, id: adapter, adapter, version: 'future-build' }],
+      runner: async (_bin, spec) => ({ code: 0, stdout: spec.args[0] === '--version' ? 'future-build' : 'authenticated', stderr: '' })
+    })
+    const [agent] = await service.detectAll(true)
+    assert.equal(agent.lifecycle.availability, 'available', adapter)
+    assert.equal(agent.lifecycle.currentVersion, 'future-build')
+  }
+})
+
 test('authentication service errors retain the installed program and are not a login requirement', async () => {
   for (const stderr of ['network timeout', 'EACCES permission denied', 'configuration parse error']) {
     const service = new AgentLifecycleService({ detect: async () => [base], runner: async (_bin, spec) => spec.args[0] === '--version'
@@ -394,7 +406,7 @@ test('update checks cannot overwrite a retry or preserve its transient detecting
 test('a DeepSeek update check preserves a detection failure reason', async () => {
   const service = new AgentLifecycleService({
     detect: async () => [{ ...base, id: 'deepseek', adapter: 'deepseek', incompatible: true, unavailableReason: 'Host 协议检查失败' }],
-    runner: async () => ({ code: 0, stdout: '"0.2.1-rc.2"', stderr: '' })
+    runner: async () => ({ code: 0, stdout: '"0.2.2-rc.1"', stderr: '' })
   })
   await service.detectAll(true)
   await service.checkAllUpdates()
@@ -788,7 +800,9 @@ test('an earlier full refresh cannot overwrite an agent whose executable is bein
 
 test('whitelist matches real CLIs and Codex checks npm without invoking its updater', async () => {
   const whitelist = lifecycleCommandWhitelist()
-  assert.deepEqual(Object.keys(whitelist).sort(), ['claude', 'codex', 'deepseek', 'grok', 'kimi', 'mcode', 'traex'])
+  assert.deepEqual(Object.keys(whitelist).sort(), ['claude', 'codex', 'deepseek', 'grok', 'kimi', 'mcode', 'qoder', 'traex'])
+  assert.deepEqual(whitelist.qoder.checkUpdate.args, ['update', '--check'])
+  assert.deepEqual(whitelist.qoder.update.args, ['update'])
   assert.deepEqual(whitelist.codex.auth.args, ['login', 'status'])
   assert.deepEqual(whitelist.codex.checkUpdate.args, ['view', '@openai/codex', 'version', '--json'])
   assert.deepEqual(whitelist.codex.update.args, ['update'])
@@ -997,6 +1011,14 @@ test('app settings are versioned and expose complete application defaults', () =
       coverSidebar: false,
       preventSleep: false,
       requirementsEnabled: false,
+      spaceRequirementSidebar: true,
+      defaultTaskWorktree: false,
+      autoSyncWorktree: false,
+      quickRepliesEnabled: false,
+      taskTitleGeneration: { enabled: false },
+      requirementCuration: { enabled: false },
+      router: { enabled: false, agentId: 'deepseek', model: '["deepseek-official","deepseek-flash"]', effort: 'max', version: 1 },
+      sessionRecovery: { enabled: false, agentId: '', model: '', selectedErrors: [], rules: [], maxRetries: 3, initialDelaySeconds: 30 },
       sidebarShortcuts: ['history', 'agent', 'tokens'],
       enabledAgentIds: INTERNAL_DISTRIBUTION ? ['codex', 'traex'] : ['codex']
     })
@@ -1036,16 +1058,18 @@ test('different agents have independent update flights', async () => {
 })
 
 const deepseekBase = {
-  ...base, id: 'deepseek', name: 'DeepSeek Harness', bin: '/safe/dsh', adapter: 'deepseek', version: '0.2.1-rc.2',
+  ...base, id: 'deepseek', name: 'DeepSeek Harness', bin: '/safe/dsh', adapter: 'deepseek', version: '0.2.2-rc.1',
   capabilities: { ...base.capabilities, streaming: true, protocol: 'acp' }
 }
 const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 
-test('DeepSeek Harness checks the qualified registry version and supports in-app update', async (t) => {
+test('DeepSeek Harness checks the official latest version and supports in-app update', async (t) => {
   const cases = [
-    ['qualified release pending', '0.2.0-rc.2', '"0.2.1-rc.2"', 'available', '0.2.1-rc.2'],
-    ['already current', '0.2.1-rc.2', '"0.2.1-rc.2"', 'current', '0.2.1-rc.2'],
-    ['detected version ahead of the qualified release', '0.2.2', '"0.2.1-rc.2"', 'current', '0.2.1-rc.2']
+    ['qualified release pending', '0.2.0-rc.2', '"0.2.2-rc.1"', 'available', '0.2.2-rc.1'],
+    ['previous qualified release', '0.2.1-rc.2', '"0.2.2-rc.1"', 'available', '0.2.2-rc.1'],
+    ['already current', '0.2.2-rc.1', '"0.2.2-rc.1"', 'current', '0.2.2-rc.1'],
+    ['detected version ahead of the latest release', '0.2.2', '"0.2.2-rc.1"', 'current', '0.2.2-rc.1'],
+    ['new official latest', '0.2.2-rc.1', '"0.3.0"', 'available', '0.3.0']
   ]
   for (const [name, current, output, expectedStatus, expectedVersion] of cases) {
     await t.test(name, async () => {
@@ -1053,8 +1077,8 @@ test('DeepSeek Harness checks the qualified registry version and supports in-app
         detect: async () => [{ ...deepseekBase, version: current }],
         runner: async (bin, spec) => {
           assert.equal(bin, npmBin)
-          assert.deepEqual(spec.args.slice(0, 2), ['view', '@deepseek-ai/dsh@0.2.1-rc.2'],
-            'the check asks for the qualified release, never the latest dist-tag')
+          assert.deepEqual(spec.args.slice(0, 2), ['view', '@deepseek-ai/dsh'],
+            'the check asks for the official latest version rather than the tested baseline')
           return { code: 0, stdout: output, stderr: '' }
         }
       })
@@ -1072,10 +1096,10 @@ test('DeepSeek Harness checks the qualified registry version and supports in-app
 test('DeepSeek Harness update reinstalls the managed runtime at the checked version', async () => {
   let installed = false
   const service = new AgentLifecycleService({
-    detect: async () => [{ ...deepseekBase, incompatible: !installed, version: installed ? '0.2.1-rc.2' : '0.2.0-rc.2' }],
-    runner: async () => ({ code: 0, stdout: '"0.2.1-rc.2"', stderr: '' }),
+    detect: async () => [{ ...deepseekBase, incompatible: !installed, version: installed ? '0.2.2-rc.1' : '0.2.0-rc.2' }],
+    runner: async () => ({ code: 0, stdout: '"0.2.2-rc.1"', stderr: '' }),
     deepseekUpdate: async (version) => {
-      assert.equal(version, '0.2.1-rc.2', 'update installs the qualified registry version')
+      assert.equal(version, '0.2.2-rc.1', 'update installs the qualified registry version')
       installed = true
       return { code: 0, stdout: '', stderr: '' }
     }
@@ -1085,7 +1109,7 @@ test('DeepSeek Harness update reinstalls the managed runtime at the checked vers
   assert.equal(service.snapshot()[0].lifecycle.updateStatus, 'available', 'incompatible installed runtimes remain discoverable for update')
   await assert.rejects(service.updateOne('deepseek', () => true), /agent_has_active_session/)
   const updated = await service.updateOne('deepseek', () => false)
-  assert.equal(updated.lifecycle.currentVersion, '0.2.1-rc.2')
+  assert.equal(updated.lifecycle.currentVersion, '0.2.2-rc.1')
   assert.equal(updated.lifecycle.updateStatus, 'current')
   assert.equal(updated.lifecycle.availableVersion, undefined)
   assert.equal(updated.lifecycle.availability, 'available')
@@ -1095,7 +1119,7 @@ test('DeepSeek post-update validation reports the actual failure and allows a re
   let attempts = 0
   const service = new AgentLifecycleService({
     detect: async () => [{ ...deepseekBase, incompatible: attempts === 1, unavailableReason: attempts === 1 ? '模型目录加载失败' : undefined }],
-    runner: async () => ({ code: 0, stdout: '"0.2.1-rc.2"', stderr: '' }),
+    runner: async () => ({ code: 0, stdout: '"0.2.2-rc.1"', stderr: '' }),
     deepseekUpdate: async () => { attempts++; return { code: 0, stdout: '', stderr: '' } }
   })
   await service.detectAll(true)
@@ -1106,23 +1130,23 @@ test('DeepSeek post-update validation reports the actual failure and allows a re
   assert.equal(updated.lifecycle.updateStatus, 'current')
 })
 
-test('DeepSeek offers the qualified runtime when an incompatible version is newer or unknown', async () => {
+test('DeepSeek offers latest for unknown versions without suggesting a downgrade', async () => {
   for (const version of ['0.3.0', '']) {
     const service = new AgentLifecycleService({
       detect: async () => [{ ...deepseekBase, version, incompatible: true }],
-      runner: async () => ({ code: 0, stdout: '"0.2.1-rc.2"', stderr: '' })
+      runner: async () => ({ code: 0, stdout: '"0.2.2-rc.1"', stderr: '' })
     })
     await service.detectAll(true)
     const checked = await service.checkUpdate('deepseek')
-    assert.equal(checked.lifecycle.updateStatus, 'available')
-    assert.equal(checked.lifecycle.availableVersion, '0.2.1-rc.2')
+    assert.equal(checked.lifecycle.updateStatus, version ? 'current' : 'available')
+    assert.equal(checked.lifecycle.availableVersion, '0.2.2-rc.1')
   }
 })
 
 test('DeepSeek Harness update surfaces the managed install failure reason', async () => {
   const service = new AgentLifecycleService({
     detect: async () => [{ ...deepseekBase, version: '0.2.0-rc.2' }],
-    runner: async () => ({ code: 0, stdout: '"0.2.1-rc.2"', stderr: '' }),
+    runner: async () => ({ code: 0, stdout: '"0.2.2-rc.1"', stderr: '' }),
     deepseekUpdate: async () => ({ code: 1, stdout: '', stderr: 'DeepSeek Harness 需要 Node.js 22.19+ 或 24+，请先升级 Node.js' })
   })
   await service.detectAll(true)

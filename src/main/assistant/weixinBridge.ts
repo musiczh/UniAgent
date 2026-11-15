@@ -7,6 +7,7 @@ import type { Attachment, Session, UAEvent } from '../../shared/types'
 import type { AssistantWeixinState } from '../../shared/weixin'
 import { appendWeixinContext } from '../../shared/weixin'
 import { parseAssistantCommand } from '../../shared/assistant'
+import type { AssistantConversationSelection } from '../../shared/assistantConversation'
 import { asInteractionRequest, planFeedbackInAnswer } from '../../shared/interactionRequests'
 import type { Orchestrator } from '../orchestrator'
 import { WeixinApi, WeixinApiError, WEIXIN_BASE_URL, weixinUrl, type WeixinMessage } from './weixinApi'
@@ -18,7 +19,7 @@ interface Dependencies {
   api: WeixinApi
   orchestrator: Pick<Orchestrator, 'getSessionById' | 'getEvents' | 'forceSend' | 'interrupt' | 'respondToRequest' | 'setArchived' | 'currentTurnAgentMessageText' | 'getWeixinSendTurn'>
   createSession(prompt: string, attachments: Attachment[], bind: (session: Session) => Promise<void>, assertCurrent: () => void): Promise<Session>
-  command(sessionId: string, command: 'new' | 'clear', requestId: string): Promise<Session>
+  command(sessionId: string, command: 'new' | 'clear', requestId: string, selection?: AssistantConversationSelection): Promise<Session>
   onState(): void
   onError(message: string): void
   attachmentsDirectory: string
@@ -212,7 +213,7 @@ export class WeixinBridge {
           const prompt = appendWeixinContext(text)
           if (session) {
             if (session.config.assistantChannel !== 'weixin' || !session.config.assistantSnapshot || session.readOnly || session.teamBinding || session.handoffId) throw new Error('当前微信对话不可用，请在桌面端检查')
-            if (session.archived) this.deps.orchestrator.setArchived(session.id, false)
+            if (session.archived) await this.deps.orchestrator.setArchived(session.id, false)
             await this.deps.orchestrator.forceSend(session.id, prompt, attachments, undefined, { source: 'weixin' }, false)
           } else await this.deps.createSession(prompt, attachments, async created => {
             this.assertCurrent(generation)
@@ -229,10 +230,10 @@ export class WeixinBridge {
     const current = this.deps.store.get()
     await this.deps.store.update({ handled: [...current.handled, id].slice(-500), pending: current.pending.filter(item => item !== id) })
   }
-  async executeCommand(sessionId: string, command: 'new' | 'clear', requestId: string, generation = this.generation): Promise<Session> {
+  async executeCommand(sessionId: string, command: 'new' | 'clear', requestId: string, generation = this.generation, selection?: AssistantConversationSelection): Promise<Session> {
     if (!this.owns(sessionId)) throw new Error('当前会话不属于微信绑定')
     this.assertCurrent(generation)
-    const next = await this.deps.command(sessionId, command, requestId)
+    const next = await this.deps.command(sessionId, command, requestId, selection)
     this.assertCurrent(generation)
     await this.deps.store.update({ sessionId: next.id, pushedSeq: -1 })
     this.interactions.clear(sessionId)
@@ -241,8 +242,8 @@ export class WeixinBridge {
       .catch(error => this.deps.onError(safeError(error)))
     return next
   }
-  executeCommandFromApp(sessionId: string, command: 'new' | 'clear', requestId: string): Promise<Session> {
-    const run = this.incoming.then(() => this.executeCommand(sessionId, command, requestId))
+  executeCommandFromApp(sessionId: string, command: 'new' | 'clear', requestId: string, selection?: AssistantConversationSelection): Promise<Session> {
+    const run = this.incoming.then(() => this.executeCommand(sessionId, command, requestId, this.generation, selection))
     this.incoming = run.then(() => {}, () => {})
     return run
   }

@@ -25,6 +25,8 @@ export interface Annotation {
 
 export interface CapturedSelection {
   seq: number
+  messageId?: string
+  turnId?: string
   start: number
   end: number
   quote: string
@@ -43,23 +45,24 @@ function offsetIn(root: HTMLElement, container: Node, offset: number): number {
   return textWithoutBadges(range.cloneContents()).length
 }
 
-// Badge numbers are UI, not part of the Markdown offsets used for highlights.
+// Reader controls are UI, not part of the text offsets used for highlights.
+const ANNOTATION_IGNORED = '.ua-anno-badge,.md-frontmatter,.md-overlays,[data-streamdown="code-block-header"],[data-streamdown="code-block-actions"],[data-streamdown="table-wrapper"] > :first-child:has(button)'
 function textWithoutBadges(root: HTMLElement | DocumentFragment): string {
   const copy = root.cloneNode(true) as HTMLElement | DocumentFragment
-  copy.querySelectorAll('.ua-anno-badge').forEach((badge) => badge.remove())
+  copy.querySelectorAll(ANNOTATION_IGNORED).forEach((node) => node.remove())
   return copy.textContent || ''
 }
 
 // The `.agent-md` reply element that fully contains the current selection, plus
 // its owning event seq — or null when the selection escapes a single reply.
-function replyElementFor(range: Range): { md: HTMLElement; seq: number } | null {
+function replyElementFor(range: Range): { md: HTMLElement; seq: number; messageId?: string; turnId?: string } | null {
   const anchor = range.commonAncestorContainer
   const el = anchor.nodeType === Node.ELEMENT_NODE ? (anchor as Element) : anchor.parentElement
   const md = el?.closest('.agent-md') as HTMLElement | null
   if (!md) return null
   const seqEl = md.closest('[data-seq]') as HTMLElement | null
   if (!seqEl?.dataset.seq) return null
-  return { md, seq: Number(seqEl.dataset.seq) }
+  return { md, seq: Number(seqEl.dataset.seq), messageId: seqEl.dataset.messageId, turnId: seqEl.dataset.turnId }
 }
 
 /** Capture the live selection if it lands inside one annotatable agent reply. */
@@ -76,7 +79,30 @@ export function captureSelection(): CapturedSelection | null {
   const quote = selectedMessageText.slice(start, end).trim()
   if (!quote) return null
   const rect = range.getBoundingClientRect()
-  return { seq: hit.seq, start, end, quote, selectedMessageText, rect }
+  return { seq: hit.seq, messageId: hit.messageId, turnId: hit.turnId, start, end, quote, selectedMessageText, rect }
+}
+
+/** Rebuild a selection after highlights split/replace its original text nodes. */
+export function rangeForSelection(root: HTMLElement, selection: Pick<CapturedSelection, 'start' | 'end' | 'quote'>): Range | null {
+  if (selection.start < 0 || selection.end <= selection.start) return null
+  const range = document.createRange()
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+  let offset = 0
+  let started = false
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (node.parentElement?.closest(ANNOTATION_IGNORED)) continue
+    const end = offset + (node.nodeValue || '').length
+    if (!started && selection.start < end) {
+      range.setStart(node, selection.start - offset)
+      started = true
+    }
+    if (started && selection.end <= end) {
+      range.setEnd(node, selection.end - offset)
+      return textWithoutBadges(range.cloneContents()).trim() === selection.quote ? range : null
+    }
+    offset = end
+  }
+  return null
 }
 
 /** Remove any highlight marks / badges previously injected into a reply. */
@@ -106,6 +132,7 @@ function collectSegs(root: HTMLElement, start: number, end: number, planIdx: num
   const segs: Omit<Seg, 'isLast'>[] = []
   let off = 0
   for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    if (n.parentElement?.closest(ANNOTATION_IGNORED)) continue
     const len = (n.nodeValue || '').length
     const s = Math.max(start, off)
     const e = Math.min(end, off + len)

@@ -9,6 +9,7 @@ import { join, resolve, basename } from 'node:path'
 import { deflateSync } from 'node:zlib'
 import { createHash, randomInt } from 'node:crypto'
 import { createAcceptanceProcessSweeper } from './acceptance-process-sweeper.mjs'
+import { installMarkdownInputDriver } from './fixtures/markdown-input-driver.mjs'
 
 const binary = resolve(process.argv[2] || 'release/mac-arm64/UniAgent Public.app/Contents/MacOS/UniAgent Public')
 assert.ok(binary.includes('/release/') && binary.endsWith('/Contents/MacOS/UniAgent Public'))
@@ -69,7 +70,7 @@ async function openSession(id) {
   await evaluate(`document.querySelector(${JSON.stringify(selector)}).click()`)
 }
 async function pasteImage(selector, code) {
-  await waitFor(() => evaluate(`document.querySelector(${JSON.stringify(selector)})?.placeholder.includes('可粘贴图片')`), Boolean, 'image-enabled input')
+  await waitFor(() => evaluate(`document.querySelector(${JSON.stringify(selector)})?.getAttribute('aria-label')?.includes('可粘贴图片')`), Boolean, 'image-enabled input')
   await evaluate(`(async()=>{
     const canvas=document.createElement('canvas'); canvas.width=600; canvas.height=180;
     const context=canvas.getContext('2d'); context.fillStyle='white'; context.fillRect(0,0,600,180);
@@ -81,16 +82,15 @@ async function pasteImage(selector, code) {
   await waitFor(() => evaluate(`!![...document.querySelectorAll('.attach-thumb img')].find(i=>i.complete&&i.naturalWidth>0)`), Boolean, 'real pasted image preview')
 }
 async function typePrompt(selector, prompt) {
-  await evaluate(`(()=>{const input=document.querySelector(${JSON.stringify(selector)});
-    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(input,${JSON.stringify(prompt)});
-    input.dispatchEvent(new Event('input',{bubbles:true}));})()`)
+  await evaluate(`(${installMarkdownInputDriver.toString()})()`)
+  await evaluate(`window.__markdownInput.fill(${JSON.stringify(selector)},${JSON.stringify(prompt)})`)
 }
 async function verifyImageInputs(agent) {
   const prompt='只回复这张图片中的六位数字，不调用工具。'
   const firstCode=String(randomInt(100000,1000000))
-  await pasteImage('.new-task textarea',firstCode)
+  await pasteImage('.new-task .markdown-editor-content',firstCode)
   check('new-task image paste creates a decoded preview',true)
-  await typePrompt('.new-task textarea',prompt)
+  await typePrompt('.new-task .markdown-editor-content',prompt)
   const before=new Set((await call('listSessions')).map(s=>s.id))
   await waitFor(() => evaluate(`!document.querySelector('.new-task-send-btn')?.disabled`),Boolean,'new image task ready')
   await evaluate(`document.querySelector('.new-task-send-btn').click()`)
@@ -101,9 +101,9 @@ async function verifyImageInputs(agent) {
   await openSession(session.id)
   let nextCode
   do { nextCode=String(randomInt(100000,1000000)) } while(nextCode===firstCode)
-  await pasteImage('.composer-input',nextCode)
+  await pasteImage('.composer .markdown-editor-content',nextCode)
   check('existing-session image paste creates a decoded preview',true)
-  await typePrompt('.composer-input',prompt)
+  await typePrompt('.composer .markdown-editor-content',prompt)
   const completed=first.events.filter(e=>e.type==='turn_completed').length
   await waitFor(() => evaluate(`!document.querySelector('.composer-send-btn')?.disabled`),Boolean,'image continuation ready')
   await evaluate(`document.querySelector('.composer-send-btn').click()`)
@@ -129,10 +129,10 @@ async function verifyUsageUI(id, events, label) {
     'main-process snapshot must not retain intermediate usage settlements')
   await openSession(id)
   const expected = usage.map(e => e.payload.usage)
-  await waitFor(() => evaluate(`[...document.querySelectorAll('.usage-line')].map(e=>e.textContent)`),
+  await waitFor(() => evaluate(`[...document.querySelectorAll('.message-usage > button')].map(e=>e.title)`),
     lines => lines.length === expected.length && lines.every((line,i) => line.includes(expected[i].inputTokens.toLocaleString('en-US'))), label + ' visible usage')
   const tables = await evaluate(`(async()=>{
-    document.querySelectorAll('.card.usage:not(.open) .usage-line').forEach(e=>e.click());
+    document.querySelectorAll('.message-usage > button[aria-expanded="false"]').forEach(e=>e.click());
     await new Promise(r=>setTimeout(r,100));
     return [...document.querySelectorAll('.usage-table')].map(t=>[...t.querySelectorAll('tbody tr')].map(r=>[...r.querySelectorAll('td')].slice(0,3).map(c=>c.textContent)));
   })()`)
@@ -172,8 +172,14 @@ async function startApp() {
   }, ts => ts.some(t => t.type === 'page' && decodeURIComponent(t.url).endsWith(expected)), 'packaged renderer', 40000)
   const target = targets.find(t => t.type === 'page' && decodeURIComponent(t.url).endsWith(expected))
   ws = new WebSocket(target.webSocketDebuggerUrl)
+  const socket = ws, launchedApp = child
   ws.onmessage = e => { const m = JSON.parse(e.data); if (pending.has(m.id)) { pending.get(m.id).resolve(m); pending.delete(m.id) } }
-  ws.onclose = () => { for (const p of pending.values()) p.reject(new Error('CDP disconnected')); pending.clear() }
+  ws.onclose = event => {
+    if (ws !== socket) return
+    const failures = stderr.split('\n').filter(line => /render-process-gone|FATAL ERROR|heap out of memory/.test(line))
+    for (const p of pending.values()) p.reject(new Error(`CDP disconnected (${event.code}); App exit=${launchedApp.exitCode}, signal=${launchedApp.signalCode}; ${failures.join(' ')}`))
+    pending.clear()
+  }
   await new Promise((r, j) => { ws.onopen = r; ws.onerror = j })
   await waitFor(async () => {
     try { return await call('getLifecycleSnapshot') }

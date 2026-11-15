@@ -75,8 +75,9 @@ try {
   assert.ok(String(injected).endsWith('只报告真实问题。'), JSON.stringify(injected))
   const started = transport.requests.find((request) => request.method === 'thread/start')?.params
   assert.equal(started?.config.openai_base_url, 'http://127.0.0.1:11436/api/codex/v1')
-  assert.deepEqual(appServerArgs, ['app-server', '-c', 'thread_unload_delay_secs=0', '-c', 'model_catalog_json="/tmp/uniagent-models.json"'],
-    '进程启动时加载模型目录，接口地址和请求参数仍由 thread 独立应用')
+  assert.equal(started?.config['features.enable_request_compression'], false)
+  assert.deepEqual(appServerArgs, ['app-server', ...sourceArgs, '-c', 'thread_unload_delay_secs=0'],
+    '新版原生进程在启动时加载完整来源参数，Thread 配置仍精确应用同一来源')
 } finally {
   configureCodexAppServerArgsProvider()
   appServer.dispose()

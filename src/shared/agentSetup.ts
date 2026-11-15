@@ -1,4 +1,4 @@
-export const CLI_SETUP_IDS = ['codex', 'traex', 'claude', 'grok'] as const
+export const CLI_SETUP_IDS = ['codex', 'traex', 'claude', 'grok', 'qoder'] as const
 export type CliSetupId = typeof CLI_SETUP_IDS[number]
 export interface CliSetupInput { method?: 'browser' | 'sso' | 'key'; apiKey?: string }
 export interface CliSetupSnapshot {

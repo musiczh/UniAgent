@@ -355,6 +355,15 @@ await writeFile(join(codexDir, 'session_index.jsonl'), [
 
 const server = await createServer({
   root: process.cwd(),
+  plugins: [{
+    name: 'offline-mermaid-runtime',
+    resolveId: id => id === 'virtual:uniagent-mermaid-runtime-url' ? id : undefined,
+    load: id => id === 'virtual:uniagent-mermaid-runtime-url' ? 'export default "about:blank"' : undefined
+  }, {
+    name: 'offline-markdown-worker',
+    resolveId: id => id === 'virtual:uniagent-markdown-worker-url' ? id : undefined,
+    load: id => id === 'virtual:uniagent-markdown-worker-url' ? 'export default "about:blank"' : undefined
+  }],
   resolve: {
     alias: {
       '@shared': join(process.cwd(), 'src/shared'),

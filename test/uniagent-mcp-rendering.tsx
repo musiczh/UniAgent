@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
-import { createElement, type ComponentProps } from 'react'
-import { renderToStaticMarkup } from 'react-dom/server'
+import type { ComponentProps } from 'react'
 import { EventStream } from '../src/renderer/components/EventStream.tsx'
 import { handoffTaskAction } from '../src/shared/handoffEvents.ts'
 import type { UAEvent } from '../src/shared/types.ts'
@@ -8,55 +7,55 @@ import { renderEventStream } from './regression/render-event-stream.mjs'
 
 const originalId = '53f4b2d4-eb9a-4bf1-b7de-f6c55dd7cb1e'
 const nextId = '63f4b2d4-eb9a-4bf1-b7de-f6c55dd7cb1e'
-function render(name: string, input: object, result: unknown, options: {
+async function render(name: string, input: object, result: unknown, options: {
   state?: UAEvent['state']
   waitingForHandoff?: ComponentProps<typeof EventStream>['waitingForHandoff']
-} = {}): string {
+} = {}): Promise<string> {
   const events: UAEvent[] = [
     { sessionId: 'caller', seq: 0, ts: 1000, type: 'user_message', payload: { text: '执行任务' } },
     { sessionId: 'caller', seq: 1, ts: 1001, type: 'tool_call', state: options.state ?? 'success',
       payload: { id: 'call', provider: 'mcp', server: 'uniagent', name, input, result } }
   ]
-  return renderToStaticMarkup(createElement(EventStream, {
-    sessionId: 'caller', status: 'running', events,
-    handoffSessionTargets: { [originalId]: { sessionId: 'target', roleName: '审查员', agentName: 'Codex' } },
-    onJumpToSession: () => {},
-    waitingForHandoff: options.waitingForHandoff
-  }))
+  return renderEventStream(events, 'running', 'caller', {
+    setup: `window.__eventStreamProps = {...${JSON.stringify({
+      handoffSessionTargets: { [originalId]: { sessionId: 'target', roleName: '审查员', agentName: 'Codex' } },
+      waitingForHandoff: options.waitingForHandoff
+    })}, onJumpToSession: () => {}}`,
+  })
 }
 
 for (const current of [true, false]) {
-  const create = render(current ? 'uniagent_task' : 'create_uniagent_task',
+  const create = await render(current ? 'uniagent_task' : 'create_uniagent_task',
     { ...(current ? { action: 'create' } : {}), role: 'internal-role', prompt: '只读审查' },
     `taskId=${originalId}\n\n[uniagent:event=started]`)
   assert.match(create, /跨agent调用[\s\S]*审查员[\s\S]*（Codex）[\s\S]*派发任务/)
   assert.match(create, /点击跳转到该任务会话/)
   assert.doesNotMatch(create, /internal-role/)
 
-  const followup = render(current ? 'uniagent_task' : 'create_uniagent_task',
+  const followup = await render(current ? 'uniagent_task' : 'create_uniagent_task',
     { ...(current ? { action: 'followup', taskId: originalId } : { followupTaskId: originalId }), prompt: '继续检查' },
     `taskId=${nextId}\n\n[uniagent:event=delivered]`)
   assert.match(followup, /审查员[\s\S]*（Codex）[\s\S]*追加消息/)
   assert.match(followup, /点击跳转到该任务会话/, 'a new followup taskId must resolve to its original session')
 
-  const forced = render(current ? 'uniagent_task' : 'create_uniagent_task',
+  const forced = await render(current ? 'uniagent_task' : 'create_uniagent_task',
     { ...(current ? { action: 'followup', taskId: originalId } : { followupTaskId: originalId }), prompt: '立即收尾', force: true },
     `taskId=${originalId}\n\n[uniagent:event=force-delivered]`)
   assert.match(forced, /强制追加/)
 
   for (const [status, label] of [['completed', '任务结束'], ['failed', '任务异常'], ['stopped', '任务中止']]) {
-    const ended = render(current ? 'uniagent_task' : 'get_uniagent_task',
+    const ended = await render(current ? 'uniagent_task' : 'get_uniagent_task',
       { ...(current ? { action: 'get', wait: true } : {}), taskId: originalId },
       JSON.stringify({ taskId: originalId, status, done: true, latestReply: '查询的最终结果' }))
     assert.match(ended, new RegExp(label))
     assert.doesNotMatch(ended, /已开始|已送达|已完成|已中止/)
     assert.match(ended, /查询的最终结果/)
   }
-  const running = render(current ? 'uniagent_task' : 'get_uniagent_task',
+  const running = await render(current ? 'uniagent_task' : 'get_uniagent_task',
     { ...(current ? { action: 'get' } : {}), taskId: originalId },
     JSON.stringify({ taskId: originalId, status: 'running', done: false }))
   assert.doesNotMatch(running, /process-handoff-end/)
-  const stopped = render(current ? 'uniagent_task' : 'stop_uniagent_task',
+  const stopped = await render(current ? 'uniagent_task' : 'stop_uniagent_task',
     { ...(current ? { action: 'stop' } : {}), taskId: originalId },
     `taskId=${originalId}\n\n已停止\n\n[uniagent:terminal=stopped]`)
   assert.match(stopped, /任务中止/)
@@ -70,21 +69,21 @@ for (const current of [true, false]) {
   const name = current ? 'uniagent_task' : 'create_uniagent_task'
   const input = { ...(current ? { action: 'followup', taskId: originalId } : { followupTaskId: originalId }), prompt: '同步追加的需求', wait: true }
   for (const state of ['running', 'pending'] as const) {
-    const create = render(name, { ...(current ? { action: 'create' } : {}), role: 'internal-role', prompt: '同步派发的需求', wait: true }, undefined, {
+    const create = await render(name, { ...(current ? { action: 'create' } : {}), role: 'internal-role', prompt: '同步派发的需求', wait: true }, undefined, {
       state, waitingForHandoff: { ...waitingForHandoff, handoffId: originalId },
     })
     assert.match(create, /审查员[\s\S]*（Codex）[\s\S]*派发任务/, '同步新建任务继续使用已确认的卡片')
-    const waiting = render(name, input, undefined, { state, waitingForHandoff })
+    const waiting = await render(name, input, undefined, { state, waitingForHandoff })
     assert.equal((waiting.match(/class="hx"/g) || []).length, 1, '同步追加在运行或待处理时立即复用一张跨 Agent 卡片')
     assert.match(waiting, /审查员[\s\S]*（Codex）[\s\S]*追加消息/)
     assert.match(waiting, /同步追加的需求/)
     assert.doesNotMatch(waiting, /step-call-name[^>]*>uniagent/, '卡片替代普通工具调用行')
   }
-  const unconfirmed = render(name, input, undefined, { state: 'running' })
+  const unconfirmed = await render(name, input, undefined, { state: 'running' })
   assert.doesNotMatch(unconfirmed, /class="hx"/, '没有实际目标会话的等待确认时不伪造追加卡片')
-  const asynchronous = render(name, { ...input, wait: false }, undefined, { state: 'running', waitingForHandoff })
+  const asynchronous = await render(name, { ...input, wait: false }, undefined, { state: 'running', waitingForHandoff })
   assert.doesNotMatch(asynchronous, /class="hx"/, '异步请求在收到送达结果前不复用其它等待状态生成卡片')
-  const differentTask = render(name, input, `taskId=${originalId}`, { state: 'running', waitingForHandoff })
+  const differentTask = await render(name, input, `taskId=${originalId}`, { state: 'running', waitingForHandoff })
   assert.doesNotMatch(differentTask, /class="hx"/, '已有结果中的任务 ID 不匹配当前等待任务时不推断送达')
 }
 
@@ -92,7 +91,7 @@ const forcedId = '73f4b2d4-eb9a-4bf1-b7de-f6c55dd7cb1e'
 const failedId = '83f4b2d4-eb9a-4bf1-b7de-f6c55dd7cb1e'
 const stoppedId = '93f4b2d4-eb9a-4bf1-b7de-f6c55dd7cb1e'
 const directId = 'a3f4b2d4-eb9a-4bf1-b7de-f6c55dd7cb1e'
-const unrelated = render('uniagent_task', { action: 'create', agent: 'codex', prompt: '另一个任务' }, `taskId=${directId}\n\n[uniagent:event=started]`, { waitingForHandoff })
+const unrelated = await render('uniagent_task', { action: 'create', agent: 'codex', prompt: '另一个任务' }, `taskId=${directId}\n\n[uniagent:event=started]`, { waitingForHandoff })
 assert.doesNotMatch(unrelated, /class="hx"[^>]*role="button"/, '其它未解析的任务卡片不能跳转到当前等待中的任务')
 const event = (seq: number, type: UAEvent['type'], payload: UAEvent['payload']): UAEvent =>
   ({ sessionId: 'caller', seq, ts: 1000 + seq, type, state: 'success', payload })

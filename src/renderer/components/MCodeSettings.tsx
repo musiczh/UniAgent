@@ -24,9 +24,11 @@ export function MCodeSettings({ agent, onRedetect, installation, defaultParamete
   const wasReady = useRef(agent.lifecycle?.availability === 'available')
   if (snapshot?.status === 'ready') wasReady.current = true
   else if (snapshot && snapshot.status !== 'failed') wasReady.current = false
-  const installed = snapshot?.installed ?? agent.installed === true
+  const needsLogin = agent.lifecycle?.availability === 'needs-auth' && agent.lifecycle.detectionStatus !== 'failed'
+  const installed = needsLogin ? agent.installed === true : snapshot?.installed ?? agent.installed === true
   const busy = action !== null || snapshot?.cancellable === true
-  const ready = snapshot?.status === 'ready' || wasReady.current && (!snapshot || snapshot.status === 'failed')
+  const ready = !needsLogin && (snapshot?.status === 'ready' || wasReady.current && (!snapshot || snapshot.status === 'failed'))
+  const detectionFailed = snapshot?.status === 'failed' && !needsLogin
   useEffect(() => {
     let current = true
     mounted.current = true
@@ -126,13 +128,13 @@ export function MCodeSettings({ agent, onRedetect, installation, defaultParamete
       <div className="deepseek-step-head">
         <span className="deepseek-step-number">2</span>
         <div className="deepseek-step-main">
-          <div className="deepseek-step-title">{browser ? '等待浏览器授权' : snapshot.status === 'failed' ? '连接检测未完成' : '登录 MiniMax Code'}</div>
+          <div className="deepseek-step-title">{browser ? '等待浏览器授权' : detectionFailed ? '连接检测未完成' : '登录 MiniMax Code'}</div>
           <div className="deepseek-step-sub">{!installed ? '安装完成后，自动检查已有登录与模型配置。' : browser ? '请在 MiniMax 官方页面完成登录，完成后自动检测。' : '选择一种登录方式，完成后即可使用。'}</div>
         </div>
-        {status(!installed ? '等待安装' : browser ? '登录中' : action === 'key' ? '验证中' : snapshot.status === 'failed' ? '检测失败' : '待登录', snapshot.status === 'failed' ? 'warn' : 'off')}
+        {status(!installed ? '等待安装' : browser ? '登录中' : action === 'key' ? '验证中' : detectionFailed ? '检测失败' : '待登录', detectionFailed ? 'warn' : 'off')}
       </div>
       {installed && <div className="deepseek-connection-form">
-        {snapshot.status === 'failed' && !busy ? <>{failureBlock}{checking}</> : browser ? <>
+        {detectionFailed && !busy ? <>{failureBlock}{checking}</> : browser ? <>
           {failureBlock}<div className="mcode-actions"><button className="set-mini-btn primary" onClick={() => void reopen()}>重新打开浏览器</button><button className="set-mini-btn" onClick={() => void cancel()}>取消等待</button></div>
         </> : <>
           <div className="mcode-segments" role="group" aria-label="登录方式">

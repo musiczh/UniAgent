@@ -65,6 +65,7 @@ export function agentQuotaConsole(agent: AgentDef, mcodeRegion = agent.mcode?.re
   let url: string
   switch (agent.adapter) {
     case 'codex': url = 'https://chatgpt.com/codex/settings/usage'; break
+    case 'qoder': url = agent.qoder?.region === 'cn' ? 'https://qoder.cn/account/usage' : 'https://qoder.com/account/usage'; break
     case 'claude': url = 'https://claude.ai/settings/usage'; break
     case 'grok': url = 'https://console.x.ai/'; break
     case 'kimi': url = 'https://www.kimi.com/code/console'; break

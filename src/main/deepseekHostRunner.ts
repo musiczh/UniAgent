@@ -29,6 +29,7 @@ export class DeepSeekHostRunner extends EventEmitter {
   private running = false
   private cancelling = false
   private submitted = false
+  private turnCompleted = false
   private broken = false
   private failedClient?: DeepSeekHostClient
   private nativeSessionId?: string
@@ -52,6 +53,10 @@ export class DeepSeekHostRunner extends EventEmitter {
   isRunning(): boolean { return this.running }
   supportsCommand(name: string): boolean { return this.contract?.commands.includes(name.replace(/^\//, '')) === true }
   private event(event: Event): void {
+    if (event.type === 'turn_completed') {
+      if (this.turnCompleted) return
+      this.turnCompleted = true
+    }
     if (!this.disposed) this.emit('event', { ...event, sessionId: this.sessionId, seq: this.seqRef.n++, ts: Date.now() })
   }
   private ensureReady(): Promise<void> {
@@ -230,6 +235,7 @@ export class DeepSeekHostRunner extends EventEmitter {
   async startTurn(prompt: string, attachments?: Attachment[]): Promise<void> {
     if (this.disposed || this.running) throw new DeepSeekHostError('runner-busy')
     this.running = true; this.cancelling = false; this.submitted = false; this.segments.clear()
+    this.turnCompleted = false; this.context.turnId = undefined
     const done = new Promise<void>(resolve => { this.finishTurn = resolve })
     try {
       await this.ensureReady()
@@ -254,7 +260,9 @@ export class DeepSeekHostRunner extends EventEmitter {
         return
       }
       const authRequired = error instanceof DeepSeekHostError && /credentials|authentication/.test(error.code)
-      this.event({ type: 'error', state: 'failed', payload: { message: error instanceof Error ? error.message : 'DeepSeek Host 请求失败', ...(authRequired ? { authRequired: true } : {}) } })
+      this.event({ type: 'error', state: 'failed', payload: { message: error instanceof Error ? error.message : 'DeepSeek Host 请求失败',
+        ...(error instanceof DeepSeekHostError ? { code: error.code, nativeSubmission: this.submitted ? 'unknown' : 'not-submitted' } : {}),
+        ...(authRequired ? { authRequired: true } : {}) } })
       this.finish(this.cancelling ? 'cancelled' : 'failed', authRequired)
     }
   }
@@ -355,10 +363,14 @@ export class DeepSeekHostRunner extends EventEmitter {
   private finish(state: 'success' | 'failed' | 'cancelled', authRequired = false): void {
     if (!this.running) return
     clearTimeout(this.cancelTimer); this.cancelTimer = undefined
+    const nativeSubmission = this.submitted ? 'unknown' : 'not-submitted'
     this.running = false; this.submitted = false
     for (const [id, segment] of this.segments) this.event({ type: segment.type, state, payload: { id, text: segment.text } })
     this.segments.clear()
     for (const id of this.pending.keys()) this.resolve(id, 'cancelled')
+    // Native turn/end normally supplies this; local failure/cancellation must also settle consumers.
+    this.event({ type: 'turn_completed', state, payload: { nativeSubmission,
+      ...(this.context.turnId ? { turnId: this.context.turnId } : {}) } })
     this.finishTurn?.(); this.finishTurn = undefined
     this.emit('done', { nativeSessionId: this.nativeSessionId, failed: state === 'failed', interrupted: state === 'cancelled', authRequired })
   }

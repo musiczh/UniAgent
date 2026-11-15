@@ -23,8 +23,8 @@ export function KimiSettings({ agent, installation, defaultParameters }: {
   }, [])
   const busy = pending || snapshot.cancellable
   const installed = agent.lifecycle ? agent.installed === true : snapshot.status ? snapshot.status !== 'uninstalled' : agent.installed === true
-  const ready = agent.lifecycle ? agent.lifecycle.availability === 'available' || !!agent.lifecycle.lastReadyAt : snapshot.status === 'ready'
-  const detectionFailed = agent.lifecycle ? agent.lifecycle.detectionStatus === 'failed' || agent.incompatible : snapshot.status === 'incompatible'
+  const ready = agent.lifecycle ? agent.lifecycle.availability === 'available' || (agent.lifecycle.detectionStatus === 'failed' && !!agent.lifecycle.lastReadyAt) : snapshot.status === 'ready'
+  const detectionFailed = agent.lifecycle ? agent.lifecycle.detectionStatus === 'failed' || (agent.lifecycle.availability !== 'needs-auth' && agent.incompatible) : snapshot.status === 'incompatible'
   const error = failure || (snapshot.phase === 'failed' || snapshot.phase === 'cancelled' ? snapshot.message : '') || ''
   const perform = async (action: 'install' | 'check' | 'login') => {
     if (locked.current) return

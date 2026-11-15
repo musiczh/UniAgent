@@ -15,12 +15,12 @@ const result = await renderEventStream([
   { sessionId: 'table-annotations', seq: 3, ts: 3, type: 'turn_completed', payload: {} },
 ], 'idle', 'table-annotations', {
   setup: `
-    import {applyAnnotations, captureSelection, stripAnnotations} from './src/renderer/textAnnotations';
-    window.annotationFixture = {applyAnnotations, captureSelection, stripAnnotations};
+    import {applyAnnotations, captureSelection, rangeForSelection, stripAnnotations} from './src/renderer/textAnnotations';
+    window.annotationFixture = {applyAnnotations, captureSelection, rangeForSelection, stripAnnotations};
   `,
   inspect: `(() => {
-    const {applyAnnotations, captureSelection, stripAnnotations} = window.annotationFixture;
-    const root = document.querySelector('.agent-md');
+    const {applyAnnotations, captureSelection, rangeForSelection, stripAnnotations} = window.annotationFixture;
+    const root = document.querySelector('.agent-msg .agent-md');
     const table = root.querySelector('table');
     const originalHTML = root.innerHTML;
     const plain = root.textContent;
@@ -54,6 +54,11 @@ const result = await renderEventStream([
       codePreserved:root.querySelectorAll('code').length,
     };
     const markedHTML = root.innerHTML;
+    const restoredRange = rangeForSelection(root, annotation)?.toString().trim();
+    const invalidRanges = [
+      {...annotation,start:-1}, {...annotation,end:annotation.start},
+      {...annotation,end:plain.length+1}, {...annotation,quote:'原文已经变化'},
+    ].every(selection => rangeForSelection(root, selection) === null);
     applyAnnotations(root, [annotation], true);
     const idempotent = root.innerHTML === markedHTML;
     const range = document.createRange();
@@ -69,6 +74,7 @@ const result = await renderEventStream([
     const secondStart = plain.indexOf('8.0 GB');
     const second = {id:'second', seq:2, start:secondStart, end:secondStart + '8.0 GB'.length, quote:'8.0 GB', comment:''};
     applyAnnotations(root, [annotation, second]);
+    const rangeAfterBadge = rangeForSelection(root, second)?.toString();
     const multiple = {aligned:grid(), invalidMarks:invalidMarks(),
       badges:[...root.querySelectorAll('.ua-anno-badge')].map(badge => badge.textContent),
       secondText:root.querySelector('mark[data-anno-id="second"]').textContent};
@@ -81,9 +87,10 @@ const result = await renderEventStream([
     const file = {aligned:grid(), invalidMarks:invalidMarks(), marks:root.querySelectorAll('mark').length};
     applyAnnotations(root, [{...annotation, filePath:'/tmp/table.md', quote:'outdated text'}]);
     const staleFileMarks = root.querySelectorAll('mark, .ua-anno-badge').length;
-    const structuralStart = plain.indexOf('Codex 临时安装目录') - 1;
-    applyAnnotations(root, [{...annotation, start:structuralStart, end:structuralStart + 1}]);
-    const whitespaceOnly = root.querySelectorAll('mark, .ua-anno-badge').length;
+    const structural = document.createElement('div');
+    structural.innerHTML = '<table><tbody>\\n<tr><td>内容</td></tr>\\n</tbody></table>';
+    applyAnnotations(structural, [{...annotation, start:0, end:1, quote:'\\n'}]);
+    const whitespaceOnly = structural.querySelectorAll('mark, .ua-anno-badge').length;
     applyAnnotations(root, [second]);
     applyAnnotations(root, []);
     const clearedHTML = root.innerHTML;
@@ -94,7 +101,8 @@ const result = await renderEventStream([
     const inlineWhitespaceMarked = inline.querySelector('p > mark')?.textContent === ' ';
     stripAnnotations(inline);
     return {plain, baselineAligned, crossRow, idempotent, captured, structuralEnd, multiple, file,
-      staleFileMarks, whitespaceOnly, clearedHTML, originalHTML, inlineWhitespaceMarked, overlapping, overlappingIdempotent};
+      staleFileMarks, whitespaceOnly, clearedHTML, originalHTML, inlineWhitespaceMarked, overlapping, overlappingIdempotent,
+      restoredRange, invalidRanges, rangeAfterBadge, quote:annotation.quote};
   })()`
 })
 
@@ -125,4 +133,7 @@ assert.equal(result.clearedHTML, result.originalHTML, 'clearing annotations rest
 assert.equal(result.inlineWhitespaceMarked, true, 'visible spaces between inline elements remain highlightable')
 assert.deepEqual(result.overlapping, {text:result.plain, aligned:true, badges:2}, 'overlapping inline threads preserve both anchors and table layout')
 assert.equal(result.overlappingIdempotent, true)
+assert.equal(result.restoredRange, result.quote, 'selection ranges survive marks across table cells and inline formatting')
+assert.equal(result.rangeAfterBadge, '8.0 GB', 'restored offsets exclude preceding annotation badges')
+assert.equal(result.invalidRanges, true, 'invalid offsets and changed source text cannot locate an unrelated range')
 console.log('text annotations: table layout, offsets, badges, reapplication and cleanup passed')

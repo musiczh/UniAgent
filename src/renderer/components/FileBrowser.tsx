@@ -165,7 +165,8 @@ export function FileBrowser({
   onEditRequestHandled,
   onOpenFile,
   coverSidebar = false,
-  onToggleCover
+  onToggleCover,
+  returnLabel = '返回会话'
 }: {
   sessionId: string
   workdir: string
@@ -189,6 +190,7 @@ export function FileBrowser({
   coverSidebar?: boolean
   /** 需求补9 — 切换铺满全窗 / 保留侧栏。 */
   onToggleCover?: () => void
+  returnLabel?: string
 }): JSX.Element {
   const overlayRef = useRef<HTMLDivElement>(null)
   const readerButtonRef = useRef<HTMLButtonElement>(null)
@@ -698,7 +700,7 @@ export function FileBrowser({
       aria-modal="true"
       aria-label="文件浏览器"
     >
-      <header className="scene-head">
+      <header className="scene-head responsive-toolbar">
         <div className="titles">
           <h1>文件浏览器</h1>
           <p title={root}>{root || '工作目录'}</p>
@@ -716,12 +718,12 @@ export function FileBrowser({
             </button>
           )}
           <button
-            className="scene-back-btn"
+            className="scene-back-btn toolbar-action"
             title="关闭文件浏览器 (Esc)"
             aria-label="关闭文件浏览器"
             onClick={requestClose}
           >
-            <UiIcon name="back" size={15} /> 返回会话
+            <UiIcon name="back" size={15} /><span className="toolbar-action-label">{returnLabel}</span>
           </button>
         </div>
       </header>
@@ -749,7 +751,7 @@ export function FileBrowser({
         )}
 
         <main className="fb-preview">
-          <div className="fb-toolbar">
+          <div className="fb-toolbar responsive-toolbar">
             {treeCollapsed && (
               <button className="fb-toolbar-btn" title="展开目录树" aria-label="展开目录树" onClick={() => setTreeCollapsed(false)}><Chevron size={15} /></button>
             )}
@@ -765,8 +767,8 @@ export function FileBrowser({
             <span className="fb-toolbar-spacer" />
 
             {markdown && !previewLoading && preview?.ok && preview.kind === 'text' && preview.text !== undefined && (
-              <button ref={readerButtonRef} className="fb-toolbar-btn fb-reader-btn" onClick={() => setReaderOpen(true)}
-                title="全屏阅读 Markdown" aria-label="阅读模式"><UiIcon name="book-open" size={14} />阅读模式</button>
+              <button ref={readerButtonRef} className="fb-toolbar-btn fb-reader-btn toolbar-action" onClick={() => setReaderOpen(true)}
+                title="全屏阅读 Markdown" aria-label="阅读模式"><UiIcon name="book-open" size={14} /><span className="toolbar-action-label">阅读模式</span></button>
             )}
 
             {preview?.ok && preview.kind === 'image' && preview.dataUrl && !preview.tooLarge && (

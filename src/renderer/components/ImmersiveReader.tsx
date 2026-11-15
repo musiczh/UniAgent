@@ -16,6 +16,7 @@ import { captureSelection, type Annotation, type CapturedSelection } from '../te
 import { HtmlPreviewSessionContext } from './HtmlPreview'
 import { UiIcon } from './Icons'
 import { Markdown } from './Markdown'
+import { splitMarkdownMetadata } from '../htmlPreview'
 import { COMMENT_ANNOTATION_PREFIX, useComments } from '../comments'
 import { CommentPanel } from './CommentPanel'
 
@@ -60,7 +61,7 @@ function inlineTokenText(tokens: Token[] | undefined): string {
 
 function extractHeadings(text: string): MarkdownHeading[] {
   const parser = new Marked({ gfm: true, breaks: true })
-  return parser.lexer(text).flatMap((token) => {
+  return parser.lexer(splitMarkdownMetadata(text).body).flatMap((token) => {
     if (token.type !== 'heading') return []
     const heading = token as Tokens.Heading
     const label = inlineTokenText(heading.tokens).trim() || heading.text.trim()
@@ -168,7 +169,7 @@ function ReaderSelectionLayer({
         <UiIcon name={copied ? 'check' : 'copy'} size={14} /> {copied ? '已复制' : '复制'}
       </button>
       {onSideComment && <><span className="sel-sep" /><button className="sel-btn" onClick={() => { onSideComment(selection); clear() }}>
-        <UiIcon name="message-square" size={14} /> 侧边评论
+        <UiIcon name="annotation" size={14} /> 侧边评论
       </button></>}
     </div>,
     document.body,
@@ -196,7 +197,7 @@ export function ImmersiveReader({
   const ownerId = file?.sessionId || event?.sessionId
   const text = file ? file.text : typeof event.payload.text === 'string' ? event.payload.text : ''
   const seq = event?.seq ?? -1
-  const highlightedAnnotations = (comments?.annotations(annotations, ownerId) || annotations)
+  const highlightedAnnotations = (comments?.annotations(annotations, ownerId, event ? [event] : undefined) || annotations)
     .filter(annotation => file ? annotation.filePath === file.path : !annotation.filePath && annotation.seq === seq)
   const headings = useMemo(() => extractHeadings(text), [text])
   const messageAnnotations = useMemo(
@@ -434,7 +435,7 @@ export function ImmersiveReader({
   return (
     <HtmlPreviewSessionContext.Provider value={file?.sessionId || event?.sessionId}>
       <div className={'immersive-reader-overlay' + (file ? ' is-file-reader' : '')} role="dialog" aria-modal="true" aria-label={file ? 'Markdown 阅读模式' : '沉浸阅读'}>
-        <header className="scene-head immersive-reader-head">
+        <header className="scene-head immersive-reader-head responsive-toolbar">
           {!file && <button className="immersive-reader-back" onClick={onClose} title="返回对话（Esc）" aria-label="返回对话">
             <UiIcon name="back" size={18} />
           </button>}
@@ -444,15 +445,15 @@ export function ImmersiveReader({
             <span>{file ? '阅读模式 · ' + file.path : `${agentName} · ${sessionTitle} · 本条回复`}</span>
           </div>
           {file && !readOnly && <span className="file-reader-sync"><UiIcon name="check" size={13} />评论同步到当前会话</span>}
-          <button className="immersive-reader-comments-toggle" onClick={() => {
+          <button className="immersive-reader-comments-toggle toolbar-action" onClick={() => {
             if (comments?.open || commentsOpen) { comments?.close(); setCommentsOpen(false) }
             else if (comments?.threads.length) { comments.setTab('ai'); comments.show() }
             else setCommentsOpen(true)
           }}
-            title={commentsOpen || comments?.open ? '收起评论' : '展开评论'} aria-label={commentsOpen || comments?.open ? '收起评论' : '展开评论'} aria-expanded={commentsOpen || !!comments?.open}>
-            <UiIcon name="message-square" size={14} /> 评论 <b>{messageAnnotations.length}</b>
+            title={`${commentsOpen || comments?.open ? '收起评论' : '展开评论'}（${messageAnnotations.length} 条）`} aria-label={commentsOpen || comments?.open ? '收起评论' : '展开评论'} aria-expanded={commentsOpen || !!comments?.open}>
+            <UiIcon name="message-square" size={14} /><span className="toolbar-action-label">评论 <b>{messageAnnotations.length}</b></span>
           </button>
-          {file && <button className="scene-back-btn" onClick={onClose} title="退出阅读（Esc）"><UiIcon name="back" size={15} />退出阅读</button>}
+          {file && <button className="scene-back-btn toolbar-action" onClick={onClose} title="退出阅读（Esc）" aria-label="退出阅读"><UiIcon name="back" size={15} /><span className="toolbar-action-label">退出阅读</span></button>}
         </header>
 
         <div ref={bodyRef} className={'immersive-reader-body' + (resizing ? ' resizing' : '')}>
@@ -500,7 +501,8 @@ export function ImmersiveReader({
               </nav>
             </div>}
             <main ref={scrollRef} className={'immersive-reader-scroll' + (!docked && tocVisible ? ' toc-preview' : '')} onScroll={syncActiveHeading}>
-              <div ref={documentRef} className="immersive-reader-document" data-seq={seq}>
+              <div ref={documentRef} className="immersive-reader-document" data-seq={seq}
+                data-message-id={event?.payload.id} data-turn-id={event?.payload.turnId}>
                 <div className="immersive-reader-meta">
                   {file ? `${file.name} · Markdown` : `回复于 ${formatMessageTime(event.ts)}`} · 约 {text.trim().length} 字 · {Math.max(1, Math.ceil(text.trim().length / 400))} 分钟阅读
                 </div>

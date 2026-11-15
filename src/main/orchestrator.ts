@@ -1,9 +1,24 @@
+import { projectQoderHistory } from './qoderHistory'
 import { appendWeixinContext, splitWeixinContext } from '../shared/weixin'
 import { stripAssistantContext } from './assistant/context'
 import { cancelRequirementPreparation, forgetRequirementContext, hasRequirementContext, prepareRequirementTurn } from './requirementRuntime'
+import { hasProjectMemoryContext } from './projectMemoryRuntime'
+import { resolveAgentWorkspaceConfig } from './projectStore'
 import { resolveModelEffort, withAgentDefaults } from '../shared/agentChoices'
 import { MANAGE_CONFIRMATION_PREFIX } from '../shared/uniagentManage'
 import { EventEmitter } from 'node:events'
+import { SessionRecovery, type RecoveryDependencies } from './sessionRecovery'
+import { SessionRecoveryStore } from './sessionRecoveryStore'
+import { runRecoveryDecision } from './recoveryDecisionRuntime'
+import { RequestResponseGate } from './requestResponseGate'
+import { decisionIdentity, projectTaskDecisions } from '../shared/taskDecisions'
+import { recoveryText, type RecoveryFailure } from './recoveryContext'
+import { defaultRecoverySettings, type RecoverySettings } from '../shared/sessionRecovery'
+import { homedir } from 'node:os'
+import { SessionForkJobs } from './sessionForkJobs'
+import { forkContextWork } from './forkContextClient'
+import { withForkClaude, withForkQoder, forkClaudeTurn, forkCodexHandoff, validateForkHandoff, FORK_HANDOFF_PROMPT } from './forkNativeRuntime'
+import { claudeForkCapacity, qoderForkCapacity, type ForkRequest } from '../shared/sessionFork'
 import { ZCodeRunner, type ZCodeDone } from './zcode/runner'
 import { ZCodeRuntimePool } from './zcode/runtimePool'
 import type { ZCodeConnection } from './zcode/connection'
@@ -21,6 +36,8 @@ import { codexProviderChanged, parseCodexModelKey } from '../shared/codexModelId
 import { resumeModelMismatch } from '../shared/agentWarnings'
 import { nanoid } from 'nanoid'
 import { isAbsolute, join } from 'node:path'
+import { QoderRunner, projectQoderGoal, qoderReviewPrompt, qoderReviewInput } from './qoderRunner'
+import { qoderOperation } from './qoderSdk'
 import { TurnRunner } from './adapter'
 import { NativeCapabilityService } from './nativeCapabilityService'
 import { claudeContextOccupancy } from '../shared/claudeNativeReports'
@@ -48,16 +65,22 @@ import { mcodeSessionRuntimeEnv } from './mcodeService.ts'
 import { deleteKimiWebSession as deleteKimiSession, forkKimiWebSession, loadKimiSubAgentEvents } from './kimiHistory.ts'
 import { SessionStore, sessionStoreWriteCommitted } from './sessionStore'
 import { SessionLogStore } from './sessionLogStore'
+import { readSessionInfo } from './sessionInfo'
+import type { SessionInfo } from '../shared/sessionInfo'
 import { hydrateSubmittedUserMessages, submittedTextHash } from './submittedUserMessages.ts'
-import { appendEventSnapshot, withCompactionTiming } from '../shared/eventSnapshots'
+import { routerTargetVersion } from './router/target'
+import { appendEventSnapshot, hasRunningContextCompaction, withCompactionTiming } from '../shared/eventSnapshots'
 import { QueueWaitHistoryStore } from './queueWaitHistory'
 import { diagnostics } from './diagnostics'
-import { loadSessionEvents, exportNativeSession, forkSameSession, listAgentHistory } from './history'
-import { forkHistoryAt, loadClaudeForkHistory } from './historyFork'
+import { loadSessionEvents, forkSameSession, listAgentHistory } from './history'
+import { forkHistoryAt, forkNativeSnapshot, loadClaudeForkHistory, historyForkPoints } from './historyFork'
 import { inspectNativeSessionOccupancy } from './nativeSessionOccupancy'
 import { reviewGetFilePair } from './reviewFiles'
 import { getGitChangeSet } from './gitChangeSet'
 import { assertWorktreeAvailable, assertWorktreeNotRemoving } from './worktreeService'
+import { WorktreeRuntime } from './worktreeRuntime'
+import { TaskWorktreeDeletion } from './taskWorktreeDeletion'
+import type { SessionDeletionPreview } from '../shared/types'
 import { TurnArtifactStore } from './turnArtifacts'
 import { resolveUserDataHome } from './userData.ts'
 import { deepseekSessionRuntimeEnv } from './deepseekService.ts'
@@ -70,6 +93,7 @@ import { handoffMcpServers, handoffTaskStore } from './handoff.ts'
 import { isHandoffEndEvent } from '../shared/handoffEvents.ts'
 import { DeepSeekEventStore } from './deepseekEventStore.ts'
 import { DeepSeekHostRunner } from './deepseekHostRunner.ts'
+import { DeepSeekHostError } from './deepseekHostClient.ts'
 import { assertDeepSeekHostConfig } from './deepseekHostContract.ts'
 import { loadDeepSeekHostHistory, loadDeepSeekHostImage, forkDeepSeekHostSession } from './deepseekHostHistory.ts'
 import { loadDeepSeekSessionEvents, forkDeepSeekSession } from './grokACPRunner.ts'
@@ -86,7 +110,7 @@ import { deepseekRuntimeEnv } from './deepseekService.ts'
 import { isMaterialContextWindowMismatch, normalizeTraexMax } from './maxMode'
 import { appendFeishuContext, splitFeishuContext } from '../shared/feishuContext'
 import { isMcpToolApproval, normalizeQuestions, questionAnswerKind, questionAnswerValues, validateQuestionAnswer } from '../shared/questions'
-import { ASYNC_QUESTION_PREFIX, LOCAL_PLAN_PREFIX, latestLocalPlanRequest, withPlanText, withInteractionState, asyncQuestionReply, interactionRequestKey, isAsyncQuestion, isSkippedQuestionAnswer, redactInteractionAnswer, asInteractionRequest } from '../shared/interactionRequests'
+import { ASYNC_QUESTION_PREFIX, LOCAL_PLAN_PREFIX, latestLocalPlanRequest, withPlanText, withInteractionState, asyncQuestionReply, interactionRequestKey, isAsyncQuestion, isPendingInteraction, isSkippedQuestionAnswer, redactInteractionAnswer, asInteractionRequest } from '../shared/interactionRequests'
 import type {
   AgentDef,
   Attachment,
@@ -158,6 +182,9 @@ type SideRunner = AppServerRunner | BetaSideRunner | ZCodeSideRunner | ClaudeSdk
 // the instruction shown as the bubble's main text (the wire prompt embeds the
 // quotes). Both are persisted so the bubble survives an App restart.
 type TurnBubble = {
+  clientTurnKey?: string
+  routedInputId?: string
+  automaticRecovery?: string
   comments?: BubbleComment[]
   displayText?: string
   /** Main-process-only source; renderer bubble input never accepts this field. */
@@ -169,8 +196,11 @@ type TurnBubble = {
 function bubblePayload(bubble?: TurnBubble): Record<string, unknown> {
   if (!bubble) return {}
   return {
+    ...(bubble.clientTurnKey ? { clientTurnKey: bubble.clientTurnKey } : {}),
+    ...(bubble.routedInputId ? { routedInputId: bubble.routedInputId } : {}),
+    ...(bubble.automaticRecovery ? { automaticRecovery: bubble.automaticRecovery } : {}),
     ...(bubble.comments?.length ? { comments: structuredClone(bubble.comments) } : {}),
-    ...(bubble.displayText ? { displayText: bubble.displayText } : {}),
+    ...(typeof bubble.displayText === 'string' ? { displayText: bubble.displayText } : {}),
     ...(bubble.source ? { source: bubble.source } : {}),
     ...(bubble.asyncQuestion ? { asyncQuestion: true } : {})
   }
@@ -179,7 +209,7 @@ function bubblePayload(bubble?: TurnBubble): Record<string, unknown> {
 // A queued item carries its own bubble decorations; forward them onto the user
 // event recorded when the item is finally delivered/steered.
 function queueItemBubblePayload(item: QueueItem): Record<string, unknown> {
-  return bubblePayload({ comments: item.comments, displayText: item.displayText, source: item.source })
+  return bubblePayload({ clientTurnKey: item.clientTurnKey, comments: item.comments, displayText: item.displayText, source: item.source, routedInputId: item.routedInputId })
 }
 
 const MAX_SUBMITTED_USER_MESSAGES = 200
@@ -207,7 +237,7 @@ export function buildDurableQueueItem(
 ): DurableQueueItem {
   const input = snapshotTurnInput(attachments, nativeContext)
   return {
-    id: 'q_' + nanoid(6),
+    id: bubble?.routedInputId || 'q_' + nanoid(6),
     prompt,
     ...input,
     ...bubblePayload(bubble),
@@ -219,6 +249,7 @@ export function buildDurableQueueItem(
 
 type PreparedAgentRun = {
   requirementPrepared?: boolean
+  worktreePrepared?: boolean
   /** Immutable, fully-validated execution commit created before public fan-out. */
   agent: AgentDef
   config: SessionConfig
@@ -226,6 +257,18 @@ type PreparedAgentRun = {
   input: TurnInputSnapshot
   streamer?: AppServerRunner
   announceStreamer?: boolean
+}
+
+interface RecoveryTurn {
+  id: string
+  config: string
+  prompt: string
+  input: TurnInputSnapshot
+  delivery: RecoveryFailure['delivery']
+  error?: UAEvent
+  turnId?: string
+  held: boolean
+  observed?: boolean
 }
 
 /**
@@ -241,6 +284,152 @@ type PreparedAgentRun = {
  *  - One-shot (claude, or non-Plan codex/traex fallback): a fresh TurnRunner per turn.
  */
 export class Orchestrator extends EventEmitter {
+  private taskMutationReservations = new Set<string>()
+  private taskArchive?: (id: string, archived: boolean) => Promise<Session | undefined>
+  configureTaskArchive(handler: NonNullable<Orchestrator['taskArchive']>): void { this.taskArchive = handler }
+  private sessionTitleGenerationPolicy?: (session: Session) => boolean
+  configureSessionTitleGenerationPolicy(policy?: (session: Session) => boolean): void {
+    this.sessionTitleGenerationPolicy = policy
+    for (const [id, runner] of this.streamers) this.bindSessionTitleGenerationPolicy(id, runner)
+  }
+  private bindSessionTitleGenerationPolicy(id: string, runner: AppServerRunner): void {
+    runner.setInitialTitleGenerationPolicy(this.sessionTitleGenerationPolicy ? () => {
+      const session = this.sessions.get(id)
+      return !!session && (this.sessionTitleGenerationPolicy?.(session) ?? true)
+    } : undefined)
+  }
+  reserveTaskMutation(id: string): () => void {
+    if (this.taskMutationReservations.has(id)) throw new Error('任务状态正在保存，请稍候')
+    this.taskMutationReservations.add(id)
+    return () => { this.taskMutationReservations.delete(id) }
+  }
+  private assertTaskInputAvailable(id: string): void {
+    if (this.taskMutationReservations.has(id)) throw new Error('任务状态正在保存，请稍候再发送')
+    if (this.sessions.get(id)?.archived) throw new Error('任务已归档，请先恢复后再发送')
+  }
+  publishTaskState(session: Session): void { this.emit('sessionUpdated', { session, hasLiveStreamer: this.streamers.has(session.id) }) }
+  private errorRecovery?: SessionRecovery
+  private recoveryReady?: Promise<void>
+  private recoveryLoadFailed = false
+  private recoverySettings: () => RecoverySettings = defaultRecoverySettings
+  private recoveryTurns = new Map<string, RecoveryTurn>()
+
+  configureErrorRecovery(settings: () => RecoverySettings, runtime: Partial<Pick<RecoveryDependencies, 'judge' | 'wait' | 'random'>> = {}): Promise<void> {
+    this.recoverySettings = settings
+    const store = new SessionRecoveryStore(join(this.store.directory(), 'session-recovery.json'))
+    this.recoveryReady = store.load().then(snapshot => {
+      this.errorRecovery = new SessionRecovery({ settings,
+        ...runtime,
+        judge: runtime.judge || (async (config, prompt, signal) => {
+          const agent = this.getAgent(config.agentId)
+          if (!agent) throw new Error('判断 Agent 不存在')
+          return runRecoveryDecision(agent, config.model, prompt, signal)
+        }),
+        current: failure => {
+          const session = this.sessions.get(failure.sessionId)
+          const turn = this.recoveryTurns.get(failure.sessionId)
+          return !!session && !!turn && turn.id === failure.failureId && turn.config === JSON.stringify(session.config) &&
+            !session.archived && !session.readOnly && session.status !== 'cancelling' &&
+            !this.rewinding.has(session.id) && !this.nativeActionReservations.has(session.id)
+        },
+        retry: async (failure, attemptId, signal) => {
+          const session = this.sessions.get(failure.sessionId)
+          const turn = this.recoveryTurns.get(failure.sessionId)
+          if (!session || !turn || turn.id !== failure.failureId || signal.aborted) throw new Error('恢复请求已失效')
+          await this.assertSessionNotExternallyOccupied(session)
+          if (signal.aborted || this.recoveryTurns.get(session.id) !== turn || session.archived || session.readOnly) throw new Error('恢复请求已取消')
+          const input = failure.delivery === 'accepted' ? snapshotTurnInput() : turn.input
+          const prepared = this.prepareCurrentAgentRun(session, input)
+          if (signal.aborted || this.recoveryTurns.get(session.id) !== turn) throw new Error('恢复请求已取消')
+          const activeId = this.activeQueueItems.get(session.id)
+          if (activeId && failure.delivery === 'accepted') this.removeDeliveredQueueItem(session, activeId)
+          const original = this.events.get(session.id)?.findLast(event => (event.type === 'user_message' || event.type === 'goal_message') && !event.payload.automaticRecovery)
+          const source = original?.payload.source
+          const prompt = failure.delivery === 'accepted'
+            ? '继续完成上一条用户请求。基于当前会话已有进展接续；对可能已经完成的操作，先核实状态，避免重复执行。'
+            : turn.prompt
+          if (!this.recordUserMessageAndRun(session, prompt, prepared, undefined, {
+            automaticRecovery: attemptId, displayText: failure.delivery === 'accepted' ? '继续（自动恢复）' : '重试原输入（自动恢复）',
+            source: source === 'feishu' || source === 'weixin' || source === 'mcp' ? source : 'app'
+          })) throw new Error('自动接续未能启动')
+        },
+        save: snapshot => store.save(snapshot),
+        progress: (id, progress) => {
+          const session = this.sessions.get(id)
+          if (!session || !settings().enabled && !session.recovery) return
+          session.recovery = progress
+          this.emit('sessionUpdated', { session, hasLiveStreamer: this.streamers.has(id) })
+        }
+      }, snapshot)
+    }).catch(error => { this.recoveryLoadFailed = true; throw error })
+    return this.recoveryReady
+  }
+
+  async getRecoveryErrors() {
+    await this.recoveryReady
+    return (this.errorRecovery?.snapshot().errors || []).sort((a, b) => b.lastSeenAt - a.lastSeenAt)
+  }
+
+  recoverySettingsChanged(): void {
+    for (const session of this.sessions.values()) this.cancelErrorRecovery(session.id, '恢复设置已变更')
+    this.errorRecovery?.settingsChanged()
+  }
+
+  cancelErrorRecovery(sessionId: string, reason = '用户取消了自动恢复'): boolean {
+    const session = this.sessions.get(sessionId)
+    const turn = this.recoveryTurns.get(sessionId)
+    if (!session || !turn || !this.errorRecovery?.isPending(sessionId, turn.id)) return false
+    this.errorRecovery?.cancel(sessionId, reason)
+    this.recoveryTurns.delete(sessionId)
+    this.record(sessionId, { type: 'error', state: 'failed', payload: { message: reason, recoveryFinal: true } })
+    this.record(sessionId, { type: 'turn_completed', state: 'failed', payload: { recoveryFinal: true } })
+    this.finishFailedTurn(session)
+    void this.errorRecovery?.persist().catch(error => this.logSession(sessionId, 'recovery_persistence_failed', { message: String(error) }))
+    return true
+  }
+
+  private trackRecoveryEvent(session: Session, event: UAEvent): UAEvent {
+    const turn = this.recoveryTurns.get(session.id)
+    if (!turn) return event
+    if (typeof event.payload.turnId === 'string') turn.turnId = event.payload.turnId
+    if (event.payload.recoveryDelivery === 'accepted' || event.payload.recoveryDelivery === 'not-accepted') turn.delivery = event.payload.recoveryDelivery
+    if (event.type === 'error') turn.error = event
+    const supported = ['codex', 'traex', 'claude'].includes(this.getAgent(session.config.agentId)?.adapter || '')
+    if (this.errorRecovery && !supported && event.type === 'error' && !turn.observed) {
+      turn.observed = true
+      this.errorRecovery.observeError({ agentId: session.config.agentId, message: String(event.payload.message || '执行失败') })
+      void this.errorRecovery.persist().catch(() => {})
+    }
+    if (this.errorRecovery && this.recoverySettings().enabled && supported &&
+      (event.type === 'error' || event.type === 'turn_completed' && event.state === 'failed')) {
+      turn.held = true
+      return { ...event, payload: { ...event.payload, recoveryIntermediate: true } }
+    }
+    return event
+  }
+
+  private async recoverTerminalFailure(session: Session, interrupted = false): Promise<boolean> {
+    const turn = this.recoveryTurns.get(session.id)
+    if (!turn || !this.errorRecovery || turn.observed) return false
+    const original = this.events.get(session.id)?.findLast(event => (event.type === 'user_message' || event.type === 'goal_message') && !event.payload.automaticRecovery)
+    const providerError = turn.error?.payload.providerError
+    const failure: RecoveryFailure = { sessionId: session.id, failureId: turn.id, agentId: session.config.agentId,
+      model: session.config.model || '', agentVersion: this.getAgent(session.config.agentId)?.version,
+      nativeSessionId: session.nativeSessionId, turnId: turn.turnId, message: String(turn.error?.payload.message || '原生回合执行失败'),
+      code: typeof providerError?.code === 'string' ? providerError.code : undefined,
+      httpStatus: typeof providerError?.httpStatusCode === 'number' ? providerError.httpStatusCode : undefined,
+      delivery: turn.delivery, terminal: true, interrupted, nativeRetrying: false,
+      blocked: !!session.archived || !!session.readOnly, userRequest: original?.payload.text,
+      progress: this.latestAgentMessageText(session.id) }
+    const outcome = await this.errorRecovery.recover(failure)
+    if (outcome.state !== 'stopped') return true
+    if (this.sessions.get(session.id) !== session || this.recoveryTurns.get(session.id) !== turn) return true
+    if (turn.held) {
+      this.record(session.id, { type: 'error', state: 'failed', payload: { message: recoveryText(failure.message) + '\n自动恢复已停止：' + outcome.reason, recoveryFinal: true } })
+      this.record(session.id, { type: 'turn_completed', state: 'failed', payload: { turnId: turn.turnId, recoveryFinal: true } })
+    }
+    return false
+  }
   private readonly deepseekEvents: DeepSeekEventStore
   private sessions = new Map<string, Session>()
   private channelSendTurns = new Map<string, { ts: number; source: 'feishu' | 'weixin' }>()
@@ -248,12 +437,14 @@ export class Orchestrator extends EventEmitter {
   private feishuTeamInputs = new Set<string>()
   private events = new Map<string, UAEvent[]>()
   private answeringAsyncQuestions = new Set<string>()
+  private requestResponses = new RequestResponseGate()
   private managementConfirmations = new Map<string, { sessionId: string; answer: (choice?: string) => Promise<void> }>()
   private seqRefs = new Map<string, { n: number }>()
   /** Process-local event coordinate; survives renderer reload, never SessionStore/restart. */
   private backendConfigCorrectionSeqs = new Map<string, number>()
   private runners = new Map<string, TurnRunner>()
-  private claudeSdkRunners = new Map<string, TurnRunner>()
+  private sdkRunners = new Map<string, TurnRunner>()
+  private sdkDisposals = new Set<Promise<void>>()
   private streamers = new Map<string, AppServerRunner>()
   private occupancyLogSignatures = new Map<string, string>()
   // 需求2（侧边对话 /side）— a SECOND logical AppServerRunner per session that
@@ -320,6 +511,7 @@ export class Orchestrator extends EventEmitter {
   private editingQueueItems = new Map<string, string>()
   private sideEditingItems = new Map<string, string>()
   private historyLoads = new Map<string, { owner: Session; promise: Promise<void> }>()
+  private pendingHistoryRestores = new WeakSet<Session>()
   private sendTails = new Map<string, Promise<void>>()
   // Accepted sends may still be waiting on history hydration while the session
   // looks idle. Rewind must treat that gap as active work.
@@ -362,11 +554,83 @@ export class Orchestrator extends EventEmitter {
   // Guard against a second rewind or a concurrent turn dispatch mid-transaction.
   private rewinding = new Set<string>()
   private nativeActionReservations = new Set<string>()
+  private worktreeStarts = new Map<string, symbol>()
+  private deletingSessionRecords = new Set<string>()
+  private autoSyncWorktree = () => false
+  private readonly worktreeRuntime = new WorktreeRuntime({
+    sessions: () => [...this.sessions.values()],
+    sideBusy: id => this.getSideStatus(id) !== 'idle',
+    enabled: () => this.autoSyncWorktree(),
+    save: (_session, tree) => {
+      for (const owner of this.sessions.values()) {
+        if (owner.config.worktree?.id !== tree.id || JSON.stringify(owner.config.worktree) === JSON.stringify(tree)) continue
+        owner.config = { ...owner.config, worktree: { ...tree } }
+        const side = this.sideConfigs.get(owner.id)
+        if (side) this.sideConfigs.set(owner.id, { ...side, worktree: { ...tree } })
+      }
+    }
+  })
+
+  configureWorktreeSync(enabled: () => boolean): void { this.autoSyncWorktree = enabled }
+
+  private worktreeProtectedDirectories = () => [] as string[]
+  private readonly taskWorktreeDeletion = new TaskWorktreeDeletion({
+    sessions: () => [...this.sessions.values()],
+    protectedDirectories: () => this.worktreeProtectedDirectories(),
+    save: tree => {
+      for (const session of this.sessions.values()) if (session.config.worktree?.id === tree.id) {
+        session.config = { ...session.config, worktree: { ...tree } }
+        this.emit('sessionUpdated', { session, hasLiveStreamer: false })
+      }
+      this.persistOrThrow()
+    }
+  })
+
+  configureWorktreeDeletion(directories: () => string[]): void { this.worktreeProtectedDirectories = directories }
+
+  previewSessionDeletion(sessionId: string, signal?: AbortSignal): Promise<SessionDeletionPreview> {
+    const session = this.sessions.get(sessionId)
+    if (!session) throw new Error('任务已不存在，请刷新列表')
+    if (session.teamBinding) throw new Error('team_session_cannot_delete')
+    return this.taskWorktreeDeletion.preview([session], session.title, false, signal)
+  }
+
+  previewTeamDeletion(teamProjectId: string, title: string, signal?: AbortSignal): Promise<SessionDeletionPreview> {
+    return this.taskWorktreeDeletion.preview([...this.sessions.values()].filter(session => session.teamBinding?.teamProjectId === teamProjectId), title, true, signal)
+  }
+
+  private initialWorktreeTurn(session: Session): boolean {
+    return !session.nativeSessionId && !(this.events.get(session.id) || []).some(event => event.type === 'turn_started' || event.type === 'turn_completed')
+  }
+
+  private setWorktreePreparing(session: Session, preparing: boolean, error?: string): void {
+    session.worktreePreparing = preparing
+    session.worktreeTaskError = error
+    this.emit('sessionUpdated', { session, hasLiveStreamer: this.streamers.has(session.id) })
+  }
+
+  private async prepareNativeWorktree(session: Session, side = false): Promise<void> {
+    if (!session.config.worktree) return
+    const key = side ? `side:${session.id}` : session.id
+    const token = Symbol(key)
+    this.worktreeStarts.set(key, token)
+    const current = () => this.worktreeStarts.get(key) === token && this.sessions.get(session.id) === session
+    const initial = this.initialWorktreeTurn(session)
+    if (initial) this.setWorktreePreparing(session, true)
+    try {
+      await this.worktreeRuntime.prepare(session, current, side)
+      if (!current()) throw new Error('工作树同步期间任务已停止')
+      if (initial) this.setWorktreePreparing(session, false)
+    } catch (error) {
+      if (initial && current()) this.setWorktreePreparing(session, false, String(error))
+      throw error
+    } finally { if (current()) this.worktreeStarts.delete(key) }
+  }
 
   constructor(
     private getAgent: (id: string) => AgentDef | undefined,
     store?: SessionStore,
-    artifactsRoot?: string,
+    private readonly artifactsRoot?: string,
     sessionLogsRoot?: string,
     private readonly resolveProjectConfig?: (config: SessionConfig, validateDirectories?: boolean) => SessionConfig,
     private readonly assertAgentReady?: (agentId: string) => void,
@@ -470,6 +734,7 @@ export class Orchestrator extends EventEmitter {
   }
 
   private installSessionOwner(session: Session): void {
+    session.config = this.resolveSessionWorkspace(session, session.config)
     const previous = this.sessions.get(session.id)
     if (previous !== session) {
       this.channelSendTurns.delete(session.id)
@@ -518,6 +783,8 @@ export class Orchestrator extends EventEmitter {
   }
 
   private replaceSessionConfig(session: Session, config: SessionConfig): void {
+    config = this.resolveSessionWorkspace(session, config)
+    if (JSON.stringify(session.config) !== JSON.stringify(config)) this.cancelErrorRecovery(session.id, '会话配置已变更')
     const previousAgentId = session.config.agentId
     session.config = config
     this.bumpSessionActivity(session.id)
@@ -527,12 +794,30 @@ export class Orchestrator extends EventEmitter {
     }
   }
 
+  private withForkArchive(session: Session, config: SessionConfig): SessionConfig {
+    const id = session.forkedFrom?.exportId
+    if (!id || !/^[\w-]+$/.test(id)) return config
+    const directory = join(this.store.directory?.() || resolveUserDataHome(), 'session-exports', id)
+    if (config.additionalDirectories?.includes(directory)) return config
+    return { ...config, additionalDirectories: [...new Set([...(config.additionalDirectories || []), directory])] }
+  }
+
+  private resolveSessionWorkspace(session: Session, config: SessionConfig): SessionConfig {
+    const agent = this.getAgent(config.agentId)
+    const effective = agent && agentForSession(agent, session)
+    return resolveAgentWorkspaceConfig(this.withForkArchive(session, config), effective?.capabilities, !!session.nativeSessionId)
+  }
+
   /** Load persisted sessions at startup (Doc2 需求3.1). */
   async loadPersisted(): Promise<void> {
+    if (this.recoveryReady) await this.recoveryReady.catch(() => {})
     for (const s of this.store.load()) {
+      const recovery = this.errorRecovery?.getProgress(s.id)
+      if (recovery) { s.recovery = recovery; if (!s.archived) s.status = 'error' }
       this.installSessionOwner(s)
       if (!this.events.has(s.id)) this.events.set(s.id, [])
       if (!this.seqRefs.has(s.id)) this.seqRefs.set(s.id, { n: 0 })
+      if ((s.nativeSessionId || s.pendingClaudeFork) && s.config.agentId !== 'deepseek' && s.config.agentId !== 'zcode') this.pendingHistoryRestores.add(s)
       if (s.config.agentId === 'deepseek') {
         try {
           const events = await this.deepseekEvents.load(s.id)
@@ -668,7 +953,7 @@ export class Orchestrator extends EventEmitter {
       const agent = this.getAgent(session.config.agentId)
       const liveGrok = agent?.adapter === 'grok' && this.protocolRunners.has(session.id) && session.agentContract?.grokNative?.confirmed === true
       const liveMCode = agent?.adapter === 'mcode' && this.protocolRunners.has(session.id)
-      const liveClaude = agent?.adapter === 'claude' && this.claudeSdkRunners.get(session.id)?.hasClaudeSdkConnection()
+      const liveClaude = (agent?.adapter === 'claude' || agent?.adapter === 'qoder') && this.sdkRunners.get(session.id)?.hasClaudeSdkConnection()
       
       if (agent?.adapter === 'grok' && session.agentContract?.grokNative) {
         if (!liveGrok) {
@@ -690,7 +975,7 @@ export class Orchestrator extends EventEmitter {
         sessionsChanged = true
         this.emitAgentUpdate(session)
       }
-      if (agent && !liveGrok && !liveMCode && !liveClaude && ['claude', 'kimi', 'grok', 'deepseek', 'mcode'].includes(agent.adapter) && session.goal?.autonomous) {
+      if (agent && !liveGrok && !liveMCode && !liveClaude && ['claude', 'qoder', 'kimi', 'grok', 'deepseek', 'mcode'].includes(agent.adapter) && session.goal?.autonomous) {
         session.goal = { ...session.goal, autonomous:false, nativeActivation:'disarmed', ...(agent.adapter === 'claude' && session.goal.status === 'active' ? { status: 'paused' as const } : {}) }
         sessionsChanged = true
       }
@@ -722,14 +1007,16 @@ export class Orchestrator extends EventEmitter {
     this.store.saveOrThrow([...this.sessions.values()])
   }
 
-  private persistSideChats(): void {
-    this.store.saveSideChats?.([...this.sideConfigs].map(([sessionId, config]) => ({
+  private persistSideChats(strict = false): void {
+    const rows = [...this.sideConfigs].map(([sessionId, config]) => ({
       sessionId,
       config,
       events: this.sideEvents.get(sessionId) || [],
       nativeSessionId: this.sideNativeSessionIds.get(sessionId),
       queue: this.sideQueues.get(sessionId) || []
-    })))
+    }))
+    if (strict) this.store.saveSideChatsOrThrow(rows)
+    else this.store.saveSideChats?.(rows)
   }
 
   listSessions(): Session[] {
@@ -755,6 +1042,12 @@ export class Orchestrator extends EventEmitter {
       if (typeof request.payload.requestId === 'string') requests.set(request.payload.requestId,request)
     }
     return [...requests.values()].filter(event => event.state === 'pending' && event.payload.submittedAnswer === undefined && !event.payload.interactionExpired)
+  }
+
+  taskDecisions(sessionId: string) {
+    const session = this.sessions.get(sessionId)
+    return session ? projectTaskDecisions(session, this.events.get(sessionId) || [], this.getSideEvents(sessionId)).map(decision =>
+      decision.status === 'submitting' && !this.requestResponses.hasPending(decision.id) ? { ...decision, status: 'unknown' as const } : decision) : []
   }
 
   requestManagementConfirmation(sessionId: string, operationId: string, summary: string, answer: (approved: boolean) => Promise<void>): void {
@@ -837,6 +1130,12 @@ export class Orchestrator extends EventEmitter {
     return this.sessions.get(sessionId)
   }
 
+  async getSessionInfo(sessionId: string): Promise<SessionInfo> {
+    const session = this.sessions.get(sessionId)
+    if (!session) throw new Error('会话不存在')
+    return readSessionInfo(session, this.sessionLogs.filePath(sessionId))
+  }
+
   /**
    * 需求5 — the accumulated text of the most recent `agent_message` in a
    * session's in-memory event buffer (the final reply once a turn ends). Empty
@@ -880,15 +1179,16 @@ export class Orchestrator extends EventEmitter {
   }
 
   async getEvents(sessionId: string): Promise<UAEvent[]> {
+    if (this.deletingSessionRecords.has(sessionId)) return []
     const existing = this.events.get(sessionId)
-    if (existing && existing.length > 0 && this.sessions.get(sessionId)?.config.agentId !== 'zcode') return existing
+    const session = this.sessions.get(sessionId)
+    if (existing && existing.length > 0 && session?.config.agentId !== 'zcode' && (!session || !this.pendingHistoryRestores.has(session))) return existing
     // 需求1 (重启后历史任务内容为空): a session restored from the persisted store
     // starts with an empty in-memory event buffer — we never persist the event
     // history, only metadata. Re-hydrate it lazily from the agent's own native
     // rollout on disk (created + imported alike carry a nativeSessionId once a
     // turn has run), so opening a restored task replays its conversation instead
     // of showing a blank chat area.
-    const session = this.sessions.get(sessionId)
     const restoredQuestion = this.teamQuestions.has(sessionId) && !this.streamers.has(sessionId) && !this.runners.has(sessionId)
     if (session?.config.agentId === 'zcode' && session.nativeSessionId) {
       if (this.zcodeRunners.get(sessionId)?.isRunning() && existing?.length) return existing
@@ -910,7 +1210,7 @@ export class Orchestrator extends EventEmitter {
       if (!load || load.owner !== session) {
         const target = existing || []
         const promise = this.deepseekEvents.load(sessionId).then(restored => {
-          if (this.sessions.get(sessionId) !== session || this.events.get(sessionId) !== target || target.length) return
+          if (this.deletingSessionRecords.has(sessionId) || this.sessions.get(sessionId) !== session || this.events.get(sessionId) !== target || target.length) return
           this.events.set(sessionId, restored)
           const ref = this.seqRefs.get(sessionId)
           if (ref) ref.n = restored.reduce((next, event) => Math.max(next, event.seq + 1), ref.n)
@@ -919,7 +1219,7 @@ export class Orchestrator extends EventEmitter {
         this.historyLoads.set(sessionId, load)
       }
       try { await load.promise } finally { if (this.historyLoads.get(sessionId) === load) this.historyLoads.delete(sessionId) }
-      return this.events.get(sessionId) || []
+      return this.deletingSessionRecords.has(sessionId) ? [] : this.events.get(sessionId) || []
     }
     if (!session || (!session.nativeSessionId && !session.pendingClaudeFork) || this.isBusy(session.status) && !restoredQuestion) return existing || []
     let load = this.historyLoads.get(sessionId)
@@ -930,51 +1230,48 @@ export class Orchestrator extends EventEmitter {
       const ref = this.seqRefs.get(sessionId) || { n: 0 }
       const startingLength = target.length
       const promise = (async (): Promise<void> => {
-        try {
-          await this.sessionLogs.flush()
-          const checkpoints = this.sessionLogs.loadReplayCheckpoints(sessionId)
-          const agent = this.getAgent(owner.config.agentId)
-          const { events } =
-            owner.pendingClaudeFork
-              ? await loadClaudeForkHistory(owner.pendingClaudeFork)
-              :  agent?.adapter === 'kimi'
-                ? await loadKimiSessionEvents(nativeSessionId!, agent.bin, owner.config.workdir, kimiSessionRuntimeEnv(owner.id, owner.config))
-                : agent?.adapter === 'grok'
-                ? await loadGrokSessionEvents(nativeSessionId!, agent.bin, owner.config.workdir)
-                : agent?.adapter === 'mcode'
-                ? await loadMCodeSessionEvents(nativeSessionId!, agent.bin, owner.config.workdir, mcodeSessionRuntimeEnv())
-                : await loadSessionEvents(owner.config.agentId, nativeSessionId!)
-          const handoffEnds = await handoffTaskStore.loadCallerEvents(sessionId, events)
-          if (
-            this.sessions.get(sessionId) !== owner ||
-            owner.nativeSessionId !== nativeSessionId ||
-            this.events.get(sessionId) !== target ||
-            target.length !== startingLength ||
-            this.runners.has(sessionId) ||
-            this.streamers.has(sessionId) ||
-            this.protocolRunners.has(sessionId)
-          ) return
-          const restored = hydrateSubmittedUserMessages(events, owner.submittedUserMessages)
-          this.restoreInteractionCheckpoints(sessionId, owner.config.agentId, restored, checkpoints)
-          for (const end of handoffEnds) {
-            const insertion = restored.findIndex(event => event.ts > end.ts)
-            restored.splice(insertion < 0 ? restored.length : insertion, 0, end)
-          }
-          for (const event of restored) {
-            target.push({ ...event, sessionId, seq: ref.n++, ...(['user_message','goal_message'].includes(event.type) ? { payload: { ...event.payload, text: stripAssistantContext(String(event.payload.text || '')) } } : {}) })
-          }
-          this.restoreReplyCheckpoints(sessionId, target)
-          this.seqRefs.set(sessionId, ref)
-          this.bumpSessionActivity(sessionId)
-        } catch {
-          /* rollout unreadable / removed — retain the stable empty buffer */
+        await this.sessionLogs.flush()
+        const checkpoints = this.sessionLogs.loadReplayCheckpoints(sessionId)
+        const agent = this.getAgent(owner.config.agentId)
+        const { events } =
+          owner.pendingClaudeFork
+            ? await loadClaudeForkHistory(owner.pendingClaudeFork)
+            :  agent?.adapter === 'kimi'
+              ? await loadKimiSessionEvents(nativeSessionId!, agent.bin, owner.config.workdir, kimiSessionRuntimeEnv(owner.id, owner.config))
+              : agent?.adapter === 'grok'
+              ? await loadGrokSessionEvents(nativeSessionId!, agent.bin, owner.config.workdir)
+              : agent?.adapter === 'mcode'
+              ? await loadMCodeSessionEvents(nativeSessionId!, agent.bin, owner.config.workdir, mcodeSessionRuntimeEnv())
+              : await loadSessionEvents(owner.config.agentId, nativeSessionId!, agent?.bin, owner.config.workdir)
+        const handoffEnds = await handoffTaskStore.loadCallerEvents(sessionId, events)
+        if (
+          this.sessions.get(sessionId) !== owner ||
+          owner.nativeSessionId !== nativeSessionId ||
+          this.events.get(sessionId) !== target ||
+          target.slice(startingLength).some(event => event.type !== 'system_notice') ||
+          this.runners.has(sessionId) ||
+          this.streamers.has(sessionId) ||
+          this.protocolRunners.has(sessionId)
+        ) return
+        const restored = hydrateSubmittedUserMessages(events, owner.submittedUserMessages)
+        this.restoreInteractionCheckpoints(sessionId, owner.config.agentId, restored, checkpoints)
+        for (const end of handoffEnds) {
+          const insertion = restored.findIndex(event => event.ts > end.ts)
+          restored.splice(insertion < 0 ? restored.length : insertion, 0, end)
         }
+        for (const event of restored) {
+          target.push({ ...event, sessionId, seq: ref.n++, ...(['user_message','goal_message'].includes(event.type) ? { payload: { ...event.payload, text: stripAssistantContext(String(event.payload.text || '')) } } : {}) })
+        }
+        this.restoreReplyCheckpoints(sessionId, target)
+        this.seqRefs.set(sessionId, ref)
+        this.pendingHistoryRestores.delete(owner)
+        this.bumpSessionActivity(sessionId)
       })()
       load = { owner, promise }
       this.historyLoads.set(sessionId, load)
       void promise.finally(() => {
         if (this.historyLoads.get(sessionId)?.promise === promise) this.historyLoads.delete(sessionId)
-      })
+      }).catch(() => {})
     }
     await load.promise
     const restoredSession = this.sessions.get(sessionId)
@@ -1207,6 +1504,9 @@ export class Orchestrator extends EventEmitter {
       !session.archived &&
       !session.teamBinding &&
       !session.readOnly &&
+      !session.recovery &&
+      !(session.taskRegistration?.delivery === 'unknown' && this.queues.get(session.id)?.[0]?.id === session.taskRegistration.inputId) &&
+      !this.recoveryLoadFailed &&
       (!agent || !planCollaborationTransportError(agent, session.config)) &&
       (!needsNativeResume || hasTrustedNativeResume) &&
       agentIsReady(session.config.agentId) &&
@@ -1248,19 +1548,49 @@ export class Orchestrator extends EventEmitter {
     return operation
   }
 
-  createTeamSessions(entries: Array<{ id?: string; config: SessionConfig; title: string; binding: NonNullable<Session['teamBinding']> }>): Session[] {
+  createTeamSessions(entries: Array<{ id?: string; config: SessionConfig; title: string; binding: NonNullable<Session['teamBinding']> }>, recoverExisting = false): Session[] {
     const created: Session[] = []
+    const result: Session[] = []
     try {
       for (const entry of entries) {
+        const existing = entry.id && this.sessions.get(entry.id)
+        if (existing && recoverExisting) {
+          if (existing.teamBinding?.teamProjectId !== entry.binding.teamProjectId || existing.teamBinding?.memberId !== entry.binding.memberId || existing.config.agentId !== entry.config.agentId) throw new Error('team_session_identity_conflict')
+          result.push(existing)
+          continue
+        }
         const { session } = this.createSessionRecord(entry.config, entry.title, undefined, entry.binding, entry.id)
         created.push(session)
+        result.push(session)
       }
       this.persistOrThrow()
-      return created
+      return result
     } catch (error) {
       for (const session of created) this.discardUnstartedSession(session)
       throw error
     }
+  }
+
+  registerTaskSession(config: SessionConfig, title: string, id: string, registration: NonNullable<Session['taskRegistration']>): Session {
+    const existing = this.sessions.get(id)
+    if (existing) {
+      if (existing.readOnly || existing.archived || existing.taskRegistration?.requestId !== registration.requestId) throw new Error('任务登记身份冲突或已不可写')
+      return existing
+    }
+    return this.createSessionRecord(config, title, undefined, undefined, id, registration).session
+  }
+
+  setTaskRegistration(sessionId: string, registration: NonNullable<Session['taskRegistration']>): void {
+    const session = this.sessions.get(sessionId)
+    if (!session) throw new Error('已登记的任务不存在，禁止重复创建')
+    const previous = session.taskRegistration
+    if (previous && previous.requestId !== registration.requestId) throw new Error('任务与创建回执身份不一致')
+    if (previous && (previous.events.length > registration.events.length || previous.events.length === registration.events.length && (previous.events.at(-1)?.ts || 0) > (registration.events.at(-1)?.ts || 0))) return
+    if (previous?.requestId === registration.requestId && previous.delivery === registration.delivery && previous.phase === registration.phase && previous.events.length === registration.events.length && previous.events.at(-1)?.ts === registration.events.at(-1)?.ts) return
+    session.taskRegistration = structuredClone(registration)
+    // Intermediate steps are durable in the async receipt; avoid repeated full-index fsyncs.
+    if (registration.delivery === 'dispatched' || registration.delivery === 'unknown') this.persist()
+    this.emit('sessionUpdated', { session, hasLiveStreamer: this.streamers.has(session.id) })
   }
 
   private isTeamMember(sessionId: string): boolean {
@@ -1374,7 +1704,7 @@ export class Orchestrator extends EventEmitter {
       throw new Error(ATTACHMENT_UNSUPPORTED_MESSAGE)
     }
     const reserved = reservedSessionId ? this.sessions.get(reservedSessionId) : undefined
-    if (reservedSessionId && (!reserved?.config.worktree || reserved.status !== 'draft')) throw new Error('工作树创建草稿不可用')
+    if (reservedSessionId && ((!reserved?.config.worktree && !reserved?.taskRegistration) || reserved.status !== 'draft')) throw new Error('任务创建草稿不可用')
     const { session, maxDisabled } = reserved ? { session: reserved, maxDisabled: false } : this.createSessionRecord(config, prompt, meta)
     let preparedRun: PreparedAgentRun | undefined
     let roleSessionCommitted = !!session.config.worktree
@@ -1404,16 +1734,16 @@ export class Orchestrator extends EventEmitter {
     } catch (error) {
       if (roleSessionCommitted) {
         if (preparedRun && session.status === 'draft') this.discardPreparedRun(session, preparedRun)
-      } else {
+      } else if (!session.taskRegistration) {
         this.discardUnstartedSession(session)
       }
       throw error
     }
   }
 
-  reserveWorktreeSession(config: SessionConfig, title: string, task?: Session['worktreeTask']): Session {
+  reserveWorktreeSession(config: SessionConfig, title: string, task?: Session['worktreeTask'], assignedId?: string, registration?: Session['taskRegistration']): Session {
     if (config.worktree?.state !== 'creating') throw new Error('无效的工作树创建草稿')
-    const { session } = this.createSessionRecord(config, title)
+    const { session } = this.createSessionRecord(config, title, undefined, undefined, assignedId, registration)
     session.worktreeTask = task && structuredClone(task)
     session.updatedAt = Math.max(Date.now(), (session.updatedAt || session.createdAt) + 1)
     this.persistOrThrow()
@@ -1429,6 +1759,13 @@ export class Orchestrator extends EventEmitter {
     session.updatedAt = Math.max(Date.now(), (session.updatedAt || session.createdAt) + 1)
     this.persistOrThrow()
     this.emit('sessionUpdated', { session, hasLiveStreamer: this.streamers.has(sessionId) })
+  }
+
+  retryWorktreePreparation(sessionId: string): void {
+    const session = this.sessions.get(sessionId)
+    if (!session?.worktreeTaskError || session.config.worktree?.state !== 'ready' || session.status !== 'error' ||
+        this.activeQueueItems.has(sessionId) || this.queues.get(sessionId)?.[0]?.state !== 'pending') throw new Error('当前没有可重试的工作树准备任务')
+    this.dispatchPendingQueue(session)
   }
 
   worktreeSessionBusy(session: Session): boolean {
@@ -1490,6 +1827,54 @@ export class Orchestrator extends EventEmitter {
     if (this.sessions.has(sessionId)) this.record(sessionId, { type: 'system_notice', payload: { kind, text } })
   }
 
+  createRouterDraft(config: SessionConfig, id: string): Session {
+    if (config.managedPurpose !== 'router') throw new Error('router_session_required')
+    const existing = this.sessions.get(id)
+    if (existing) { if (existing.config.managedPurpose !== 'router') throw new Error('router_identity_conflict'); return existing }
+    const { session } = this.createSessionRecord(config, 'RouterAgent', undefined, undefined, id)
+    session.titleLocked = true
+    this.persistOrThrow()
+    this.emit('sessionUpdated',{session,hasLiveStreamer:false})
+    return session
+  }
+
+  async acceptRoutedInput(sessionId: string, inputId: string, prompt: string, attachments: Attachment[] | undefined, expectedVersion: string, source: 'app' | 'feishu' = 'app'): Promise<{ status: 'queued' | 'accepted' | 'unknown' }> {
+    if (!/^[a-f0-9-]{36}$/i.test(inputId) || typeof prompt !== 'string' || !prompt.trim() && !attachments?.length) throw new Error('invalid_routed_input')
+    const previous = this.sendTails.get(sessionId) || Promise.resolve()
+    const operation = previous.then(async () => {
+      this.assertTaskInputAvailable(sessionId)
+      await this.getEvents(sessionId)
+      const session = this.sessions.get(sessionId)
+      if (!session || session.readOnly || session.teamBinding || session.config.managedPurpose || session.config.assistantSnapshot) throw new Error('router_target_not_writable')
+      const queued = this.queues.get(sessionId)?.find(item=>item.id===inputId)
+      if (queued) {
+        if (queued.prompt!==prompt || JSON.stringify(queued.attachments||[])!==JSON.stringify(attachments||[])) throw new Error('routed_input_conflict')
+        return {status:queued.deliveryUncertain?'unknown' as const:queued.state==='pending'?'queued' as const:'accepted' as const}
+      }
+      const submitted = session.submittedUserMessages?.find(item=>item.routedInputId===inputId)
+      if (submitted) {
+        if (submitted.textHash !== submittedTextHash(prompt) || JSON.stringify(submitted.attachments||[]) !== JSON.stringify(attachments||[])) throw new Error('routed_input_conflict')
+        return {status:'accepted' as const}
+      }
+      if (routerTargetVersion(session)!==expectedVersion) throw new Error('router_target_changed')
+      this.assertAgentCanRun(session.config.agentId)
+      const agent = this.getAgent(session.config.agentId)
+      if (!agent || attachments?.length && !agentSupportsAttachments(agent)) throw new Error(ATTACHMENT_UNSUPPORTED_MESSAGE)
+      if (this.rewinding.has(sessionId) || this.nativeActionReservations.has(sessionId) || this.assistantCommandSessions.has(sessionId)) throw new Error('session_transition_in_progress')
+      const busy = this.isBusy(session.status) || hasRunningContextCompaction(this.events.get(sessionId)||[])
+      if (!busy) await this.assertSessionNotExternallyOccupied(session)
+      if (this.sessions.get(sessionId)!==session || routerTargetVersion(session)!==expectedVersion) throw new Error('router_target_changed')
+      const item=buildDurableQueueItem(prompt,attachments,undefined,undefined,{source,routedInputId:inputId})
+      this.commitQueue(session,[...(this.queues.get(sessionId)||[]),item])
+      this.emitQueue(sessionId); this.emit('taskInputAccepted',sessionId)
+      if (busy) this.setStatus(session,'queued')
+      else this.dispatchPendingQueue(session)
+      return {status:busy?'queued' as const:'accepted' as const}
+    })
+    this.sendTails.set(sessionId,operation.then(()=>{},()=>{}))
+    return operation
+  }
+
   createAssistantDraft(config: SessionConfig, previousSessionId?: string, command: 'new' | 'clear' = 'new'): Session {
     const previous = previousSessionId ? this.sessions.get(previousSessionId) : undefined
     if (previousSessionId && (!previous || isSessionBusy(previous.status))) throw new Error('assistant_session_busy')
@@ -1528,7 +1913,8 @@ export class Orchestrator extends EventEmitter {
     title: string,
     meta?: { handoffId?: string; handoffWaiting?: boolean },
     teamBinding?: Session['teamBinding'],
-    assignedId?: string
+    assignedId?: string,
+    taskRegistration?: Session['taskRegistration']
   ): { session: Session; maxDisabled: boolean } {
     const projectConfig = this.resolveProjectConfig ? this.resolveProjectConfig(config, true) : config
     this.assertAgentCanRun(projectConfig.agentId)
@@ -1540,6 +1926,7 @@ export class Orchestrator extends EventEmitter {
       ...projectConfig,
       ...(permissionMode ? { permissionMode } : {})
     }
+    normalizedConfig = resolveAgentWorkspaceConfig(normalizedConfig, agent.capabilities)
     if (!permissionMode) delete normalizedConfig.permissionMode
     const normalized = this.normalizeAgentConfig(normalizedConfig)
     normalizedConfig = normalized.config
@@ -1548,6 +1935,7 @@ export class Orchestrator extends EventEmitter {
     if (this.sessions.has(id)) throw new Error('session_id_conflict')
     const session: Session = {
       id,
+      ...(taskRegistration ? { taskRegistration: structuredClone(taskRegistration) } : {}),
       // 需求3: strip skill/MCP mention markup so the title reflects the actual
       // first line, not the "@capcode …" wire prefix.
       title: deriveSessionTitle(title) || '新会话',
@@ -1590,12 +1978,19 @@ export class Orchestrator extends EventEmitter {
     queueIfBusy = true,
     teamExecution?: symbol
   ): Promise<void> {
+    this.assertTaskInputAvailable(sessionId)
     if (this.isTeamMember(sessionId) && teamExecution !== TEAM_EXECUTION) throw new Error('team_session_requires_project_route')
     if (this.teamQuestions.has(sessionId)) throw new Error('team_awaiting_user_answer')
     if (this.assistantCommandSessions.has(sessionId)) throw new Error('assistant_session_busy')
     const teamStopVersion = this.teamStopVersions.get(sessionId) || 0
     if (bubble?.source !== 'mcp') this.assertUserSessionEnabled(sessionId)
     const acceptedInput = snapshotTurnInput(attachments, nativeContext)
+    this.cancelErrorRecovery(sessionId, '收到新消息，已取消自动恢复')
+    const previousSession = this.sessions.get(sessionId)
+    if (previousSession && !this.isBusy(previousSession.status) && this.errorRecovery?.getProgress(sessionId)) {
+      this.errorRecovery.reset(sessionId)
+      void this.errorRecovery.persist().catch(() => {})
+    }
     if (activatePlan) {
       await this.sendMessageWithPlan(sessionId, prompt, acceptedInput, bubble)
       return
@@ -1642,7 +2037,7 @@ export class Orchestrator extends EventEmitter {
       if (this.sessions.get(sessionId) !== session || this.rewinding.has(sessionId) || session.readOnly || this.nativeActionReservations.has(sessionId)) throw new Error('图片准备期间会话已变化，请重试')
     }
     if (teamExecution !== TEAM_EXECUTION) teamRuntime(sessionId)?.beforeUserTurn?.()
-    if (this.isBusy(session.status)) {
+    if (this.isBusy(session.status) || hasRunningContextCompaction(this.events.get(sessionId) || [])) {
       if (!queueIfBusy) throw new Error(`session_not_idle: ${session.status}`)
       this.enqueueDuringTurn(
         session,
@@ -1688,7 +2083,7 @@ export class Orchestrator extends EventEmitter {
         })
         return
       }
-      if (this.isBusy(owner.status)) {
+      if (this.isBusy(owner.status) || hasRunningContextCompaction(this.events.get(sessionId) || [])) {
         if (!queueIfBusy) throw new Error(`session_not_idle: ${owner.status}`)
         this.enqueueDuringTurn(
           owner,
@@ -1753,7 +2148,7 @@ export class Orchestrator extends EventEmitter {
     const agent = this.getAgent(session.config.agentId)
     if (!agent || agent.adapter !== 'claude') throw new Error('Claude 原生报告需要 Claude 会话')
     const nativeId = session.nativeSessionId
-    const live = this.claudeSdkRunners.get(session.id)
+    const live = this.sdkRunners.get(session.id)
     const runner = this.runners.get(session.id) || (live?.hasClaudeSdkConnection() ? live : undefined)
     if (this.isBusy(session.status) && !runner) throw new Error('Claude 当前控制通道尚未就绪')
     this.nativeActionReservations.add(session.id)
@@ -1852,11 +2247,13 @@ export class Orchestrator extends EventEmitter {
     bubble?: TurnBubble,
     queueIfBusy = true
   ): Promise<void> {
+    this.assertTaskInputAvailable(sessionId)
     if (this.isTeamMember(sessionId)) throw new Error('team_member_read_only')
     if (this.teamQuestions.has(sessionId)) throw new Error('team_awaiting_user_answer')
     if (this.assistantCommandSessions.has(sessionId)) throw new Error('assistant_session_busy')
     if (bubble?.source !== 'mcp') this.assertUserSessionEnabled(sessionId)
     const acceptedInput = snapshotTurnInput(attachments, nativeContext)
+    if (hasRunningContextCompaction(this.events.get(sessionId) || [])) throw new Error('compaction_in_progress')
     if (this.nativeActionReservations.has(sessionId)) throw new Error('native_action_in_progress')
     const session = this.sessions.get(sessionId)
     if (!session) return
@@ -1874,6 +2271,7 @@ export class Orchestrator extends EventEmitter {
     if (claudeRunner && this.isBusy(session.status)) {
       await claudeRunner.steer(prompt, acceptedInput.attachments)
       this.record(sessionId, { type: 'user_message', payload: { text: prompt, ...acceptedInput, ...bubblePayload(bubble), appendedToTurn: true } })
+      this.emit('taskInputAccepted', sessionId)
       return
     }
     const protocol = this.protocolRunners.get(sessionId)
@@ -1881,6 +2279,7 @@ export class Orchestrator extends EventEmitter {
       const receipt = await protocol.steer(prompt, acceptedInput.attachments)
       this.record(sessionId, { type: 'user_message', payload: { text: prompt, ...acceptedInput, ...bubblePayload(bubble),
         appendedToTurn: receipt?.appendedToTurn ?? true, ...(receipt?.nativePromptId ? { nativePromptId: receipt.nativePromptId } : {}) } })
+      this.emit('taskInputAccepted', sessionId)
       return
     }
     const streamer = this.streamers.get(sessionId)
@@ -1894,12 +2293,13 @@ export class Orchestrator extends EventEmitter {
         await (preparedRun.streamer || streamer).steerStrict(prompt, preparedRun.input.attachments, preparedRun.input.nativeContext)
       }
       this.record(sessionId, { type: 'user_message', payload: { text: prompt, ...auditInput, ...bubblePayload(bubble), appendedToTurn: true } })
-      if (!queueIfBusy) return
+      if (!queueIfBusy) { this.emit('taskInputAccepted', sessionId); return }
       await (preparedRun.streamer || streamer).steer(
         prompt,
         preparedRun.input.attachments,
         preparedRun.input.nativeContext
       )
+      this.emit('taskInputAccepted', sessionId)
       return
     }
     // Idle sessions start normally; busy sessions respect the caller's queue policy.
@@ -1919,6 +2319,7 @@ export class Orchestrator extends EventEmitter {
    * acknowledges turn/steer, and it never falls back to sendMessage/the queue.
    */
   async forceSendStrict(sessionId: string, prompt: string): Promise<void> {
+    this.assertTaskInputAvailable(sessionId)
     if (this.sessions.get(sessionId)?.teamBinding) throw new Error('team_session_requires_project_route')
     if (this.nativeActionReservations.has(sessionId)) throw new Error('native_action_in_progress')
     const session = this.sessions.get(sessionId)
@@ -1931,12 +2332,14 @@ export class Orchestrator extends EventEmitter {
     if (claudeRunner) {
       await claudeRunner.steer(prompt)
       this.record(sessionId, { type: 'user_message', payload: { text: prompt, source: 'mcp', appendedToTurn: true } })
+      this.emit('taskInputAccepted', sessionId)
       return
     }
     const streamer = this.streamers.get(sessionId)
     if (!streamer) throw new Error('force_send_provider_does_not_support_steer')
     await streamer.steerStrict(prompt)
     this.record(sessionId, { type: 'user_message', payload: { text: prompt, source: 'mcp', appendedToTurn: true } })
+    this.emit('taskInputAccepted', sessionId)
   }
 
   /** Remove a queued item by id (Doc4 需求2 — 可删除). */
@@ -2004,7 +2407,7 @@ export class Orchestrator extends EventEmitter {
             ...bubblePayload(bubble),
             // Editing drops any stale bubble decorations the new payload omits.
             ...(bubble?.comments?.length ? {} : { comments: undefined }),
-            ...(bubble?.displayText ? {} : { displayText: undefined })
+            ...(typeof bubble?.displayText === 'string' ? {} : { displayText: undefined })
           }
         : entry
     )
@@ -2073,6 +2476,7 @@ export class Orchestrator extends EventEmitter {
     })
   }
   promoteQueueItem(sessionId: string, itemId: string): void {
+    if (hasRunningContextCompaction(this.events.get(sessionId) || [])) return
     if (this.isTeamMember(sessionId)) throw new Error('team_member_read_only')
     if (this.teamQuestions.has(sessionId)) throw new Error('team_awaiting_user_answer')
     const q = this.queues.get(sessionId)
@@ -2151,6 +2555,12 @@ export class Orchestrator extends EventEmitter {
   }
 
   interrupt(sessionId: string, seen = new Set<string>()): void {
+    const cancelledWorktreeStart = this.worktreeStarts.delete(sessionId)
+    this.cancelErrorRecovery(sessionId, '用户已停止本轮执行')
+    if (this.errorRecovery?.getProgress(sessionId)?.phase === 'retrying') {
+      this.errorRecovery.cancel(sessionId, '用户已停止本轮执行')
+      void this.errorRecovery.persist().catch(() => {})
+    }
     const cancelledRequirementStart = cancelRequirementPreparation(sessionId)
     this.cancelManagementConfirmations(sessionId)
     if (this.sessions.get(sessionId)?.teamBinding) this.teamStopVersions.set(sessionId, (this.teamStopVersions.get(sessionId) || 0) + 1)
@@ -2159,6 +2569,7 @@ export class Orchestrator extends EventEmitter {
     this.channelSendTurns.delete(sessionId)
     this.feishuTeamInputs.delete(sessionId)
     const session = this.sessions.get(sessionId)
+    if (session?.worktreePreparing) this.setWorktreePreparing(session, false)
     const awaitedSessionId = session?.waitingForHandoff?.awaitedSessionId
     if (awaitedSessionId) this.interrupt(awaitedSessionId, seen)
     if (session) this.bumpSessionActivity(sessionId)
@@ -2235,7 +2646,7 @@ export class Orchestrator extends EventEmitter {
     // locally after invalidating the scheduled FIFO callback.
     if (
       session &&
-      (cancelledRequirementStart || cancelledDeferredDispatch || cancelledGrokStart || cancelledRecoveryStart || cancelledZCodeStart && !this.zcodeRunners.get(sessionId)?.isRunning()) &&
+      (cancelledWorktreeStart || cancelledRequirementStart || cancelledDeferredDispatch || cancelledGrokStart || cancelledRecoveryStart || cancelledZCodeStart && !this.zcodeRunners.get(sessionId)?.isRunning()) &&
       session.status === 'cancelling'
     ) {
       this.setStatus(session, 'idle')
@@ -2268,13 +2679,13 @@ export class Orchestrator extends EventEmitter {
     if (Object.prototype.hasOwnProperty.call(patch, 'collaborationMode')) {
       throw new Error('collaboration mode 必须通过 setCollaborationMode 更新')
     }
-    const requested = { ...session.config, ...patch }
+    const requested = this.resolveSessionWorkspace(session, { ...session.config, ...patch })
     if (requested.agentId !== session.config.agentId) throw new Error('不能更改已有会话的 Agent')
     if (session.config.agentId === 'zcode') {
       if (requested.workdir !== session.config.workdir || JSON.stringify(requested.additionalDirectories) !== JSON.stringify(session.config.additionalDirectories)) throw new Error('ZCode 已有会话不能更改工作区')
       const operation = (this.protocolConfigTails.get(sessionId) || Promise.resolve()).then(async () => {
         if (this.sessions.get(sessionId) !== session) return undefined
-        const target = { ...session.config, ...patch }
+        const target = this.resolveSessionWorkspace(session, { ...session.config, ...patch })
         const runner = await this.ensureZCodeRunner(session)
         const contract = await runner.updateConfig(target)
         if (this.sessions.get(sessionId) !== session) return undefined
@@ -2329,7 +2740,7 @@ export class Orchestrator extends EventEmitter {
     const operation = prior.then(async () => {
       const current = this.sessions.get(sessionId)
       if (!current) return undefined
-      const target = { ...current.config, ...patch }
+      const target = this.resolveSessionWorkspace(current, { ...current.config, ...patch })
       const advertisedModes = agent.capabilities.permissionModes
       if (
         patch.permissionMode !== undefined &&
@@ -2460,6 +2871,7 @@ export class Orchestrator extends EventEmitter {
 
   private async switchCodexProvider(session: Session, requested: SessionConfig): Promise<Session | undefined> {
     const previous = session.config
+    const previousNativeId = session.nativeSessionId
     let runner: AppServerRunner | undefined
     let replaced = false
     let reserved = false
@@ -2494,6 +2906,8 @@ export class Orchestrator extends EventEmitter {
         if (this.sessions.get(session.id) !== session) { this.abandonModelSwitch(session.id); return undefined }
       }
       this.replaceSessionConfig(session, target)
+      const nativeId = runner?.nativeThreadId()
+      if (nativeId && nativeId !== session.nativeSessionId) this.assignNativeSessionId(session, nativeId, false)
       replaced = true
       this.persistOrThrow()
       this.finishModelSwitch(session.id, 'success')
@@ -2504,7 +2918,8 @@ export class Orchestrator extends EventEmitter {
         const committed = replaced && sessionStoreWriteCommitted(error)
         if (!committed) {
           this.replaceSessionConfig(session, previous)
-          runner?.updateConfig(previous)
+          if (previousNativeId && session.nativeSessionId !== previousNativeId) this.assignNativeSessionId(session, previousNativeId, false)
+          runner?.restoreProviderConfig(previous, previousNativeId)
         }
         this.finishModelSwitch(session.id, 'failed', committed
           ? new Error(`模型配置已写入，但持久化确认失败，请核对配置：${error?.message || String(error)}`)
@@ -2553,12 +2968,28 @@ export class Orchestrator extends EventEmitter {
     answer: any,
     bubble?: TurnBubble
   ): AppServerRespondResult | void | Promise<AppServerRespondResult | void> {
-    const result = this.respondToRequestImpl(sessionId, requestId, answer, bubble)
+    const source = requestId.startsWith('side:') ? 'side' : 'main'
+    const nativeId = source === 'side' ? requestId.slice(5) : requestId
+    const events = (source === 'side' ? this.sideEvents : this.events).get(sessionId)
+    const request = events?.findLast(event => interactionRequestKey(event) === nativeId)
+    const key = request ? decisionIdentity(request, source) : JSON.stringify([sessionId, requestId])
+    if (request && isPendingInteraction(asInteractionRequest(request)) && (request.payload.taskResponseState === 'unknown' || request.payload.taskResponseState === 'submitting' && !this.requestResponses.hasPending(key))) return Promise.reject(new Error('处理结果待确认，请先刷新原请求状态；系统不会重复提交'))
+    const update = (state?: 'submitting' | 'unknown') => {
+      const index = events?.findLastIndex(event => interactionRequestKey(event) === nativeId && event.seq === request?.seq) ?? -1
+      if (!events || index < 0 || !request || !isPendingInteraction(asInteractionRequest(events[index]))) return
+      const changed = { ...events[index], payload: { ...events[index].payload, taskResponseState: state } }
+      events[index] = changed
+      this.logEvent(changed, source)
+      if (source === 'side') this.emit('sideEvent', { sessionId, event: changed })
+      else this.emit('event', changed)
+    }
+    const result = this.requestResponses.run(key, () => {
+      if (!this.sessionLogs.backgroundWrites || !request) return this.respondToRequestImpl(sessionId, requestId, answer, bubble)
+      update('submitting')
+      return this.sessionLogs.flush().then(() => this.respondToRequestImpl(sessionId, requestId, answer, bubble))
+    }, update)
     if (!this.sessionLogs.backgroundWrites) return result
-    return Promise.resolve(result).then(async accepted => {
-      if (accepted?.handled) await this.sessionLogs.flush()
-      return accepted
-    })
+    return Promise.resolve(result).finally(() => this.sessionLogs.flush())
   }
 
   private respondToRequestImpl(
@@ -2834,7 +3265,7 @@ export class Orchestrator extends EventEmitter {
     } else if (agent.adapter === 'mcode') {
       loaded = await loadMCodeSessionEvents(nativeId, agent.bin, loadCwd, mcodeSessionRuntimeEnv())
     } else {
-      loaded = await loadSessionEvents(agentId, nativeId)
+      loaded = await loadSessionEvents(agentId, nativeId, agent.bin, loadCwd)
     }
     const { cwd, model, maxMode, contextWindow } = loaded
     const events = loaded.events.map(event => ['user_message','goal_message'].includes(event.type) ? { ...event, payload: { ...event.payload, text: stripAssistantContext(String(event.payload.text || '')) } } : event)
@@ -2948,6 +3379,7 @@ export class Orchestrator extends EventEmitter {
         contextWindow
       )
       this.events.set(owner.id, stamped)
+      this.pendingHistoryRestores.delete(owner)
       this.seqRefs.set(owner.id, ref)
       this.restoreReplyCheckpoints(owner.id, stamped)
       if (owner.pendingQueue) {
@@ -3063,31 +3495,148 @@ export class Orchestrator extends EventEmitter {
     return undefined
   }
 
-  /**
-   * Doc2 — cross-agent resume. Transplant a native session from `sourceAgentId`
-   * into `targetAgentId`'s on-disk history (history.exportNativeSession does the
-   * schema translation), then import the freshly-minted native id under the
-   * target agent so it opens & can be resumed there. Returns the imported
-   * UniAgent session, or undefined if the transplant produced nothing.
-   */
+  /** Durable compact/export jobs own private native forks until a target is validated. */
+  private compactForkJobs?: SessionForkJobs
+  get forkJobs(): SessionForkJobs {
+    return this.compactForkJobs ??= new SessionForkJobs(join(this.store.directory?.() || resolveUserDataHome(), 'session-exports'), {
+      prepare: async (request: ForkRequest) => {
+        const source = this.getAgent(request.sourceAgentId), target = this.getAgent(request.targetAgentId)
+        if (!source || !target || !isCrossForkSourceAgent(source) || !isCrossForkTargetAgent(target)) throw new Error('当前 Agent 暂不支持压缩后导出')
+        this.assertAgentCanRun(source.id); this.assertAgentCanRun(target.id)
+        const owner = this.findByIdentity(source.id, request.nativeId)
+        if (!owner) throw new Error('请先将来源会话导入 UniAgent，以确认来源模型和连接配置，再执行压缩分叉')
+        if (this.nativeActionReservations.has(owner.id) || this.isBusy(owner.status) || this.rewinding.has(owner.id) || (this.pendingSends.get(owner.id) || 0) > 0 || this.getQueue(owner.id).length) throw new Error('当前会话正在使用中，请完成或停止后再分叉')
+        const occupancy = await this.inspectSessionOccupancy(owner.id, 'fork-preflight')
+        if (occupancy.state === 'occupied') throw new Error('来源会话被其他客户端占用')
+        if (owner.config.worktree) assertWorktreeAvailable(owner.config)
+        const model = target.models.find(model => model.id === request.targetModel)
+        if (!model?.contextWindow) throw new Error('目标模型容量暂无法确认，请刷新模型配置')
+        const targetConfig: SessionConfig = { agentId: target.id, model: model.id, modelSource: model.modelSource,
+          effort: model.defaultEffort, workdir: owner.config.workdir, projectId: owner.config.projectId,
+          worktree: owner.config.worktree, requirementId: owner.config.requirementId,
+          permissionMode: resolveCreatePermissionMode(target, undefined) }
+        return { source, target, sourceConfig: structuredClone(owner.config),
+          targetConfig: this.resolveProjectConfig ? this.resolveProjectConfig(targetConfig, true) : targetConfig,
+          sourceCache: { attachments: request.point ? [] : (owner.submittedUserMessages || []).flatMap(message => (message.attachments || []).map(attachment => attachment.path)),
+            artifactsDirectory: join(this.artifactsRoot || join(resolveUserDataHome(), 'turn-artifacts'), 'v1', owner.id) },
+          sourceSessionId: owner.id, contextWindow: model.contextWindow, modelLabel: model.label }
+      },
+      snapshot: async job => {
+        const source = this.getAgent(job.request.sourceAgentId)!
+        const owner = this.findByIdentity(source.id, job.request.nativeId)
+        if (!owner || this.nativeActionReservations.has(owner.id) || this.isBusy(owner.status)) throw new Error('来源会话状态已变化，请重新确认')
+        this.nativeActionReservations.add(owner.id)
+        try {
+          await this.assertSessionNotExternallyOccupied(owner)
+          if (source.adapter === 'qoder') {
+            const result = await qoderOperation(source.bin, 'forkSession', { sessionId: job.request.nativeId, messageId: job.request.point?.nativeId }, job.sourceConfig.workdir)
+            if (!result.sessionId || result.sessionId === job.request.nativeId) throw new Error('Qoder 未创建独立原生分支')
+            return result.sessionId
+          }
+          if (source.adapter === 'claude') {
+            const result = await claudeSdkSessionOperation(source.bin, job.sourceConfig.workdir, 'forkSession',
+              { sessionId: job.request.nativeId, messageId: job.request.point?.nativeId })
+            if (!result.sessionId || result.sessionId === job.request.nativeId) throw new Error('Claude 未创建独立原生分支')
+            return result.sessionId
+          }
+          return await forkNativeSnapshot(source, job.request.nativeId, job.request.point)
+        } finally { this.nativeActionReservations.delete(owner.id) }
+      },
+      compact: async job => {
+        const agent = this.getAgent(job.request.sourceAgentId)!
+        if (agent.adapter === 'qoder') {
+          await withForkQoder(agent, job.sourceConfig, job.stagingNativeId!, client => forkClaudeTurn(client, '/compact'))
+        } else if (agent.adapter === 'claude') {
+          await withForkClaude(agent, job.sourceConfig, job.stagingNativeId, true, client => forkClaudeTurn(client, '/compact'))
+        } else {
+          const runner = new AppServerRunner(`fork-${job.id}`, { n: 0 }, agent, job.sourceConfig, job.stagingNativeId)
+          try { await runner.compactForExport() } finally { runner.dispose() }
+        }
+      },
+      handoff: async job => {
+        const agent = this.getAgent(job.request.sourceAgentId)!
+        if (agent.adapter === 'qoder') return withForkQoder(agent, job.sourceConfig, job.stagingNativeId!, async client => validateForkHandoff(await forkClaudeTurn(client, FORK_HANDOFF_PROMPT)))
+        if (agent.adapter === 'claude') return withForkClaude(agent, job.sourceConfig, job.stagingNativeId, true,
+          async client => validateForkHandoff(await forkClaudeTurn(client, FORK_HANDOFF_PROMPT)))
+        if (!['codex', 'traex'].includes(agent.adapter)) throw new Error('当前来源不支持无工具交接导出')
+        const runner = new AppServerRunner(`fork-${job.id}`, { n: 0 }, agent,
+          { ...job.sourceConfig, permissionMode: 'read-only', assistantSnapshot: undefined }, job.stagingNativeId)
+        try { return await forkCodexHandoff(runner) } finally { runner.dispose() }
+      },
+      validate: async job => {
+        const target = this.getAgent(job.request.targetAgentId)!
+        const model = target.models.find(model => model.id === job.targetConfig.model)
+        const window = model?.contextWindow || 0
+        if (!window) throw new Error('目标模型容量暂无法确认')
+        job.targetConfig.additionalDirectories = [...new Set([...(job.targetConfig.additionalDirectories || []), job.archivePath])]
+        await forkContextWork('write', { home: homedir(), agentId: target.id, nativeId: job.targetNativeId,
+          archive: job.archivePath, cwd: job.targetConfig.workdir,
+          model: parseCodexModelKey(job.targetConfig.model || '')?.model || job.targetConfig.model || '' })
+        if (target.adapter === 'qoder') {
+          await withForkQoder(target, job.targetConfig, job.targetNativeId!, async client => { job.capacity = qoderForkCapacity(await client.request('context'), window) })
+        } else if (target.adapter === 'claude') {
+          await withForkClaude(target, job.targetConfig, job.targetNativeId, false, async client => {
+            const report = await client.request('context')
+            job.capacity = claudeForkCapacity(report, window)
+          })
+        } else {
+          const estimate = await forkContextWork<number>('measure', { archive: job.archivePath, hash: job.contextHash,
+            model: parseCodexModelKey(job.targetConfig.model || '')?.model || job.targetConfig.model })
+          const runner = new AppServerRunner(`fork-target-${job.id}`, { n: 0 }, target, job.targetConfig, job.targetNativeId)
+          try { job.capacity = await runner.validateForkContext(estimate, window) } finally { runner.dispose() }
+        }
+      },
+      create: async job => {
+        const prior = this.findByIdentity(job.request.targetAgentId, job.targetNativeId)
+        if (prior) return prior.id
+        // Load before publishing. The small target history contains only the validated active context.
+        const target = this.getAgent(job.request.targetAgentId)!
+        const loaded = await loadSessionEvents(job.request.targetAgentId, job.targetNativeId, target.bin, job.targetConfig.workdir)
+        if (!loaded.events.length) throw new Error('目标原生会话无法加载，未创建公开分支')
+        const source = job.sourceSessionId && this.sessions.get(job.sourceSessionId)
+        const config = this.normalizeAgentConfig(this.resolveProjectConfig ? this.resolveProjectConfig(job.targetConfig) : job.targetConfig).config
+        const session: Session = { id: `s_${nanoid(10)}`, title: source ? `${source.title}（分叉）` : '分叉会话', config,
+          nativeSessionId: job.targetNativeId, origin: 'imported', readOnly: false, status: 'idle', createdAt: Date.now(), updatedAt: Date.now(),
+          forkedFrom: { agentId: job.request.sourceAgentId, nativeId: job.request.nativeId,
+            mode: job.request.sourceAgentId === job.request.targetAgentId ? 'compatible' : 'cross', exportId: job.id } }
+        const ref = { n: 0 }
+        this.installSessionOwner(session)
+        this.events.set(session.id, loaded.events.map(event => ({ ...event, sessionId: session.id, seq: ref.n++ })))
+        this.seqRefs.set(session.id, ref)
+        try { this.persistOrThrow() } catch (error) {
+          if (!sessionStoreWriteCommitted(error)) { this.sessions.delete(session.id); this.events.delete(session.id); this.seqRefs.delete(session.id) }
+          throw error
+        }
+        this.emit('sessionCreated', session)
+        return session.id
+      },
+      findCreated: job => this.findByIdentity(job.request.targetAgentId, job.targetNativeId)?.id,
+      retarget: (job, id) => {
+        const agent = this.getAgent(job.request.targetAgentId)
+        this.assertAgentCanRun(job.request.targetAgentId)
+        const model = agent?.models.find(model => model.id === id)
+        if (!model?.contextWindow) throw new Error('目标模型容量暂无法确认')
+        return { ...job.targetConfig, model: model.id, modelSource: model.modelSource, effort: model.defaultEffort }
+      }
+    })
+  }
+
   async exportNativeSession(
     sourceAgentId: string,
     nativeId: string,
     targetAgentId: string,
     point?: HistoryForkPoint
   ): Promise<Session | undefined> {
-    const source = this.getAgent(sourceAgentId)
     const target = this.getAgent(targetAgentId)
-    const sourceAllowed = isCrossForkSourceAgent(source)
-    if (!sourceAllowed || !isCrossForkTargetAgent(target)) return undefined
-    const sourceConfig = this.findByIdentity(sourceAgentId, nativeId)?.config
-    if (sourceConfig?.worktree) assertWorktreeAvailable(sourceConfig)
-    const res = await exportNativeSession(sourceAgentId, nativeId, targetAgentId, this.getAgent, point)
-    if (!res) return undefined
-    // Import the transplanted native session under the target agent. The events
-    // replay from the file we just wrote, so the target opens with full context.
-    return this.importSession(targetAgentId, res.nativeId, 'snapshot', undefined, undefined, false, undefined,
-      sourceConfig ? { projectId: sourceConfig.projectId, ...(sourceConfig.worktree ? { worktree: sourceConfig.worktree } : {}), requirementId: sourceConfig.requirementId, ...(sourceConfig.assistantSnapshot ? { assistantSnapshot: structuredClone(sourceConfig.assistantSnapshot) } : {}) } : undefined)
+    if (!target) return undefined
+    const pref = this.getAgentPref?.(targetAgentId)
+    const preferred = pref?.defaultModel || pref?.model
+    const targetModel = target.models.find(model => model.id === preferred)?.id || target.defaultModel || target.models[0]?.id
+    if (!targetModel) throw new Error('目标 Agent 未配置模型')
+    const plan = await this.forkJobs.preflight({ sourceAgentId, nativeId, targetAgentId, targetModel, point })
+    const job = await this.forkJobs.start(plan.planId)
+    const done = await this.forkJobs.wait(job.id)
+    return done.targetSessionId ? this.sessions.get(done.targetSessionId) : undefined
   }
 
   /**
@@ -3142,10 +3691,25 @@ export class Orchestrator extends EventEmitter {
       const forked = await this.exportNativeSession(agentId, nativeId, agentId, point)
       if (!forked) return undefined
       forked.readOnly = false
-      forked.forkedFrom = { agentId, nativeId, mode: 'compatible' }
+      forked.forkedFrom = { ...forked.forkedFrom, agentId, nativeId, mode: 'compatible' }
       this.bumpSessionActivity(forked.id)
       this.persist()
       return forked
+    }
+    if (agent.adapter === 'qoder') {
+      if (existing && this.isBusy(existing.status)) throw new Error('Qoder 会话正在运行，请先停止后再分叉')
+      if (point) {
+        const events = existing ? await this.getEvents(existing.id) : (await loadSessionEvents(agentId, nativeId, agent.bin, workdir)).events
+        const points = await historyForkPoints(agent, nativeId, events)
+        if (!points.some(candidate => candidate.eventSeq === point.eventSeq && candidate.nativeId === point.nativeId && candidate.kind === point.kind)) throw new Error('Qoder 分叉位置已变化，请刷新历史')
+      }
+      const result = await qoderOperation(agent.bin, 'forkSession', { sessionId: nativeId, messageId: point?.nativeId }, workdir)
+      if (!result.sessionId || result.sessionId === nativeId) throw new Error('Qoder 未创建独立原生分支')
+      const forked = await this.importSession(agentId, result.sessionId, 'snapshot', workdir, undefined, false, undefined, workspaceConfig)
+      if (!forked) throw new Error('Qoder 原生分支无法加载')
+      if (existing) forked.config = { ...forked.config, ...existing.config, workdir }
+      forked.readOnly = false; forked.forkedFrom = { agentId, nativeId, mode: 'same' }
+      this.bumpSessionActivity(forked.id); this.persist(); return forked
     }
     if (agent.adapter === 'deepseek') {
       const sourceConfig = existing && structuredClone(existing.config)
@@ -3206,7 +3770,8 @@ export class Orchestrator extends EventEmitter {
       forked.status = 'idle'
       forked.origin = 'imported'
       forked.readOnly = false
-      forked.forkedFrom = { agentId, nativeId, mode: 'same' }
+      forked.forkedFrom = { agentId, nativeId, mode: 'same', exportId: existing?.forkedFrom?.exportId }
+      this.replaceSessionConfig(forked, forked.config)
       this.bumpSessionActivity(forked.id)
       this.persist()
       return forked
@@ -3241,6 +3806,16 @@ export class Orchestrator extends EventEmitter {
       if (agent.adapter === 'grok') await retainGrokFork(res.nativeId,agent.bin)
       return forked
     }
+    if (agent.adapter === 'claude') {
+      const result = await claudeSdkSessionOperation(agent.bin, workdir, 'forkSession', { sessionId: nativeId })
+      if (!result.sessionId || result.sessionId === nativeId) throw new Error('Claude 未创建独立原生分支')
+      const forked = await this.importSession(agentId, result.sessionId, 'snapshot', workdir, undefined, false, undefined, workspaceConfig)
+      if (!forked) throw new Error('Claude 原生分支无法加载')
+      if (existing) forked.config = structuredClone(existing.config)
+      forked.readOnly = false; forked.forkedFrom = { agentId, nativeId, mode: 'same', exportId: existing?.forkedFrom?.exportId }
+      this.bumpSessionActivity(forked.id); this.persist()
+      return forked
+    }
     const res = await forkSameSession(agentId, nativeId)
     if (!res) return undefined
     const forked = await this.importSession(agentId, res.nativeId, 'snapshot', undefined, undefined, false, undefined, workspaceConfig)
@@ -3255,11 +3830,8 @@ export class Orchestrator extends EventEmitter {
 
   /**
    * 需求5 — 换Agent分叉. Fork a read-only snapshot into another agent by
-   * transplanting its normalized transcript into that agent's native history
-   * (reuses exportNativeSession). This rebuild is potentially LOSSY (each CLI's
-   * schema differs; opaque reasoning blobs can't cross), so the returned session
-   * is labeled `mode:'cross'` and the UI must warn the user. Still writable +
-   * carries lineage.
+   * compacting a private native fork, exporting the active context and archiving
+   * history. A failed export never falls back to replaying the entire transcript.
    */
   async forkCrossSession(
     sourceAgentId: string,
@@ -3274,7 +3846,7 @@ export class Orchestrator extends EventEmitter {
     const forked = await this.exportNativeSession(sourceAgentId, nativeId, targetAgentId, point)
     if (!forked) return undefined
     forked.readOnly = false
-    forked.forkedFrom = { agentId: sourceAgentId, nativeId, mode: 'cross' }
+    forked.forkedFrom = { ...forked.forkedFrom, agentId: sourceAgentId, nativeId, mode: 'cross' }
     this.bumpSessionActivity(forked.id)
     this.persist()
     return forked
@@ -3628,6 +4200,7 @@ export class Orchestrator extends EventEmitter {
       this.bindNativeCapabilityInvalidation(streamer, session)
       this.installMainStreamerOwner(session.id, streamer)
     }
+    this.bindSessionTitleGenerationPolicy(session.id, streamer)
     return streamer
   }
 
@@ -3753,10 +4326,38 @@ export class Orchestrator extends EventEmitter {
       } else if (effectiveAgent?.capabilities.nativeReview !== true) {
         throw new Error(`unsupported_target_capability: ${effectiveAgent?.name || '目标 Agent'} does not support native review`)
       }
+      if (session.config.worktree && (action.type === 'review.start' || action.type === 'goal.update' && ['resume', 'edit'].includes(action.action) && this.isReady(session.status))) await this.prepareNativeWorktree(session)
       if (action.type === 'goal.set' || action.type === 'review.start') teamRuntime(sessionId)?.beforeUserTurn?.()
       if (action.type === 'goal.set') {
         const objective = action.objective.trim()
         await this.setGoalAndRun(session, objective, action.tokenBudget, action.maxRounds)
+        return
+      }
+      if (effectiveAgent?.adapter === 'qoder' && (action.type === 'goal.clear' || action.type === 'goal.update')) {
+        const runner = this.ensureTurnRunner(session, effectiveAgent) as QoderRunner
+        await runner.initialize(effectiveAgent, session.config, session.nativeSessionId)
+        if (action.type === 'goal.clear' || action.action === 'clear') {
+          await runner.clearClaudeGoal(); this.updateGoalState(session, undefined)
+        } else if (action.action === 'resume') {
+          if (!session.goal) throw new Error('Qoder 当前没有可恢复的 Goal')
+          this.runners.set(session.id, runner)
+          this.updateGoalState(session, await runner.activateGoal(effectiveAgent, session.config, session.goal, session.nativeSessionId, true))
+        } else if (action.action === 'edit') {
+          if (!session.goal) throw new Error('Qoder 当前没有 Goal')
+          if (action.tokenBudget !== undefined && (!Number.isSafeInteger(action.tokenBudget) || action.tokenBudget < 1)) throw new Error('Token 预算必须是正整数')
+          if (action.tokenBudget !== undefined) { session.goal = { ...session.goal, tokenBudget: action.tokenBudget }; runner.configureClaudeGoal(session.goal) }
+          if (session.goal.tokenBudget != null) {
+            this.updateGoalState(session, await runner.activateGoal(effectiveAgent, session.config, { ...session.goal, objective: action.objective || session.goal.objective }, session.nativeSessionId, true))
+            return
+          }
+          const snapshot = await runner.control('setGoal', { objective: action.objective || session.goal.objective })
+          this.updateGoalState(session, projectQoderGoal(snapshot, session.goal))
+        } else {
+          const status = action.action === 'pause' || action.action === 'disarm' ? 'paused' : action.action === 'complete' ? 'complete' : 'blocked'
+          const snapshot = await runner.control('setGoal', { status })
+          this.updateGoalState(session, projectQoderGoal(snapshot, session.goal))
+          if (status === 'paused') this.interrupt(session.id)
+        }
         return
       }
       if (effectiveAgent?.adapter === 'claude' && (action.type === 'goal.clear' || action.type === 'goal.update')) {
@@ -3767,7 +4368,7 @@ export class Orchestrator extends EventEmitter {
           if (!session.goal) throw new Error('Claude 当前没有可恢复的 Goal')
           await this.setGoalAndRun(session, action.objective || session.goal.objective, action.tokenBudget, action.maxRounds)
         } else if (action.type === 'goal.clear' || action.action === 'clear') {
-          const runner = this.claudeSdkRunners.get(session.id)
+          const runner = this.sdkRunners.get(session.id)
           if (runner && this.runners.has(session.id)) {
             this.interrupt(session.id)
             await runner.stopClaudeSdk()
@@ -3778,11 +4379,12 @@ export class Orchestrator extends EventEmitter {
         } else throw new Error('Claude 原生 Goal 支持暂停、恢复、编辑和清除')
         return
       }
-      if (effectiveAgent?.adapter === 'claude' && action.type === 'review.start') {
-        const prompt = claudeReviewPrompt(action.draft, session.config)
+      if ((effectiveAgent?.adapter === 'claude' || effectiveAgent?.adapter === 'qoder') && action.type === 'review.start') {
+        const prompt = effectiveAgent.adapter === 'qoder' ? qoderReviewPrompt(action.draft) : claudeReviewPrompt(action.draft, session.config)
+        const input = effectiveAgent.adapter === 'qoder' ? await qoderReviewInput(action.draft, session.config.workdir) : prompt
         this.record(session.id, { type: 'user_message', payload: { text: prompt } })
         this.setStatus(session, 'running')
-        this.runOneShot(session, effectiveAgent, prompt)
+        this.runOneShot(session, effectiveAgent, input)
         return
       }
       if (effectiveAgent?.adapter === 'zcode' && (action.type === 'goal.clear' || action.type === 'goal.update')) {
@@ -3857,6 +4459,16 @@ export class Orchestrator extends EventEmitter {
     }
     const grokSession = this.sessions.get(sessionId)
     const grokAgent = grokSession ? this.getAgent(grokSession.config.agentId) : undefined
+    if (grokSession && grokAgent?.adapter === 'qoder') {
+      await this.withNativeActionReservation(sessionId, async session => {
+        const runner = this.ensureTurnRunner(session, grokAgent) as QoderRunner
+        await runner.initialize(grokAgent, session.config, session.nativeSessionId)
+        await runner.control('setPlanMode', mode === 'plan')
+        session.config = { ...session.config, collaborationMode: mode }
+        this.persist(); this.emit('sessionUpdated', { session, hasLiveStreamer: true })
+      })
+      return
+    }
     if (grokSession && grokAgent?.adapter === 'zcode') {
       if (!this.isReady(grokSession.status) || (this.queues.get(sessionId)?.length ?? 0) > 0) throw new Error('当前仍有任务或排队消息，请稍后操作')
       const runner = await this.ensureZCodeRunner(grokSession)
@@ -3954,7 +4566,7 @@ export class Orchestrator extends EventEmitter {
     }
     const title = action.type === 'goal.set' ? action.objective.trim() : 'Review'
     const reserved = reservedSessionId ? this.sessions.get(reservedSessionId) : undefined
-    if (reservedSessionId && (!reserved?.config.worktree || reserved.status !== 'draft')) throw new Error('工作树创建草稿不可用')
+    if (reservedSessionId && ((!reserved?.config.worktree && !reserved?.taskRegistration) || reserved.status !== 'draft')) throw new Error('任务创建草稿不可用')
     const { session } = reserved ? { session: reserved } : this.createSessionRecord(config, title, meta)
     assertWorktreeAvailable(session.config)
     const reservesNativeAction = action.type === 'review.start' || ['deepseek', 'grok', 'kimi', 'mcode'].includes(agent?.adapter || '')
@@ -3963,17 +4575,20 @@ export class Orchestrator extends EventEmitter {
     try {
       if (action.type === 'goal.set') {
         await this.setGoalAndRun(session, title, action.tokenBudget, action.maxRounds)
-      } else if (agent?.adapter === 'claude') {
-        const prompt = claudeReviewPrompt(action.draft, session.config)
+      } else if (agent?.adapter === 'claude' || agent?.adapter === 'qoder') {
+        if (session.config.worktree) await this.prepareNativeWorktree(session)
+        const prompt = agent.adapter === 'qoder' ? qoderReviewPrompt(action.draft) : claudeReviewPrompt(action.draft, session.config)
+        const input = agent.adapter === 'qoder' ? await qoderReviewInput(action.draft, session.config.workdir) : prompt
         this.record(session.id, { type: 'user_message', payload: { text: prompt } })
-        this.runOneShot(session, agent, prompt)
+        this.runOneShot(session, agent, input)
       } else {
+        if (session.config.worktree) await this.prepareNativeWorktree(session)
         const runner = this.ensureStreamerForNativeAction(session)
         await runner.startReview(action.draft)
       }
       return session
     } catch (error) {
-      if (session.config.worktree) {
+      if (session.config.worktree || session.taskRegistration) {
         this.setStatus(session, session.nativeSessionId ? 'error' : 'draft')
         this.persist()
       } else this.discardUnstartedSession(session)
@@ -3994,14 +4609,14 @@ export class Orchestrator extends EventEmitter {
       throw new Error('消息正在发送，请稍后再操作')
     }
     const agent = this.getAgent(session.config.agentId)
-    const activeNativeGoal = controlsNativeGoal && ['claude', 'deepseek', 'grok', 'kimi', 'mcode', 'zcode'].includes(agent?.adapter || '') &&
+    const activeNativeGoal = controlsNativeGoal && ['claude', 'qoder', 'deepseek', 'grok', 'kimi', 'mcode', 'zcode'].includes(agent?.adapter || '') &&
       session.goal?.continuation === 'native' && (this.protocolRunners.has(sessionId) || this.zcodeRunners.has(sessionId) || this.runners.has(sessionId)) &&
       ['running', 'queued', 'awaiting-approval'].includes(session.status)
     const configChangeReady = configChange && (session.status === 'error' || session.status === 'draft')
     if (!activeNativeGoal && ((!this.isReady(session.status) && !configChangeReady) || (this.queues.get(sessionId)?.length ?? 0) > 0)) {
       throw new Error('当前仍有任务或排队消息，请稍后再操作')
     }
-    if (!agent || (!usesAppServer(agent) && !['claude', 'deepseek', 'grok', 'kimi', 'mcode', 'zcode'].includes(agent.adapter))) throw new Error('当前 Agent 不支持原生操作')
+    if (!agent || (!usesAppServer(agent) && !['claude', 'qoder', 'deepseek', 'grok', 'kimi', 'mcode', 'zcode'].includes(agent.adapter))) throw new Error('当前 Agent 不支持原生操作')
     return session
   }
 
@@ -4010,6 +4625,7 @@ export class Orchestrator extends EventEmitter {
     action: (session: Session) => Promise<T>,
     controlsNativeGoal = false
   ): Promise<T> {
+    this.assertTaskInputAvailable(sessionId)
     const session = this.requireWritableIdleSession(sessionId, controlsNativeGoal)
     const teamStopVersion = this.teamStopVersions.get(sessionId) || 0
     this.nativeActionReservations.add(sessionId)
@@ -4035,6 +4651,7 @@ export class Orchestrator extends EventEmitter {
     tokenBudget?: number,
     maxRounds?: number
   ): Promise<void> {
+    if (session.config.worktree) await this.prepareNativeWorktree(session)
     const claude = this.getAgent(session.config.agentId)
     if (claude?.adapter === 'claude') {
       if (session.config.permissionMode === 'plan') throw new Error('请先退出 Plan 模式再设置 Goal')
@@ -4043,6 +4660,22 @@ export class Orchestrator extends EventEmitter {
       this.updateGoalState(session, goal)
       this.setStatus(session, 'running')
       this.runOneShot(session, claude, `/goal ${goal.objective}`)
+      return
+    }
+    if (claude?.adapter === 'qoder') {
+      if (!objective.trim()) throw new Error('Goal 目标不能为空')
+      for (const value of [tokenBudget, maxRounds]) if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) throw new Error('Goal 限制必须是正整数')
+      if (session.config.collaborationMode === 'plan') throw new Error('请先退出 Plan 模式再设置 Goal')
+      const now = Date.now()
+      const goal: GoalState = { objective: objective.trim(), status: 'active', tokenBudget: tokenBudget ?? null,
+        tokensUsed: 0, timeUsedSeconds: 0, createdAt: now, updatedAt: now, continuation: 'native', autonomous: true,
+        roundLimit: { maxRounds: maxRounds ?? null, roundsStarted: 0 } }
+      const runner = this.ensureTurnRunner(session, claude) as QoderRunner
+      this.runners.set(session.id, runner)
+      this.record(session.id, { type: 'goal_message', payload: { text: goal.objective, command: 'goal' } })
+      this.setStatus(session, 'running')
+      try { this.updateGoalState(session, await runner.activateGoal(claude, session.config, goal, session.nativeSessionId)) }
+      catch (error) { this.runners.delete(session.id); this.setStatus(session, 'error'); throw error }
       return
     }
     const teamStopVersion = this.teamStopVersions.get(session.id) || 0
@@ -4093,6 +4726,7 @@ export class Orchestrator extends EventEmitter {
     if (agent?.adapter === 'deepseek') this.deepseekEvents.append(session.id, event)
     this.logEvent(event)
     this.rememberSubmittedUserMessage(session, event)
+    this.emit('taskInputAccepted', session.id)
     this.bumpSessionActivity(session.id)
     this.emit('event', event)
     if (session.teamBinding && (this.teamStopVersions.get(session.id) || 0) !== teamStopVersion) { this.discardPreparedRun(session, preparedRun); return }
@@ -4160,7 +4794,7 @@ export class Orchestrator extends EventEmitter {
     const effectiveAgent = agent ? agentForSession(agent, session) : undefined
     const kimiCompact = ['kimi', 'grok', 'deepseek', 'mcode', 'zcode'].includes(effectiveAgent?.adapter || '') &&
       effectiveAgent?.capabilities.commands?.some(command => command.replace(/^\//, '') === 'compact') === true
-    const claudeCompact = effectiveAgent?.adapter === 'claude' && !!session.nativeSessionId
+    const claudeCompact = (effectiveAgent?.adapter === 'claude' || effectiveAgent?.adapter === 'qoder') && !!session.nativeSessionId
     if (!agent || (!usesAppServer(agent) && !kimiCompact && !claudeCompact)) throw new Error('当前 Agent 不支持手动压缩上下文')
     if (this.isBusy(session.status) || (this.queues.get(sessionId)?.length ?? 0) > 0) {
       throw new Error('Agent 运行中，无法压缩上下文')
@@ -4173,6 +4807,10 @@ export class Orchestrator extends EventEmitter {
     const streamer = this.streamers.get(sessionId)
     if (!streamer) throw new Error('当前会话尚未建立实时连接，请先发送一条消息')
     await streamer.compact()
+    // Idle manual compaction has no user-turn done callback to drain messages accepted meanwhile.
+    if (this.sessions.get(sessionId) === session && this.streamers.get(sessionId) === streamer &&
+        !streamer.isRunning() && !hasRunningContextCompaction(this.events.get(sessionId) || []) &&
+        !this.activeQueueItems.has(sessionId) && this.queues.get(sessionId)?.length) this.afterTurn(session)
   }
 
   /**
@@ -4185,7 +4823,7 @@ export class Orchestrator extends EventEmitter {
     if (!session || isToolSession(session)) return false
     const baseAgent = this.getAgent(session.config.agentId)
     const agent = baseAgent && agentForSession(baseAgent, session)
-    if (!agent || !(usesAppServer(agent) || ['claude', 'kimi', 'grok', 'deepseek', 'mcode', 'zcode'].includes(agent.adapter) && agent.capabilities.sideChat === true)) return false
+    if (!agent || !(usesAppServer(agent) || ['claude', 'qoder', 'kimi', 'grok', 'deepseek', 'mcode', 'zcode'].includes(agent.adapter) && agent.capabilities.sideChat === true)) return false
     return !!session.nativeSessionId
   }
 
@@ -4238,7 +4876,8 @@ export class Orchestrator extends EventEmitter {
       attachments = await prepareGrokAttachments(attachments)
       if (this.sessions.get(sessionId) !== session || this.sidePromotions.has(sessionId)) throw new Error('图片准备期间侧边对话已变化，请重试')
     }
-    if (this.sideStatus.get(sessionId) && this.sideStatus.get(sessionId) !== 'idle') {
+    if (hasRunningContextCompaction(this.sideEvents.get(sessionId) || []) ||
+        this.sideStatus.get(sessionId) && this.sideStatus.get(sessionId) !== 'idle') {
       if (activatePlan) throw new Error('Plan 命令只能在空闲且无排队消息的侧边对话中使用')
       this.enqueueSideMessage(sessionId, prompt, attachments, nativeContext, bubble)
       return
@@ -4267,6 +4906,7 @@ export class Orchestrator extends EventEmitter {
   ): Promise<void> {
     if (this.sidePromotions.has(sessionId)) throw new Error('侧边对话正在转换，请稍后重试')
     if (this.isTeamMember(sessionId)) throw new Error('team_member_read_only')
+    if (hasRunningContextCompaction(this.sideEvents.get(sessionId) || [])) throw new Error('compaction_in_progress')
     const side = this.sideStreamers.get(sessionId)
     if (!side || this.sideStatus.get(sessionId) === 'idle') {
       await this.sendSideMessage(sessionId, prompt, attachments, nativeContext, false, bubble)
@@ -4296,6 +4936,9 @@ export class Orchestrator extends EventEmitter {
 
   /** 需求2 — interrupt the in-flight side turn (best effort). */
   interruptSide(sessionId: string): void {
+    const preparing = this.worktreeStarts.delete(`side:${sessionId}`)
+    const session = this.sessions.get(sessionId)
+    if (preparing && session?.worktreePreparing && !this.worktreeStarts.has(sessionId)) this.setWorktreePreparing(session, false)
     this.sideQueues.set(sessionId, [])
     if (!this.sideStreamers.has(sessionId)) {
       this.setSideStatus(sessionId, 'idle')
@@ -4377,6 +5020,11 @@ export class Orchestrator extends EventEmitter {
       await side.clearGoal()
       return
     }
+    const session = this.sessions.get(sessionId)
+    if (session?.config.worktree) {
+      await this.prepareNativeWorktree(session, true)
+      await side.updateConfig(this.sideConfig(sessionId))
+    }
     if (action.type === 'goal.set') {
       const objective = action.objective.trim()
       await side.setGoal({ objective, ...(action.tokenBudget === undefined ? {} : { tokenBudget: action.tokenBudget }) })
@@ -4401,6 +5049,9 @@ export class Orchestrator extends EventEmitter {
     if (side instanceof BetaSideRunner || side instanceof ZCodeSideRunner || side instanceof ClaudeSdkSideRunner) this.setSideStatus(sessionId, 'running')
     try { await side.compact() }
     catch (error) { this.setSideStatus(sessionId, 'idle'); throw error }
+    if (this.sideStreamers.get(sessionId) === side && !side.isRunning() &&
+        !this.sideEditingItems.has(sessionId) && !hasRunningContextCompaction(this.sideEvents.get(sessionId) || []) &&
+        this.sideQueues.get(sessionId)?.length) this.dispatchSideQueue(sessionId, side)
   }
 
   async respondSideRequest(sessionId: string, requestId: string, answer: any, bubble?: TurnBubble): Promise<AppServerRespondResult> {
@@ -4499,6 +5150,7 @@ export class Orchestrator extends EventEmitter {
   }
 
   promoteSideMessage(sessionId: string, itemId: string): void {
+    if (hasRunningContextCompaction(this.sideEvents.get(sessionId) || [])) return
     const side = this.sideStreamers.get(sessionId)
     const queue = this.sideQueues.get(sessionId) || []
     const item = queue.find((entry) => entry.id === itemId)
@@ -4730,7 +5382,7 @@ export class Orchestrator extends EventEmitter {
     if (!this.sideSeqRefs.has(sessionId)) this.sideSeqRefs.set(sessionId, { n: 0 })
     if (!this.sideEvents.has(sessionId)) this.sideEvents.set(sessionId, [])
     if (!this.sideQueues.has(sessionId)) this.sideQueues.set(sessionId, [])
-    if (agent.adapter === 'claude') {
+    if (agent.adapter === 'claude' || agent.adapter === 'qoder') {
       const side = new ClaudeSdkSideRunner(sessionId, this.sideSeqRefs.get(sessionId)!, agent, this.sideConfig(sessionId), session.nativeSessionId, this.sideNativeSessionIds.get(sessionId))
       this.bindSideStreamer(sessionId, side); this.sideStreamers.set(sessionId, side); this.emitSideState(sessionId)
       return side
@@ -4856,7 +5508,17 @@ export class Orchestrator extends EventEmitter {
       type: command === 'goal' ? 'goal_message' : 'user_message',
       payload: { text: prompt, attachments, nativeContext, ...(command ? { command } : {}), ...bubblePayload(bubble) }
     })
-    void side.startTurn(prompt, attachments, nativeContext)
+    const session = this.sessions.get(sessionId)
+    if (!session?.config.worktree) { void side.startTurn(prompt, attachments, nativeContext); return }
+    void (async () => {
+      if (session && command !== 'goal') await this.prepareNativeWorktree(session, true)
+      if (this.sideStreamers.get(sessionId) !== side || this.getSideStatus(sessionId) === 'idle') return
+      await side.updateConfig(this.sideConfig(sessionId))
+      await side.startTurn(prompt, attachments, nativeContext)
+    })().catch(error => {
+      this.recordSide(sessionId, { type: 'error', state: 'failed', payload: { message: String(error) } })
+      this.setSideStatus(sessionId, 'idle')
+    })
   }
 
   private enqueueSideMessage(
@@ -4872,12 +5534,13 @@ export class Orchestrator extends EventEmitter {
       id: 'side-q_' + nanoid(6), prompt, attachments, nativeContext,
       ...(deliveryUncertain ? { deliveryUncertain: true } : {}),
       ...(bubble?.comments?.length ? { comments: bubble.comments } : {}),
-      ...(bubble?.displayText ? { displayText: bubble.displayText } : {})
+      ...(typeof bubble?.displayText === 'string' ? { displayText: bubble.displayText } : {})
     }])
     this.setSideStatus(sessionId, 'queued')
   }
 
   private dispatchSideQueue(sessionId: string, side: SideRunner): void {
+    if (hasRunningContextCompaction(this.sideEvents.get(sessionId) || [])) return
     const queue = this.sideQueues.get(sessionId) || []
     const [head, ...rest] = queue
     if (head?.deliveryUncertain || head?.state === 'steering' || head?.state === 'dispatching') { this.setSideStatus(sessionId, 'idle'); return }
@@ -4935,7 +5598,7 @@ export class Orchestrator extends EventEmitter {
     const session = this.sessions.get(sessionId)
     if (!session) return
     const agent = this.getAgent(session.config.agentId)
-    if (!agent || (!usesAppServer(agent) && agent.adapter !== 'claude') || !session.nativeSessionId) {
+    if (!agent || (!usesAppServer(agent) && agent.adapter !== 'claude' && agent.adapter !== 'qoder') || !session.nativeSessionId) {
       this.recordDetail(sessionId, {
         type: 'system_notice',
         payload: { kind: 'warning', text: '详情解释需要 Codex / TraeX 且主会话已就绪。' }
@@ -4957,12 +5620,12 @@ export class Orchestrator extends EventEmitter {
     void detail.startTurn(prompt)
   }
 
-  async sendDetailMessage(sessionId: string, prompt: string, attachments?: Attachment[]): Promise<void> {
+  async sendDetailMessage(sessionId: string, prompt: string, attachments?: Attachment[], bubble?: TurnBubble): Promise<void> {
     if (this.isTeamMember(sessionId)) throw new Error('team_member_read_only')
     const session = this.sessions.get(sessionId)
     if (!session) return
     const agent = this.getAgent(session.config.agentId)
-    if (!agent || (!usesAppServer(agent) && agent.adapter !== 'claude') || !session.nativeSessionId) {
+    if (!agent || (!usesAppServer(agent) && agent.adapter !== 'claude' && agent.adapter !== 'qoder') || !session.nativeSessionId) {
       this.recordDetail(sessionId, {
         type: 'system_notice',
         payload: { kind: 'warning', text: '详情解释需要 Codex / TraeX 且主会话已就绪。' }
@@ -4970,7 +5633,7 @@ export class Orchestrator extends EventEmitter {
       return
     }
     const detail = this.ensureDetailStreamer(sessionId, session, agent)
-    this.recordDetail(sessionId, { type: 'user_message', payload: { text: prompt } })
+    this.recordDetail(sessionId, { type: 'user_message', payload: { text: prompt, ...bubblePayload(bubble) } })
     this.detailStatus.set(sessionId, 'running')
     this.emit('detailStatus', { sessionId, status: 'running' })
     void detail.startTurn(prompt, attachments)
@@ -4983,7 +5646,7 @@ export class Orchestrator extends EventEmitter {
       if (!this.detailEvents.has(sessionId)) this.detailEvents.set(sessionId, [])
       const ref = this.detailSeqRefs.get(sessionId)!
       // Fork off the main rollout: resumeThreadId undefined, forkFromThreadId set.
-      detail = agent.adapter === 'claude'
+      detail = agent.adapter === 'claude' || agent.adapter === 'qoder'
         ? new ClaudeSdkSideRunner(sessionId, ref, agent, session.config, session.nativeSessionId!)
         : new AppServerRunner(sessionId, ref, agent, session.config)
       if (detail instanceof AppServerRunner) {
@@ -5120,7 +5783,7 @@ export class Orchestrator extends EventEmitter {
     detail.updateConfig(config)
     this.sideConfigs.set(sessionId, config)
     const nativeSessionId = detail.nativeThreadId()
-    if (nativeSessionId && ['codex', 'claude'].includes(this.getAgent(config.agentId)?.adapter || '')) this.sideNativeSessionIds.set(sessionId, nativeSessionId)
+    if (nativeSessionId && ['codex', 'claude', 'qoder'].includes(this.getAgent(config.agentId)?.adapter || '')) this.sideNativeSessionIds.set(sessionId, nativeSessionId)
     this.sideQueues.set(sessionId, [])
     this.sideEvents.set(sessionId, this.detailEvents.get(sessionId) || [])
     this.sideSeqRefs.set(sessionId, this.detailSeqRefs.get(sessionId) || { n: 0 })
@@ -5215,6 +5878,16 @@ export class Orchestrator extends EventEmitter {
     }
     if (adapter === 'deepseek') return []
     if (adapter === 'mcode') return []
+    if (adapter === 'qoder') {
+      const child = session?.subagents?.find(child => child.agentThreadId === agentThreadId)
+      if (!child || !session?.nativeSessionId) return []
+      const live = this.sdkRunners.get(sessionId)?.getSubAgentItems(agentThreadId) || this.completedSubAgentItems.get(sessionId)?.get(agentThreadId)
+      if (live?.length) return structuredClone(live)
+      try {
+        const messages = await qoderOperation(agent!.bin, 'subagentHistory', { sessionId: session.nativeSessionId, agentId: child.nativeHistoryId || agentThreadId }, session.config.workdir)
+        return projectQoderHistory(messages, sessionId)
+      } catch { return [] }
+    }
     if (adapter === 'claude') {
       const cached = this.runners.get(sessionId)?.getSubAgentItems(agentThreadId) || this.completedSubAgentItems.get(sessionId)?.get(agentThreadId)
       if (cached?.length) return structuredClone(cached)
@@ -5239,13 +5912,18 @@ export class Orchestrator extends EventEmitter {
     if (session.readOnly) throw new Error('只读会话不能取消子智能体')
     if (session.archived) throw new Error('归档会话不能取消子智能体')
     const adapter = this.getAgent(session.config.agentId)?.adapter
-    if (adapter !== 'grok' && adapter !== 'deepseek' && adapter !== 'kimi') throw new Error('当前 Agent 不支持取消子智能体')
+    if (adapter !== 'grok' && adapter !== 'deepseek' && adapter !== 'kimi' && adapter !== 'qoder') throw new Error('当前 Agent 不支持取消子智能体')
     const children = session.subagents?.filter(child => child.agentThreadId === agentThreadId) || []
     const child = children[0]
     if (children.length !== 1 || child.parentThreadId && child.parentThreadId !== session.nativeSessionId && child.parentThreadId !== session.id) {
       throw new Error('子智能体不属于当前会话')
     }
     if (child.status !== 'running' || !['running', 'awaiting-approval'].includes(session.status)) throw new Error('子智能体或所属会话未在运行')
+    if (adapter === 'qoder') {
+      const runner = this.sdkRunners.get(sessionId)
+      if (!(runner instanceof QoderRunner)) throw new Error('子智能体所属会话未连接')
+      await runner.control('stopTask', agentThreadId); return
+    }
     const runner = this.protocolRunners.get(sessionId)
     if (!runner) throw new Error('子智能体所属会话未连接')
     await runner.cancelSubAgent(agentThreadId)
@@ -5276,7 +5954,7 @@ export class Orchestrator extends EventEmitter {
    * carries the same (agentId, nativeId) identity, absorb it — drop the stale
    * duplicate so the same conversation never shows up twice in the sidebar.
    */
-  private assignNativeSessionId(session: Session, nativeId: string): void {
+  private assignNativeSessionId(session: Session, nativeId: string, persist = true): void {
     if (this.sessions.get(session.id) !== session) return
     const previousNativeId = session.nativeSessionId
     const prior = this.findByIdentity(session.config.agentId, nativeId)
@@ -5304,11 +5982,14 @@ export class Orchestrator extends EventEmitter {
       this.seqRefs.delete(prior.id)
       this.backendConfigCorrectionSeqs.delete(prior.id)
     }
-    this.persist()
+    if (persist) this.persist()
   }
 
   /** Release a session's long-lived streaming process (archive / close). */
   disposeSession(sessionId: string, keepSideCache = false): void {
+    this.cancelErrorRecovery(sessionId, '会话已关闭')
+    this.errorRecovery?.cancel(sessionId, '会话已关闭')
+    this.recoveryTurns.delete(sessionId)
     cancelRequirementPreparation(sessionId)
     this.channelSendTurns.delete(sessionId)
     this.feishuTeamInputs.delete(sessionId)
@@ -5353,10 +6034,14 @@ export class Orchestrator extends EventEmitter {
     runner?.removeAllListeners()
     runner?.interrupt()
     this.runners.delete(sessionId)
-    const claude = this.claudeSdkRunners.get(sessionId)
-    this.claudeSdkRunners.delete(sessionId)
+    const claude = this.sdkRunners.get(sessionId)
+    this.sdkRunners.delete(sessionId)
     claude?.removeAllListeners()
-    void claude?.disposeClaudeSdk()
+    if (claude) {
+      const disposal = claude.disposeClaudeSdk()
+      this.sdkDisposals.add(disposal)
+      void disposal.finally(() => this.sdkDisposals.delete(disposal)).catch(() => {})
+    }
     const grok = this.protocolRunners.get(sessionId)
     grok?.removeAllListeners()
     grok?.dispose()
@@ -5375,6 +6060,7 @@ export class Orchestrator extends EventEmitter {
 
   /** Tear down every process, including any session hidden by list de-dup. */
   disposeAll(): void {
+    this.worktreeStarts.clear()
     for (const { sessionId } of [...this.managementConfirmations.values()]) this.cancelManagementConfirmations(sessionId)
     this.persistSideChats()
     const ids = new Set([
@@ -5382,6 +6068,7 @@ export class Orchestrator extends EventEmitter {
       ...this.sideStreamers.keys(),
       ...this.detailStreamers.keys(),
       ...this.runners.keys(),
+      ...this.sdkRunners.keys(),
       ...this.protocolRunners.keys(),
       ...this.zcodeRunners.keys(),
       ...this.zcodeRunnerLoads.keys()
@@ -5446,10 +6133,12 @@ export class Orchestrator extends EventEmitter {
     finally { await lease.release() }
   }
 
-  assertUserSessionEnabled(sessionId: string): void {
+  assertUserSessionEnabled(sessionId: string, allowRemovedWorktree = false): void {
+    if (this.deletingSessionRecords.has(sessionId)) throw new Error('任务正在删除，请稍后再操作')
     if (this.worktreeTransitions.has(sessionId)) throw new Error('正在切换工作目录，请稍后再操作')
     const session = this.sessions.get(sessionId)
     if (session) assertWorktreeNotRemoving(session.config)
+    if (session?.config.worktree?.removedAt && !allowRemovedWorktree) throw new Error('工作树已清理，请重试删除任务记录')
     if (isToolSession(this.sessions.get(sessionId))) {
       throw new Error('这是工具创建的只读会话，请先在 UniAgent 中启用会话。')
     }
@@ -5480,7 +6169,17 @@ export class Orchestrator extends EventEmitter {
   }
 
   /** Archive or restore a session, preserving its metadata and native rollout. */
-  setArchived(sessionId: string, archived: boolean, teamExecution?: symbol): Session | undefined {
+  setArchived(sessionId: string, archived: boolean, teamExecution?: symbol): Session | undefined | Promise<Session | undefined> {
+    const session = this.sessions.get(sessionId)
+    if (this.taskArchive && session && !teamExecution && !session.config.assistantSnapshot && !session.teamBinding) return this.taskArchive(sessionId, archived)
+    return this.setArchivedValue(sessionId, archived, teamExecution)
+  }
+
+  applyTaskArchive(sessionId: string, archived: boolean): Session | undefined {
+    return this.setArchivedValue(sessionId, archived, undefined, false)
+  }
+
+  private setArchivedValue(sessionId: string, archived: boolean, teamExecution?: symbol, persist = true): Session | undefined {
     if (this.sessions.get(sessionId)?.teamBinding && teamExecution !== TEAM_EXECUTION) throw new Error('archive_team_project_instead')
     const session = this.sessions.get(sessionId)
     if (!session) return undefined
@@ -5496,7 +6195,7 @@ export class Orchestrator extends EventEmitter {
     session.archived = archived
     session.updatedAt = Date.now()
     this.bumpSessionActivity(session.id)
-    this.persist()
+    if (persist) this.persist()
     if (archived) this.emit('sessionArchived', sessionId)
     if (archived && session.config.agentId === 'deepseek') {
       const events = this.events.get(sessionId)
@@ -5512,12 +6211,17 @@ export class Orchestrator extends EventEmitter {
   }
 
   /**
-   * Permanently delete a session (G2-4). Drops all in-memory state and its
-   * persisted metadata. The agent's own native rollout on disk is left intact
-   * (we never created it) — this only removes UniAgent's record of the session.
+   * Delete the task and its last-owned managed worktree. Native history follows
+   * the adapter's existing deletion contract; Git branches remain recoverable.
    */
-  deleteSession(sessionId: string): Promise<void> {
+  deleteSession(sessionId: string, confirmationId?: string): Promise<void> {
     if (this.sessions.get(sessionId)?.teamBinding) throw new Error('team_session_cannot_delete')
+    const session = this.sessions.get(sessionId)
+    if (session?.config.worktree) return this.deleteWorktreeSessions([session], confirmationId, () => this.deleteSessionRecord(sessionId))
+    return this.deleteSessionRecord(sessionId)
+  }
+
+  private deleteSessionRecord(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId)
     const agent = session ? this.getAgent(session.config.agentId) : undefined
     if (session?.nativeSessionId && (agent?.adapter === 'grok' || agent?.adapter === 'kimi')) {
@@ -5526,19 +6230,44 @@ export class Orchestrator extends EventEmitter {
     return this.deleteLocalSession(sessionId)
   }
 
-  deleteTeamSessions(teamProjectId: string): void {
-    for (const session of [...this.sessions.values()]) {
-      if (session.teamBinding?.teamProjectId === teamProjectId) void this.deleteLocalSession(session.id).catch(error => this.logSession(session.id, 'history_delete_failed', { message: String(error) }))
+  async deleteTeamSessions(teamProjectId: string, confirmationId?: string): Promise<void> {
+    const sessions = [...this.sessions.values()].filter(session => session.teamBinding?.teamProjectId === teamProjectId)
+    const remove = async () => { for (const session of sessions) await this.deleteLocalSession(session.id) }
+    if (sessions.some(session => session.config.worktree)) await this.deleteWorktreeSessions(sessions, confirmationId, remove)
+    else await remove()
+  }
+
+  private async deleteWorktreeSessions(sessions: Session[], confirmationId: string | undefined, remove: () => Promise<void>): Promise<void> {
+    for (const session of sessions) if (this.worktreeTransitions.has(session.id)) throw new Error('正在清理任务，请稍后再操作')
+    for (const session of sessions) this.worktreeTransitions.add(session.id)
+    const resume = this.worktreeRuntime.suspend(sessions.map(session => session.id))
+    try {
+      await this.taskWorktreeDeletion.execute(sessions, confirmationId, async () => {
+        const streamers = sessions.flatMap(session => [this.streamers.get(session.id), this.sideStreamers.get(session.id), this.detailStreamers.get(session.id)]).filter(streamer => streamer instanceof AppServerRunner) as AppServerRunner[]
+        for (const session of sessions) {
+          this.worktreeStarts.delete(session.id); this.worktreeStarts.delete(`side:${session.id}`)
+          this.interrupt(session.id)
+          this.disposeSession(session.id, true)
+        }
+        await Promise.all([...streamers.map(streamer => streamer.waitForDisposal()), ...this.sdkDisposals,
+          ...sessions.flatMap(session => [this.zcodeDisposals.get(session.id), this.zcodeSideDisposals.get(session.id)])])
+        await this.worktreeRuntime.settle(sessions)
+        for (const session of sessions) await this.assertSessionNotExternallyOccupied(session)
+      }, remove)
+    } finally {
+      for (const session of sessions) this.worktreeTransitions.delete(session.id)
+      resume()
     }
   }
 
   private async deleteProtocolSessionNativeFirst(session: Session, agent: AgentDef): Promise<void> {
     const nativeSessionId = session.nativeSessionId
     if (!nativeSessionId) return
+    const workdir = session.config.worktree?.removedAt ? session.config.worktree.sourcePrimaryDirectory : session.config.workdir
     if (agent.adapter === 'kimi') {
-      await deleteKimiSession(nativeSessionId, agent.bin, session.config.workdir, kimiSessionRuntimeEnv(session.id, session.config))
+      await deleteKimiSession(nativeSessionId, agent.bin, workdir, kimiSessionRuntimeEnv(session.id, session.config))
     } else {
-      await deleteGrokSession(nativeSessionId, agent.bin, session.config.workdir)
+      await deleteGrokSession(nativeSessionId, agent.bin, workdir)
     }
     if (this.sessions.get(session.id) !== session || session.nativeSessionId !== nativeSessionId) {
       throw new Error(`${agent.name} 会话在删除期间发生变化，已保留本地记录`)
@@ -5547,8 +6276,21 @@ export class Orchestrator extends EventEmitter {
   }
 
   private deleteLocalSession(sessionId: string): Promise<void> {
+    if (this.deletingSessionRecords.has(sessionId)) return Promise.reject(new Error('任务正在删除，请稍后再操作'))
+    const transitioning = this.worktreeTransitions.has(sessionId)
+    this.worktreeTransitions.add(sessionId)
+    this.deletingSessionRecords.add(sessionId)
+    return this.deleteLocalSessionValue(sessionId).finally(() => {
+      this.deletingSessionRecords.delete(sessionId)
+      if (!transitioning) this.worktreeTransitions.delete(sessionId)
+    })
+  }
+
+  private async deleteLocalSessionValue(sessionId: string): Promise<void> {
     this.disposeSession(sessionId)
-    const deletion = this.sessions.get(sessionId)?.config.agentId === 'deepseek' ? this.deepseekEvents.delete(sessionId) : Promise.resolve()
+    if (this.sessions.get(sessionId)?.config.agentId === 'deepseek') await this.deepseekEvents.delete(sessionId)
+    // Keep the visible record and caches until durable metadata deletion succeeds.
+    this.store.saveOrThrow([...this.sessions.values()].filter(session => session.id !== sessionId))
     this.recoveryStartTokens.delete(sessionId)
     this.historyLoads.delete(sessionId)
     this.sendTails.delete(sessionId)
@@ -5560,7 +6302,6 @@ export class Orchestrator extends EventEmitter {
     this.queues.delete(sessionId)
     this.seqRefs.delete(sessionId)
     this.backendConfigCorrectionSeqs.delete(sessionId)
-    this.persist()
     this.emit('sessionDeleted', sessionId)
     const references = new Set<string>()
     const include = (attachments?: Attachment[]): void => {
@@ -5570,7 +6311,6 @@ export class Orchestrator extends EventEmitter {
     for (const buffers of [this.events,this.sideEvents]) for (const events of buffers.values()) for (const event of events) include(event.payload?.attachments)
     for (const queues of [this.queues,this.sideQueues]) for (const queue of queues.values()) for (const item of queue) include(item.attachments)
     void collectGrokImages(references).catch(() => {})
-    return deletion
   }
 
   /**
@@ -5760,6 +6500,22 @@ export class Orchestrator extends EventEmitter {
     }
   }
 
+  private finishFailedTurn(session: Session, itemId = this.activeQueueItems.get(session.id)): void {
+    const queue = this.queues.get(session.id) || []
+    const recovery = itemId && queue.some(item => item.id === itemId)
+      ? this.commitQueueForRecovery(session, queue.filter(item => item.id !== itemId))
+      : undefined
+    if (itemId && this.activeQueueItems.get(session.id) === itemId) this.activeQueueItems.delete(session.id)
+    let persistenceDetail = recovery?.detail
+    try { this.setStatus(session, 'error') }
+    catch (error) { persistenceDetail = String(error) }
+    if (recovery) this.emitQueue(session.id)
+    if (persistenceDetail) {
+      this.record(session.id, { type: 'system_notice', payload: { kind: 'warning',
+        text: `本轮执行失败，${recovery ? '消息已从等待队列移出，但' : ''}持久化未确认；重启后请核对原消息状态：${persistenceDetail}` } })
+    }
+  }
+
   private removeDeliveredQueueItem(session: Session, itemId: string): void {
     const queue = this.queues.get(session.id) || []
     if (!queue.some((item) => item.id === itemId)) return
@@ -5819,6 +6575,7 @@ export class Orchestrator extends EventEmitter {
     this.logSession(session.id, 'status_changed', { from: previousStatus, to: 'queued' })
     this.emit('statusChange', { sessionId: session.id, status: 'queued' })
     this.emitQueue(session.id)
+    this.emit('taskInputAccepted', session.id)
     this.record(session.id, {
       type: 'system_notice',
       payload: { text: `已排队（第 ${this.getQueue(session.id).length} 条），本轮结束后自动发送。`, kind: 'queue' }
@@ -5830,9 +6587,11 @@ export class Orchestrator extends EventEmitter {
     if (scheduledToken && this.deferredDispatches.get(session.id) !== scheduledToken) return
     if (
       this.activeQueueItems.has(session.id) ||
+      hasRunningContextCompaction(this.events.get(session.id) || []) ||
       this.editingQueueItems.has(session.id) ||
       this.teamQuestions.has(session.id) ||
       session.archived ||
+      session.taskRegistration?.delivery === 'unknown' && this.queues.get(session.id)?.[0]?.id === session.taskRegistration.inputId ||
       session.readOnly || this.assistantCommandSessions.has(session.id)
     ) {
       if (this.deferredDispatches.get(session.id) === dispatchToken) {
@@ -5999,13 +6758,8 @@ export class Orchestrator extends EventEmitter {
       preparedRun.input.attachments,
       preparedRun.input.nativeContext,
       preparedRun
-    )) return
-    this.restoreQueueItemsToPending(
-      session,
-      (item) => item.id === head.id,
-      '队列消息启动失败，已恢复为可重试状态。',
-      { releaseActiveItemId: head.id, statusAfter: 'error' }
-    )
+    )) { this.emit('taskInputAccepted', session.id); return }
+    this.finishFailedTurn(session, head.id)
   }
 
   async recordHandoffEnd(event: UAEvent): Promise<void> {
@@ -6021,7 +6775,7 @@ export class Orchestrator extends EventEmitter {
     const events = this.events.get(sessionId)
     if (!ref || !events || !this.sessions.has(sessionId)) return
     const ev: UAEvent = { sessionId, seq: ref.n++, ts, ...partial }
-    if (ev.type === 'turn_completed') this.channelSendTurns.delete(sessionId)
+    if (ev.type === 'turn_completed' && !ev.payload.recoveryIntermediate) this.channelSendTurns.delete(sessionId)
     if (ev.type === 'user_message' || ev.type === 'goal_message') {
       if (this.sessions.get(sessionId)?.config.assistantSnapshot) ev.payload.assistantMessageId ||= nanoid(20)
       this.expireLocalPlans(sessionId)
@@ -6075,8 +6829,14 @@ export class Orchestrator extends EventEmitter {
 
   async flushSessionLogs(): Promise<void> { await Promise.all([this.sessionLogs.flush(), this.deepseekEvents.flush()]) }
   async closeSessionLogs(): Promise<void> {
-    await Promise.all(this.artifactFinalizations)
-    await Promise.all([this.sessionLogs.close(), this.deepseekEvents.close()])
+    this.worktreeStarts.clear()
+    await this.worktreeRuntime.close()
+    try { await this.errorRecovery?.close() }
+    finally {
+      await Promise.all(this.sdkDisposals)
+      await Promise.all(this.artifactFinalizations)
+      await Promise.all([this.sessionLogs.close(), this.deepseekEvents.close()])
+    }
   }
 
   performanceStats(): Record<string, number> {
@@ -6112,6 +6872,26 @@ export class Orchestrator extends EventEmitter {
     sessionId: string,
     channel: 'main' | 'side' | 'detail' = 'main'
   ): void {
+    streamer.on('nativeThreadRebound', (threadId: string) => {
+      if (channel === 'detail') return
+      const session = this.sessions.get(sessionId)
+      const owner = channel === 'main' ? this.streamers.get(sessionId) : this.sideStreamers.get(sessionId)
+      if (!session || owner !== streamer) throw new Error('压缩接续会话已关闭')
+      const previous = channel === 'main' ? session.nativeSessionId : this.sideNativeSessionIds.get(sessionId)
+      if (channel === 'main') this.assignNativeSessionId(session, threadId, false)
+      else this.sideNativeSessionIds.set(sessionId, threadId)
+      try {
+        if (channel === 'main') this.persistOrThrow()
+        else this.persistSideChats(true)
+      } catch (error) {
+        if (!sessionStoreWriteCommitted(error)) {
+          if (channel === 'main' && previous) this.assignNativeSessionId(session, previous, false)
+          else if (previous) this.sideNativeSessionIds.set(sessionId, previous)
+          else this.sideNativeSessionIds.delete(sessionId)
+        }
+        throw error
+      }
+    })
     streamer.on('rateLimits', (snapshot: CodexRateLimits) => {
       this.emit('codexRateLimits', snapshot)
     })
@@ -6186,6 +6966,12 @@ export class Orchestrator extends EventEmitter {
       acceptedInput.attachments,
       acceptedInput.nativeContext
     )
+    const workspace = this.resolveSessionWorkspace(session, session.config)
+    if (workspace !== session.config) {
+      this.replaceSessionConfig(session, workspace)
+      this.persist()
+      this.emit('sessionUpdated', { session, hasLiveStreamer: this.streamers.has(session.id) })
+    }
     let currentAgent: AgentDef
     try {
       currentAgent = this.requireCurrentAgentRun(session, input.attachments)
@@ -6201,7 +6987,7 @@ export class Orchestrator extends EventEmitter {
       this.emit('sessionUpdated', { session, hasLiveStreamer: this.streamers.has(session.id) })
     }
     const config = structuredClone(session.config)
-    const route = agentRunRoute(agent)
+    const route = agentRunRoute(agent, config)
     if (route === 'zcode' && (config.fastMode || config.maxMode)) throw new Error('ZCode 当前接入不支持 Fast 或 Max 参数')
     if (route !== 'app-server') return { agent, config, route, input }
     const previous = this.streamers.get(session.id)
@@ -6272,11 +7058,15 @@ export class Orchestrator extends EventEmitter {
     command?: ComposerCommand,
     bubble?: TurnBubble
   ): boolean {
-    if (preparedRun.route === 'zcode') {
+    if (preparedRun.route === 'zcode' || session.config.worktree && !session.teamBinding) {
       const item = buildDurableQueueItem(prompt, preparedRun.input.attachments, preparedRun.input.nativeContext, undefined, bubble)
+      if (session.taskRegistration?.delivery === 'dispatching' && !session.submittedUserMessages?.length && !this.queues.get(session.id)?.some(entry => entry.id === session.taskRegistration!.inputId)) {
+        item.id = session.taskRegistration.inputId
+      }
       if (session.zcodeState) session.zcodeState.suspendedAfterStop = false
       this.commitQueue(session, [...(this.queues.get(session.id) || []), item])
       this.emitQueue(session.id)
+      if (!bubble?.automaticRecovery) this.emit('taskInputAccepted', session.id)
       this.dispatchPendingQueue(session)
       return true
     }
@@ -6295,13 +7085,15 @@ export class Orchestrator extends EventEmitter {
       }
     })
     if (session.teamBinding && (this.teamStopVersions.get(session.id) || 0) !== teamStopVersion) { this.discardPreparedRun(session, preparedRun); return false }
-    return this.run(
+    const accepted = this.run(
       session,
       prompt,
       preparedRun.input.attachments,
       preparedRun.input.nativeContext,
       preparedRun
     )
+    if (accepted && !bubble?.automaticRecovery) this.emit('taskInputAccepted', session.id)
+    return accepted
   }
 
   private rememberSubmittedUserMessage(session: Session, event: UAEvent): void {
@@ -6318,7 +7110,7 @@ export class Orchestrator extends EventEmitter {
     if (userOrdinal < 0) return
     // Remember whether a human has ever continued this MCP-created session for
     // legacy records; the current message source still decides each turn's push.
-    if (session.handoffId && event.payload.source !== 'mcp' && (userOrdinal > 0 || session.submittedUserMessages?.length)) {
+    if (session.handoffId && !event.payload.automaticRecovery && event.payload.source !== 'mcp' && (userOrdinal > 0 || session.submittedUserMessages?.length)) {
       session.handoffUserContinued = true
     }
     const attachments = Array.isArray(event.payload?.attachments)
@@ -6335,12 +7127,15 @@ export class Orchestrator extends EventEmitter {
     const comments = Array.isArray(event.payload?.comments) && event.payload.comments.length
       ? structuredClone(event.payload.comments as BubbleComment[])
       : undefined
-    const displayText = typeof event.payload?.displayText === 'string' && event.payload.displayText
+    const displayText = typeof event.payload?.displayText === 'string'
       ? event.payload.displayText
       : undefined
     const submitted: SubmittedUserMessage = {
+      ...(event.payload.clientTurnKey ? { clientTurnKey: event.payload.clientTurnKey } : {}),
+      ...(typeof event.payload.routedInputId === 'string' ? { routedInputId: event.payload.routedInputId } : {}),
       ...(session.config.assistantSnapshot ? { assistantText: String(event.payload.text || '').slice(0,65536), assistantMessageId: event.payload.assistantMessageId } : {}),
       type: event.type as SubmittedUserMessage['type'],
+      ...(event.payload.automaticRecovery ? { automaticRecovery: event.payload.automaticRecovery } : {}),
       ...(event.payload.appendedToTurn === true ? { appendedToTurn: true } : {}),
       source: event.payload.source === 'feishu' || event.payload.source === 'weixin' || event.payload.source === 'mcp' ? event.payload.source : 'app',
       userOrdinal,
@@ -6357,6 +7152,7 @@ export class Orchestrator extends EventEmitter {
       submitted
     ].slice(-MAX_SUBMITTED_USER_MESSAGES)
     this.persist()
+    this.emit('taskTitleInputRecorded', event)
   }
 
   private run(
@@ -6411,7 +7207,35 @@ export class Orchestrator extends EventEmitter {
       }
     }
 
-    if (hasRequirementContext(session.config) && !preparedRun?.requirementPrepared) {
+    if (session.config.worktree && !preparedRun?.worktreePrepared && !this.currentTurnInput(session)?.payload.automaticRecovery) {
+      const prepared = preparedRun || this.prepareCurrentAgentRun(session, input)
+      const token = Symbol(session.id)
+      this.worktreeStarts.set(session.id, token)
+      const current = () => this.sessions.get(session.id) === session && this.worktreeStarts.get(session.id) === token
+      this.setStatus(session, 'running')
+      const initial = this.initialWorktreeTurn(session)
+      if (initial) this.setWorktreePreparing(session, true)
+      void this.worktreeRuntime.prepare(session, current, false).then(() => {
+        if (!current()) { this.discardPreparedRun(session, prepared); return }
+        if (initial) this.setWorktreePreparing(session, false)
+        const config = { ...prepared.config, worktree: structuredClone(session.config.worktree) }
+        prepared.streamer?.updateConfig(config)
+        this.run(session, prompt, input.attachments, input.nativeContext, { ...prepared, config, worktreePrepared: true })
+        if (current()) this.worktreeStarts.delete(session.id)
+      }).catch(error => {
+        if (!current()) return
+        this.worktreeStarts.delete(session.id)
+        this.discardPreparedRun(session, prepared)
+        this.record(session.id, { type: 'error', state: 'failed', payload: { message: `工作树同步失败，本轮未启动：${String(error)}` } })
+        const activeId = this.activeQueueItems.get(session.id)
+        if (activeId) this.restoreQueueItemsToPending(session, item => item.id === activeId, '工作树同步失败，消息已保留待重试。', { releaseActiveItemId: activeId, statusAfter: 'error' })
+        else this.setStatus(session, 'error')
+        if (initial) this.setWorktreePreparing(session, false, String(error))
+      })
+      return true
+    }
+
+    if ((hasRequirementContext(session.config) || hasProjectMemoryContext(session.config)) && !preparedRun?.requirementPrepared) {
       const prepared = preparedRun || this.prepareCurrentAgentRun(session, input)
       const preparation = prepareRequirementTurn(session, prompt)
       void preparation.ready.then(text => {
@@ -6424,9 +7248,7 @@ export class Orchestrator extends EventEmitter {
         forgetRequirementContext(session.id)
         this.discardPreparedRun(session, prepared)
         this.record(session.id, { type: 'error', state: 'failed', payload: { message: '需求上下文读取失败，本轮未启动：' + String(error) } })
-        const activeId = this.activeQueueItems.get(session.id)
-        if (activeId) this.restoreQueueItemsToPending(session, item => item.id === activeId, '需求上下文读取失败，消息已恢复为可重试状态。', { releaseActiveItemId: activeId, statusAfter: 'error' })
-        else this.setStatus(session, 'error')
+        this.finishFailedTurn(session)
       })
       this.setStatus(session, 'running')
       return true
@@ -6434,9 +7256,11 @@ export class Orchestrator extends EventEmitter {
 
     const queuedBehindActive =
       this.activeQueueItems.has(session.id) && (this.queues.get(session.id)?.length ?? 0) > 1
+    this.recoveryTurns.set(session.id, { id: nanoid(), config: JSON.stringify(session.config), prompt,
+      input, delivery: 'unknown', held: false })
     this.setStatus(session, queuedBehindActive ? 'queued' : 'running')
 
-    const route = preparedRun?.route || agentRunRoute(agent)
+    const route = preparedRun?.route || agentRunRoute(agent, session.config)
     if (route === 'zcode') {
       this.runZCode(session, prompt, input.attachments, input.nativeContext)
     } else if (route === 'protocol') {
@@ -6451,13 +7275,18 @@ export class Orchestrator extends EventEmitter {
         preparedRun
       )
     } else {
-      this.runOneShot(session, agent, agent.adapter === 'claude' ? claudeTurnPrompt(prompt, input.nativeContext) : prompt, input.attachments, preparedRun?.config)
+      this.runOneShot(session, agent, (agent.adapter === 'claude' || agent.adapter === 'qoder') ? claudeTurnPrompt(prompt, input.nativeContext) : prompt, input.attachments, preparedRun?.config)
     }
     return true
   }
 
   /** After a turn finishes: drain the next queued message, else go idle. */
   private afterTurn(session: Session, interrupted = false): void {
+    if (!interrupted && this.errorRecovery?.getProgress(session.id)) {
+      this.errorRecovery.reset(session.id)
+      void this.errorRecovery.persist().catch(error => this.logSession(session.id, 'recovery_persistence_failed', { message: String(error) }))
+    }
+    this.recoveryTurns.delete(session.id)
     this.emit('assistantTurnEnded', { sessionId: session.id, interrupted: interrupted || session.status === 'error' })
     this.channelSendTurns.delete(session.id)
     // A hard interrupt (G2-9) settles to a clean terminal state and does NOT
@@ -6574,6 +7403,7 @@ export class Orchestrator extends EventEmitter {
     assertWorktreeNotRemoving(config)
     const existing = this.streamers.get(session.id)
     if (existing?.matchesAgentRuntime(agent)) {
+      this.bindSessionTitleGenerationPolicy(session.id, existing)
       existing.updateAgent(agent)
       existing.updateConfig(config)
       if (!session.titleLocked) {
@@ -6595,6 +7425,7 @@ export class Orchestrator extends EventEmitter {
       session.nativeSessionId
     )
     if (sharedWith) streamer.shareConnectionWith(sharedWith)
+    this.bindSessionTitleGenerationPolicy(session.id, streamer)
     if (!session.titleLocked) {
       const firstUser = this.events.get(session.id)?.find((event) =>
         event.type === 'user_message' || event.type === 'goal_message'
@@ -6608,6 +7439,7 @@ export class Orchestrator extends EventEmitter {
         return
       }
       if (this.foldModelSwitchNotice(session, ev)) return
+      ev = this.trackRecoveryEvent(session, ev)
       ev = withInteractionState(ev, this.events.get(session.id) || [])
       const nativeSessionId =
         ev.type === 'turn_started' && typeof ev.payload?.threadId === 'string'
@@ -6635,7 +7467,7 @@ export class Orchestrator extends EventEmitter {
       // native turnId; `diff_update` carries the growing aggregated diff; the
       // `done` handler finalizes a snapshot keyed by that turnId.
       this.captureTurnEvent(session, ev)
-      if (ev.type === 'turn_completed') this.channelSendTurns.delete(session.id)
+      if (ev.type === 'turn_completed' && !ev.payload.recoveryIntermediate) this.channelSendTurns.delete(session.id)
       const buffer = this.events.get(session.id)
       if (buffer) appendEventSnapshot(buffer, ev)
       this.logEvent(ev)
@@ -6726,7 +7558,6 @@ export class Orchestrator extends EventEmitter {
           failed: !!failed
         })
         const completedInput = this.currentTurnInput(session)
-        const failedActiveItemId = failed ? this.activeQueueItems.get(session.id) : undefined
         const capture = this.turnCapture.get(session.id)
         // 需求3 — snapshot this turn's files BEFORE draining the queue. afterTurn
         // schedules the next turn (setImmediate), which can start writing files;
@@ -6744,17 +7575,11 @@ export class Orchestrator extends EventEmitter {
         // Session can leave its busy state immediately. If the user starts a new
         // turn while that best-effort finalization is pending, the old callback
         // must not overwrite the new turn's running state.
-        if (failedActiveItemId && this.activeQueueItems.get(session.id) === failedActiveItemId) {
-          this.restoreQueueItemsToPending(
-            session,
-            (item) => item.id === failedActiveItemId,
-            'Provider 启动或执行失败，消息已恢复为可重试状态。',
-            { releaseActiveItemId: failedActiveItemId }
-          )
-        }
         if (this.currentTurnInput(session) !== completedInput) return
+        if (failed && this.errorRecovery && await this.recoverTerminalFailure(session, interrupted)) return
+        if (this.streamers.get(session.id) !== streamer || this.sessions.get(session.id) !== session || this.currentTurnInput(session) !== completedInput) return
         if (failed) {
-          this.setStatus(session, 'error')
+          this.finishFailedTurn(session)
           return
         }
         this.afterTurn(session, interrupted)
@@ -6861,6 +7686,7 @@ export class Orchestrator extends EventEmitter {
     runner.on('event', (incoming: UAEvent) => {
       if (!owns()) return
       let event = decorate(incoming)
+      event = this.trackRecoveryEvent(session, event)
       if (event.payload.zcodeProjection) event = { ...event, payload: { ...event.payload,
         projectionGeneration: this.zcodeDisplayGenerations.get(session.id) ?? 0 } }
       const events = this.events.get(session.id) || []
@@ -6905,7 +7731,7 @@ export class Orchestrator extends EventEmitter {
     runner.on('delivery', (record: import('../shared/zcode').ZCodeDeliveryRecord) => {
       if (!owns()) return
       const next = (this.queues.get(session.id) || []).map(item => item.id !== record.queueItemId ? item : {
-        ...item, state: ['uncertain', 'failed'].includes(record.phase) ? 'pending' as const : 'dispatching' as const,
+        ...item, state: record.phase === 'uncertain' ? 'pending' as const : 'dispatching' as const,
         deliveryUncertain: record.phase === 'uncertain' || undefined })
       this.commitQueue(session, next)
       if (record.phase === 'observed') this.activeQueueItems.set(session.id, record.queueItemId)
@@ -6917,9 +7743,7 @@ export class Orchestrator extends EventEmitter {
         const receipt = session.zcodeState?.deliveries.find(item => item.commandId === result.commandId)
         const itemId = receipt?.queueItemId
         if (result.delivery === 'uncertain' || result.delivery === 'not-submitted' || result.failed) {
-          if (itemId) this.commitQueue(session, (this.queues.get(session.id) || []).map(item => item.id === itemId ? {
-            ...item, state: 'pending', deliveryUncertain: result.delivery === 'uncertain' || undefined } : item))
-          this.activeQueueItems.delete(session.id); this.emitQueue(session.id); this.setStatus(session, 'error')
+          this.finishFailedTurn(session, itemId)
           return
         }
         if (!result.recovered) await this.finalizeTurnArtifact(session)
@@ -6967,13 +7791,8 @@ export class Orchestrator extends EventEmitter {
       if (this.sessions.get(session.id) !== session) return
       if (itemId && !this.queues.get(session.id)?.some(item => item.id === itemId)) return
       if (this.zcodeStarts.get(session.id) === token) this.zcodeStarts.delete(session.id)
-      const receipt = session.zcodeState?.deliveries.filter(item => item.queueItemId === itemId).at(-1)
-      const uncertain = receipt && ['sent', 'acknowledged', 'uncertain', 'observed'].includes(receipt.phase)
-      if (itemId) this.commitQueue(session, (this.queues.get(session.id) || []).map(item => item.id === itemId ? {
-        ...item, state: 'pending', deliveryUncertain: uncertain || undefined } : item))
-      this.activeQueueItems.delete(session.id); this.emitQueue(session.id)
       this.record(session.id, { type: 'error', state: 'failed', payload: { message: error instanceof Error ? error.message : 'ZCode 启动失败' } })
-      this.setStatus(session, 'error')
+      this.finishFailedTurn(session, itemId)
     }).catch(error => {
       if (this.sessions.get(session.id) === session) { this.activeQueueItems.delete(session.id); this.setStatus(session, 'error') }
       this.logSession(session.id, 'zcode_start_recovery_failed', { message: String(error) })
@@ -7005,13 +7824,14 @@ export class Orchestrator extends EventEmitter {
     const configBarrier = this.protocolConfigTails.get(session.id) || Promise.resolve()
     const startToken = Symbol(session.id)
     this.protocolPendingStarts.set(session.id, startToken)
+    const routedInputId = session.config.managedPurpose === 'router' ? this.currentTurnInput(session)?.payload.routedInputId : undefined
     let started = false
     void configBarrier.then(async () => {
       if (this.protocolPendingStarts.get(session.id) !== startToken) return
       // MiniMax Code runs the permission policy inside its own process, so the
       // selected mode has to be pushed down before every turn — otherwise a
       // mid-session change would never reach the agent.
-      if (session.config.requirementId || agent.adapter === 'kimi' || agent.adapter === 'deepseek' || agent.adapter === 'mcode' || agent.adapter === 'nika') await runner!.updateConfig(config)
+      if (config.worktree || session.config.requirementId || agent.adapter === 'kimi' || agent.adapter === 'deepseek' || agent.adapter === 'mcode' || agent.adapter === 'nika') await runner!.updateConfig(config)
       if (this.protocolPendingStarts.get(session.id) !== startToken) return
       this.protocolPendingStarts.delete(session.id)
       if (this.sessions.get(session.id) !== session || session.status === 'cancelling') return
@@ -7021,8 +7841,10 @@ export class Orchestrator extends EventEmitter {
       if (this.sessions.get(session.id) !== session) return
       if (!started && this.protocolPendingStarts.get(session.id) !== startToken) return
       this.protocolPendingStarts.delete(session.id)
-      this.record(session.id, { type: 'error', state: 'failed', payload: { message: String(error) } })
-      this.setStatus(session, 'error')
+      this.record(session.id, { type: 'error', state: 'failed', payload: { message: String(error),
+        ...(!started && error instanceof DeepSeekHostError ? { code: error.code, nativeSubmission: 'not-submitted', routedInputId } : {}) } })
+      if (!started) this.record(session.id, { type: 'turn_completed', state: 'failed', payload: { nativeSubmission: 'not-submitted', routedInputId } })
+      this.finishFailedTurn(session)
     })
   }
 
@@ -7047,6 +7869,10 @@ export class Orchestrator extends EventEmitter {
     })
     runner.on('event', (ev: UAEvent) => {
       if (!ownsRunner()) return
+      ev = this.trackRecoveryEvent(session, ev)
+      if (session.config.managedPurpose === 'router' && ev.type === 'error' && ev.payload.nativeSubmission === 'not-submitted') {
+        ev = { ...ev, payload: { ...ev.payload, routedInputId: this.currentTurnInput(session)?.payload.routedInputId } }
+      }
       if (ev.type === 'turn_completed') this.channelSendTurns.delete(session.id)
       const events = this.events.get(session.id)
       if (events) appendEventSnapshot(events, ev)
@@ -7132,18 +7958,8 @@ export class Orchestrator extends EventEmitter {
           }
           if (session.status === 'error') return
         }
-        if (failed && ['kimi','grok','deepseek','mcode','nika'].includes(session.config.agentId)) {
-          const activeId = this.activeQueueItems.get(session.id)
-          if (activeId) {
-            try {
-              if (authRequired) this.removeDeliveredQueueItem(session, activeId)
-              else this.commitQueue(session, (this.queues.get(session.id) || []).map(item => item.id === activeId ? { ...item, state: 'pending', deliveryUncertain: true } : item))
-              this.activeQueueItems.delete(session.id); this.emitQueue(session.id)
-            } catch { /* Retain dispatching state: restart will not replay it. */ }
-          }
-        }
-        if (failed && (['kimi','grok','deepseek','mcode','nika'].includes(session.config.agentId) || (this.queues.get(session.id)?.length ?? 0) === 0)) {
-          this.setStatus(session, 'error')
+        if (failed) {
+          this.finishFailedTurn(session)
         } else {
           this.afterTurn(session, interrupted)
         }
@@ -7162,37 +7978,47 @@ export class Orchestrator extends EventEmitter {
   }
 
   /** Claude reuses its SDK owner; fallback adapters create one runner per turn. */
-  private runOneShot(
-    session: Session,
-    agent: AgentDef,
-    prompt: string,
-    attachments?: Attachment[],
-    config: SessionConfig = session.config
-  ): void {
-    const existing = agent.adapter === 'claude' ? this.claudeSdkRunners.get(session.id) : undefined
-    if (existing) {
-      this.runners.set(session.id, existing)
-      existing.configureClaudeGoal(session.goal)
-      existing.start(agent, config, prompt, session.nativeSessionId, attachments, session.pendingClaudeFork)
-      return
-    }
-    const ref = this.seqRefs.get(session.id)!
-    const runner = new TurnRunner(session.id, ref)
+  private runOneShot(session: Session, agent: AgentDef, prompt: string, attachments?: Attachment[], config: SessionConfig = session.config): void {
+    const runner = this.ensureTurnRunner(session, agent)
     this.runners.set(session.id, runner)
-    if (agent.adapter === 'claude') this.claudeSdkRunners.set(session.id, runner)
-    if (agent.adapter === 'claude') runner.configureClaudeGoal(session.goal)
+    runner.configureClaudeGoal(session.goal)
+    runner.start(agent, config, prompt, session.nativeSessionId, attachments, session.pendingClaudeFork)
+  }
+
+  private ensureTurnRunner(session: Session, agent: AgentDef): TurnRunner {
+    const persistent = agent.adapter === 'claude' || agent.adapter === 'qoder'
+    const existing = persistent ? this.sdkRunners.get(session.id) : undefined
+    if (existing) return existing
+    const ref = this.seqRefs.get(session.id)!
+    const runner = agent.adapter === 'qoder' ? new QoderRunner(session.id, ref) : new TurnRunner(session.id, ref)
+    if (persistent) this.sdkRunners.set(session.id, runner)
     runner.on('goalChanged', (goal: GoalState | undefined) => {
-      if (this.claudeSdkRunners.get(session.id) === runner && this.sessions.get(session.id) === session) this.updateGoalState(session, goal)
+      if (this.sdkRunners.get(session.id) === runner && this.sessions.get(session.id) === session) this.updateGoalState(session, goal)
+    })
+    runner.on('titleChanged', (title: string) => {
+      if (this.sdkRunners.get(session.id) !== runner || this.sessions.get(session.id) !== session || session.titleLocked ||
+          !title?.trim() || this.sessionTitleGenerationPolicy?.(session) === false) return
+      session.title = title.trim(); session.titleLocked = true; session.updatedAt = Date.now()
+      this.persist(); this.emit('sessionUpdated', { session, hasLiveStreamer: false })
+    })
+    runner.on('planModeChanged', (plan: { active: boolean }) => {
+      if (this.sdkRunners.get(session.id) !== runner || this.sessions.get(session.id) !== session) return
+      session.config = { ...session.config, collaborationMode: plan.active ? 'plan' : 'default' }
+      this.persist(); this.emit('sessionUpdated', { session, hasLiveStreamer: false })
     })
 
     runner.on('event', (ev: UAEvent) => {
-      if ((this.runners.get(session.id) !== runner && this.claudeSdkRunners.get(session.id) !== runner) || this.sessions.get(session.id) !== session) return
+      if ((this.runners.get(session.id) !== runner && this.sdkRunners.get(session.id) !== runner) || this.sessions.get(session.id) !== session) return
+      ev = this.trackRecoveryEvent(session, ev)
       ev = withPlanText(ev, this.events.get(session.id) || [])
       this.captureTurnEvent(session, ev)
-      if (ev.type === 'turn_completed') this.channelSendTurns.delete(session.id)
-      if (session.pendingClaudeFork && ev.type === 'turn_started' && ev.payload.sessionId) {
-        delete session.pendingClaudeFork
-        this.assignNativeSessionId(session, ev.payload.sessionId)
+      if (ev.type === 'turn_completed' && !ev.payload.recoveryIntermediate) this.channelSendTurns.delete(session.id)
+      if (ev.type === 'turn_started') {
+        const nativeSessionId = ev.payload.threadId ?? ev.payload.sessionId
+        if (typeof nativeSessionId === 'string' && nativeSessionId.trim()) {
+          if (session.pendingClaudeFork && ev.payload.sessionId) delete session.pendingClaudeFork
+          if (nativeSessionId.trim() !== session.nativeSessionId) this.assignNativeSessionId(session, nativeSessionId.trim())
+        }
       }
       const buffer = this.events.get(session.id)
       if (buffer) appendEventSnapshot(buffer, ev)
@@ -7224,22 +8050,15 @@ export class Orchestrator extends EventEmitter {
       this.completedSubAgentItems.set(session.id, details)
       this.runners.delete(session.id)
       if (failed) {
-        const activeId = this.activeQueueItems.get(session.id)
-        if (activeId) {
-          this.restoreQueueItemsToPending(
-            session,
-            (item) => item.id === activeId,
-            'Claude 启动或执行失败，消息已恢复为可重试状态。',
-            { releaseActiveItemId: activeId }
-          )
-        }
-        this.setStatus(session, 'error')
+        if (this.errorRecovery && await this.recoverTerminalFailure(session, interrupted)) return
+        if (this.sessions.get(session.id) !== session || this.runners.has(session.id)) return
+        this.finishFailedTurn(session)
         return
       }
       this.afterTurn(session, interrupted)
     })
 
-    runner.start(agent, config, prompt, session.nativeSessionId, attachments, session.pendingClaudeFork)
+    return runner
   }
 }
 
@@ -7282,7 +8101,7 @@ function planCollaborationTransportError(
   config: SessionConfig
 ): string | undefined {
   if (config.collaborationMode !== 'plan') return undefined
-  if (agent.adapter === 'claude') return undefined
+  if (agent.adapter === 'claude' || agent.adapter === 'qoder') return undefined
   if (isACPAdapter(agent.adapter) || agent.adapter === 'zcode') return undefined
   if (agent.adapter !== 'codex' && agent.adapter !== 'traex') {
     return 'plan_collaboration_requires_app_server'
@@ -7291,7 +8110,8 @@ function planCollaborationTransportError(
   return undefined
 }
 
-function agentRunRoute(agent: AgentDef): 'protocol' | 'app-server' | 'one-shot' | 'zcode' {
+function agentRunRoute(agent: AgentDef, config: SessionConfig): 'protocol' | 'app-server' | 'one-shot' | 'zcode' {
+  if (agent.adapter === 'traex' && config.managedPurpose === 'router') return 'one-shot'
   if (agent.adapter === 'zcode') return 'zcode'
   if (agent.capabilities.protocol === 'acp' || agent.capabilities.protocol === 'web') return 'protocol'
   return usesAppServer(agent) ? 'app-server' : 'one-shot'

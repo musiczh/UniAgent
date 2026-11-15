@@ -1,5 +1,5 @@
 import './assistant.css'
-import { resolveAgentModel, resolveModelEffort, resolveModelThinking, supportsModelImages } from '@shared/agentChoices'
+import { resolveAgentModel, resolveModelEffort, resolveModelThinking, supportsModelImages, withLastAgentChoices } from '@shared/agentChoices'
 import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type {
   AgentDef,
@@ -44,8 +44,10 @@ import { SendIcon, StopIcon, UiIcon, Chevron } from './Icons'
 import { SubmenuPopover } from './SubmenuPopover'
 import { TeamSessionContext } from './TeamSessionExtras'
 import { MarkdownEditor } from './MarkdownEditor'
+import { QuickReplyComposerContext } from './QuickReplyComposerContext'
 import type { ComposerPasteEvent, MarkdownInputHandle } from '../markdownInput'
 import type { Annotation } from '../textAnnotations'
+import { animateSentContent, cancelSendOrigin, captureSendOrigin } from '../conversationMotion'
 
 const EFFORT_LABEL: Record<ReasoningEffort, string> = {
   off: '关闭',
@@ -58,6 +60,8 @@ const EFFORT_LABEL: Record<ReasoningEffort, string> = {
 }
 // ponytail: process-local drafts; persist only if they must survive an App restart.
 const draftBySession = new Map<string, { draft: ComposerDraftSeed; owner: symbol }>()
+
+export interface ComposerPrefill { text: string; nonce: number; sessionId?: string; append?: boolean }
 
 export function Composer({
   sessionId,
@@ -80,6 +84,7 @@ export function Composer({
   draftSeed,
   onConsumeDraftSeed,
   contextUsed,
+  contextUsedPercentage,
   contextWindow,
   onCompact,
   canCompact,
@@ -123,6 +128,7 @@ export function Composer({
   draftSeed?: ComposerDraftSeed | null
   onConsumeDraftSeed?: (seed: ComposerDraftSeed) => void
   contextUsed: number
+  contextUsedPercentage?: number
   contextWindow?: number
   onCompact: () => Promise<void>
   canCompact: boolean
@@ -137,13 +143,8 @@ export function Composer({
   onEnableToolSession?: () => Promise<void>
   refreshingNativeSession?: boolean
   onRefreshNativeSession?: () => void | Promise<void>
-  /**
-   * 需求3（回退回填）— when a rewind resolves, App passes the target turn's user
-   * text plus a monotonically-changing `nonce`. The composer loads it into the
-   * input and focuses, without auto-sending. The nonce lets the same text be
-   * re-applied after edits.
-   */
-  prefill?: { text: string; nonce: number }
+  /** 回退替换输入，合并指令追加；只预填并聚焦，不自动发送。 */
+  prefill?: ComposerPrefill
   /**
    * 选中即评论 →「评论」— confirmed annotations pinned to the composer's 待评论托盘
    * (引用 + 可选评论). They persist per session (localStorage) and ride along with
@@ -157,6 +158,7 @@ export function Composer({
   allowRoleConfig?: boolean
 }): JSX.Element {
   const teamSession = useContext(TeamSessionContext)
+  const quickReply = useContext(QuickReplyComposerContext)
   const teamName = teamSession?.project.team.name
   const draftOwnerRef = useRef(Symbol('composer-draft'))
   const cachedDraftRef = useRef(sessionId ? draftBySession.get(sessionId)?.draft : undefined)
@@ -176,7 +178,7 @@ export function Composer({
   // opens a second-level list to its RIGHT (side-by-side), top-aligned to that
   // row, WITHOUT closing the main popover. Re-clicking the same row collapses it;
   // clicking the other row swaps the side list. Reset whenever the menu closes.
-  const [activeSub, setActiveSub] = useState<'model' | 'effort' | null>(null)
+  const [activeSub, setActiveSub] = useState<'model' | 'effort' | 'qoder-context' | null>(null)
   // 需求（队列二次编辑）— when set, the composer is rewriting this pending queue
   // item in place: its text/images are loaded back into the same input, and the
   // primary action swaps to a single 保存 button. While editing, this item (and
@@ -210,7 +212,7 @@ export function Composer({
   const preparing = compacting || preparingModel
   // 跨来源模型切换期间直接屏蔽输入：不再显示压缩横幅，输入框与发送均锁定，草稿保留。
   const switchBusy = preparingModel || providerSwitchCompacting
-  const queueBusy = isSessionBusy(runtimeStatus ?? status)
+  const queueBusy = isSessionBusy(runtimeStatus ?? status) || compacting
   const providerDisabled = !!disabled || !!toolSessionReadOnly || !!sessionExternallyOccupied || !agent || agent.installed === false || !!agent.incompatible
   const canSteer = agent?.capabilities.steer === true
   // Missing optional flags retain legacy providers' attachment behavior; ACP
@@ -249,21 +251,37 @@ export function Composer({
     return () => { cancelled = true; window.removeEventListener('uniagent-presets-changed', loadPresets) }
   }, [])
 
-  // 需求3（回退回填）— apply the rewound turn's user text into the input and
-  // focus, without auto-sending. Keyed on nonce so App can re-apply the same
-  // text after a subsequent rewind; a ref guards against clobbering live edits
-  // on unrelated re-renders.
+  // nonce 防止普通重渲染覆盖草稿；sessionId 限制合并指令的目标任务。
   const prefillNonceRef = useRef<number | undefined>(prefill?.nonce)
   useEffect(() => {
     if (!prefill || prefill.nonce === prefillNonceRef.current) return
     prefillNonceRef.current = prefill.nonce
-    setText(prefill.text)
+    if (prefill.sessionId && prefill.sessionId !== sessionId) return
+    if (prefill.append && (providerDisabled || switchBusy)) return
+    setText(current => {
+      if (!prefill.append) return prefill.text
+      if (current.includes(prefill.text)) return current
+      return current.trim() ? current + '\n\n' + prefill.text : prefill.text
+    })
     requestAnimationFrame(() => {
       const ta = taRef.current
       if (!ta) return
       ta.focus('end')
     })
-  }, [prefill])
+  }, [prefill, sessionId, providerDisabled, switchBusy])
+
+  const quickReplyKeyRef = useRef('')
+  useEffect(() => {
+    if (!quickReply?.selection || quickReply.sessionId !== sessionId) return
+    const key = `${quickReply.sessionId}:${quickReply.selection.nonce}`
+    if (quickReplyKeyRef.current === key) return
+    quickReplyKeyRef.current = key
+    quickReply.onConsumed?.(quickReply.selection.nonce)
+    if (providerDisabled || switchBusy) return
+    const reply = quickReply.selection.text
+    setText(current => current.trim() ? current + '\n' + reply : reply)
+    requestAnimationFrame(() => taRef.current?.focus('end'))
+  }, [quickReply, sessionId, providerDisabled, switchBusy])
 
   // 选中即评论 — the 待评论托盘 defaults to COLLAPSED (a single `💬 N 条待评论`
   // summary row); clicking it expands the per-comment card list. A new comment
@@ -434,7 +452,8 @@ export function Composer({
       attachment.kind === 'image' ? canAttachImages : canAttachFiles
     )
     const delivery = buildComposerDelivery(command, text, outgoingAttachments, selectedIds, trayComments, agent?.adapter)
-    if (!delivery || providerDisabled || preparing || (force && !canSteer)) return
+    if (!delivery || providerDisabled || switchBusy ||
+        (compacting && (force || command !== null)) || (force && !canSteer)) return
     if (delivery.kind === 'goal' && (busy || force)) return
     if (sendingRef.current) return
     if (delivery.kind === 'goal') {
@@ -442,6 +461,8 @@ export function Composer({
       catch (error) { setSendError(error instanceof Error ? error.message : String(error)); return }
     }
     // While busy, a normal send enqueues (orchestrator decides); force steers.
+    const clientTurnKey = captureSendOrigin(composerRef.current?.querySelector<HTMLElement>('.composer-box') || composerRef.current,
+      delivery.kind === 'goal' ? `session:${sessionId}` : undefined)
     setSendError(undefined)
     const draftAtSend = draftRef.current
     const attachmentsAtSend = attachments.map((attachment) => ({
@@ -491,7 +512,7 @@ export function Composer({
           runNativeAction: onRunNativeAction,
           send: onSend,
           forceSend: onForceSend
-        }),
+        }, clientTurnKey),
         () => {
           if (delivery.kind !== 'goal' && !clearedDraft && shouldResetComposerDraft(draftRef.current, draftAtSend)) {
             reset()
@@ -522,6 +543,7 @@ export function Composer({
         setCommand(draftAtSend.command)
       }
       setSendError(error)
+      if (error) cancelSendOrigin(clientTurnKey)
     } finally {
       sendingRef.current = false
       setSending(false)
@@ -655,7 +677,7 @@ export function Composer({
   }
 
   const prefs = useAgentPreferences()
-  const pref = prefs?.lastByAgent[agent?.id || '']
+  const pref = withLastAgentChoices(prefs?.lastByAgent[agent?.id || ''])
   const canConfigure = !busy && !preparing && !!agent && !providerDisabled
   const canSelectModel = canConfigure || (agent?.adapter === 'claude' && !preparing && !providerDisabled)
   const modelDef: ModelDef | undefined = resolveAgentModel(agent, config.model, pref?.defaultModel)
@@ -707,7 +729,9 @@ export function Composer({
             <span className="queue-hint">
               {editingQueueId
                 ? `任务 ${pendingQueue.findIndex((q) => q.id === editingQueueId) + 1} 正在编辑`
-                : '本轮结束后按顺序自动发送'}
+                : compacting && canForceInsert
+                  ? '压缩完成后可直接发送 · 本轮结束后按顺序自动发送'
+                  : '本轮结束后按顺序自动发送'}
             </span>
           </div>
           {pendingQueue.map((q, i) => {
@@ -717,7 +741,8 @@ export function Composer({
             const isEditing = editingQueueId === q.id
             return (
             <div
-              key={q.id}
+              key={q.clientTurnKey || q.id}
+              ref={node => { animateSentContent(node, q.clientTurnKey) }}
               className={`queue-card${optimistic ? ' is-entering' : ''}${isEditing ? ' is-editing' : ''}`}
               title={q.prompt}
             >
@@ -734,24 +759,25 @@ export function Composer({
                 </span>
               )}
               {!optimistic && !composerLocked && <div className="queue-card-acts">
-                {canSteer && (
+                {canSteer && !config.managedPurpose && (
                   <button
                     className="queue-act queue-steer"
-                    onClick={() => onPromoteQueue(q.id)}
-                    title="直接发送"
+                    onClick={() => { if (!compacting && !switchBusy) onPromoteQueue(q.id) }}
+                    disabled={compacting || switchBusy}
+                    title={compacting ? '上下文正在压缩，完成后可直接发送' : switchBusy ? '正在切换模型，请等待准备完成' : '直接发送'}
                     aria-label="直接发送"
                   >
                     <UiIcon name="arrow-up" size={16} />
                   </button>
                 )}
-                <button
+                {!config.managedPurpose && <button
                   className={`queue-act queue-edit${isEditing ? ' is-editing' : ''}`}
                   onClick={() => (isEditing ? cancelEditQueueItem() : beginEditQueueItem(q))}
                   title={isEditing ? '取消编辑' : '编辑'}
                   aria-label={isEditing ? '取消编辑' : '编辑等待消息'}
                 >
                   <UiIcon name="edit" size={16} />
-                </button>
+                </button>}
                 <button
                   className="queue-act queue-del"
                   onClick={() => void dequeueQueueItem(q.id)}
@@ -899,7 +925,8 @@ export function Composer({
           cards, not crammed inside the input row (rendered before this card). */}
       <div className="composer">
         <div className="composer-main">
-          {command === 'goal' && ['deepseek', 'grok', 'kimi', 'mcode'].includes(agent?.adapter || '') && <NativeGoalOptions provider={agent?.adapter} value={agent?.adapter === 'grok' || agent?.adapter === 'mcode' ? goalTokenBudget : goalMaxRounds} disabled={providerDisabled || busy || sending} onChange={agent?.adapter === 'grok' || agent?.adapter === 'mcode' ? setGoalTokenBudget : setGoalMaxRounds} />}
+          {command === 'goal' && ['deepseek', 'grok', 'kimi', 'mcode', 'qoder'].includes(agent?.adapter || '') && <NativeGoalOptions provider={agent?.adapter} value={agent?.adapter === 'grok' || agent?.adapter === 'mcode' || agent?.adapter === 'qoder' ? goalTokenBudget : goalMaxRounds} disabled={providerDisabled || busy || sending} onChange={agent?.adapter === 'grok' || agent?.adapter === 'mcode' || agent?.adapter === 'qoder' ? setGoalTokenBudget : setGoalMaxRounds} />}
+          {command === 'goal' && agent?.adapter === 'qoder' && <div className="native-goal-options candidate-hint"><label>最多回合 <input className="native-goal-rounds-input" type="number" min="1" step="1" aria-label="Qoder Goal 最多回合" value={goalMaxRounds} disabled={providerDisabled || busy || sending} onChange={event => setGoalMaxRounds(event.target.value)} /></label><span>由 Qoder 原生限制轮次</span></div>}
           {slashOpen && (
             <SlashMenu
               hits={slashHits}
@@ -917,9 +944,11 @@ export function Composer({
           {queueBusy && hasContent && !sending && !editingQueueId && (
             <div className="candidate-hint">
               待发送：按 <b>⌘⏎</b> 加入等待队列
-              {canForceInsert
-                ? ' · 需要立即打断可在队列里点「直接发送」'
-                : ' · 本轮结束后按顺序自动发送'}
+              {compacting && canForceInsert
+                ? ' · 压缩完成后可在队列里点「直接发送」'
+                : canForceInsert
+                  ? ' · 需要立即打断可在队列里点「直接发送」'
+                  : ' · 本轮结束后按顺序自动发送'}
             </div>
           )}
           <MarkdownEditor
@@ -927,7 +956,11 @@ export function Composer({
             className="composer-input"
             placeholder={inputPlaceholder || (
               queueBusy
-                ? canForceInsert
+                ? compacting
+                  ? canForceInsert
+                    ? '上下文压缩中…输入后按 ⌘⏎ 加入等待队列，压缩完成后可直接发送'
+                    : '上下文压缩中…输入后按 ⌘⏎ 加入等待队列，本轮结束自动发送'
+                  : canForceInsert
                   ? '运行中…输入后按 ⌘⏎ 加入等待队列，本轮结束自动发送（可在队列里选择直接发送）'
                   : '运行中…输入后按 ⌘⏎ 加入等待队列，本轮结束自动发送'
                 : canAttachImages
@@ -1005,7 +1038,7 @@ export function Composer({
           </div>
         </details>
         {<>
-        {(agent?.capabilities.permissionModes.length ?? 0) > 0 && (
+        {!config.managedPurpose && (agent?.capabilities.permissionModes.length ?? 0) > 0 && (
           <label className="sb-cfg">
             <select
               value={config.permissionMode || ''}
@@ -1034,8 +1067,8 @@ export function Composer({
           mode={config.collaborationMode || 'default'}
           onExit={() => onSetCollaborationMode('default')}
         />}
-        {!teamName && agent && (roleLocked ? (
-          <span className="sb-effort-btn is-locked" title={`角色 ${roleSnapshot?.name} 已锁定运行画像`}>
+        {!teamName && agent && (roleLocked || config.managedPurpose==='router' ? (
+          <span className="sb-effort-btn is-locked" title={config.managedPurpose==='router'?'Router 运行配置在 superAgent配置中修改':`角色 ${roleSnapshot?.name} 已锁定运行画像`}>
             {showFast && config.fastMode && <span className="sb-flash" aria-hidden><UiIcon name="zap" size={13} /></span>}
             <span className="sb-effort-ico" aria-hidden><AgentIcon agentId={agent.id} adapter={agent.adapter} size={14} /></span>
             {agent.capabilities.modelSelect && <span className="sb-effort-model">{modelLabel}</span>}
@@ -1096,6 +1129,7 @@ export function Composer({
                             e.currentTarget.closest('details')?.removeAttribute('open')
                             setActiveSub(null)
                             onUpdateConfig({ model: m.id, modelSource: m.modelSource,
+                              ...(agent.adapter === 'qoder' ? { qoderContextWindow: m.qoderContextWindows?.includes(config.qoderContextWindow || 0) ? config.qoderContextWindow : undefined, qoderThinkingDisabled: m.qoderThinkingDisabled ? config.qoderThinkingDisabled : undefined } : {}),
                               effort: !nativeThinking && agent.capabilities.reasoningEffort ? resolveModelEffort(m, config.effort, pref?.defaultEffort) : undefined,
                               ...(kimi ? { kimiThinking: resolveModelThinking(m, config.kimiThinking, pref?.defaultThinking, pref?.defaultEffort) } : {}),
                               ...(zcode ? { zcodeModelSelection: m.zcodeSelection && { ...m.zcodeSelection, options: { ...m.zcodeSelection.options, reasoningLevel: resolveModelThinking(m, config.zcodeModelSelection?.options?.reasoningLevel, pref?.defaultThinking, pref?.defaultEffort) } } } : {}) })
@@ -1139,7 +1173,7 @@ export function Composer({
                           aria-selected={selectedEffort === ef}
                           className={`sb-menu-item sb-sub-opt ${selectedEffort === ef ? 'is-sel' : ''}`}
                           disabled={!canSelectModel}
-                          onClick={() => onUpdateConfig(kimi ? { kimiThinking: ef } : zcode ? { effort: undefined, zcodeModelSelection: { ...modelDef!.zcodeSelection!, options: { reasoningLevel: ef } } } : { effort: ef as ReasoningEffort })}
+                          onClick={() => onUpdateConfig(kimi ? { kimiThinking: ef } : zcode ? { effort: undefined, zcodeModelSelection: { ...modelDef!.zcodeSelection!, options: { reasoningLevel: ef } } } : { effort: ef as ReasoningEffort, ...(agent.adapter === 'qoder' ? { qoderThinkingDisabled: false } : {}) })}
                         >
                           <span className="sb-sub-radio" aria-hidden />
                           <span className="sb-entry-body">{effortLabel(ef)}</span>
@@ -1150,6 +1184,11 @@ export function Composer({
                   )}
                 </div>
               )}
+              {agent.adapter === 'qoder' && !!modelDef?.qoderContextWindows?.length && <div className="sb-sub-wrap">
+                <button type="button" className="sb-menu-item sb-sub-entry" disabled={!canConfigure} aria-expanded={activeSub === 'qoder-context'} onClick={() => setActiveSub(value => value === 'qoder-context' ? null : 'qoder-context')}><UiIcon name="sliders" size={14} /><span className="sb-entry-body">上下文窗口<small>{(config.qoderContextWindow || modelDef.contextWindow)?.toLocaleString()}</small></span><UiIcon name="chevron-right" size={13} /></button>
+                {activeSub === 'qoder-context' && <SubmenuPopover>{modelDef.qoderContextWindows.map(window => <button key={window} type="button" role="option" aria-selected={(config.qoderContextWindow || modelDef.contextWindow) === window} className={`sb-menu-item sb-sub-opt ${(config.qoderContextWindow || modelDef.contextWindow) === window ? 'is-sel' : ''}`} disabled={!canConfigure} onClick={() => onUpdateConfig({ qoderContextWindow: window })}><span className="sb-sub-radio" /><span className="sb-entry-body">{window.toLocaleString()} Token</span></button>)}</SubmenuPopover>}
+              </div>}
+              {agent.adapter === 'qoder' && modelDef?.qoderThinkingDisabled && <button type="button" className="sb-menu-item sb-switch-row" role="switch" aria-checked={config.qoderThinkingDisabled === true} disabled={!canConfigure} onClick={() => onUpdateConfig({ qoderThinkingDisabled: !config.qoderThinkingDisabled })}><UiIcon name="sliders" size={14} /><span className="sb-entry-body">关闭思考</span></button>}
               {(showFast || showMax) && (
                 <>
                   <div className="sb-menu-sep" role="separator" />
@@ -1200,6 +1239,7 @@ export function Composer({
         <div className="sb-primary-actions">
           {<ContextMeter
             used={contextUsed}
+            usedPercentage={contextUsedPercentage}
             window={contextWindow}
             onCompact={onCompact}
             canCompact={canCompact}
@@ -1238,7 +1278,8 @@ export function Composer({
                   ? !text.trim()
                   : !text.trim() && supportedAttachments.length === 0 && trayComments.length === 0) ||
                 providerDisabled ||
-                preparing ||
+                switchBusy ||
+                (compacting && command !== null) ||
                 sending ||
                 (busy && command !== null)
               }
@@ -1462,21 +1503,22 @@ export function buildNativeGoalRoundLimit(value: string): { maxRounds?: number }
 
 export function buildNativeGoalLimits(provider: AgentDef['adapter'] | undefined, values: { maxRounds?: string; tokenBudget?: string }): { maxRounds?: number; tokenBudget?: number } {
   if (provider === 'deepseek') return buildNativeGoalRoundLimit(values.maxRounds || '')
-  if (provider !== 'grok' && provider !== 'mcode') return {}
+  if (provider !== 'grok' && provider !== 'mcode' && provider !== 'qoder') return {}
   const trimmed = (values.tokenBudget || '').trim()
-  if (!trimmed) return {}
+  const rounds = provider === 'qoder' && values.maxRounds?.trim() ? buildNativeGoalRoundLimit(values.maxRounds) : {}
+  if (!trimmed) return rounds
   const tokenBudget = Number(trimmed)
   if (!/^\d+$/.test(trimmed) || !Number.isSafeInteger(tokenBudget) || tokenBudget < 1) throw new Error('Token 预算必须是正整数')
-  return { tokenBudget }
+  return { ...rounds, tokenBudget }
 }
 
 export function NativeGoalOptions({ provider = 'deepseek', value, disabled, onChange }: { provider?: AgentDef['adapter']; value: string; disabled: boolean; onChange: (value: string) => void }): JSX.Element {
   if (provider === 'kimi') return <div className="native-goal-options candidate-hint"><span>原生 Goal · 预算不可设置</span></div>
-  const grok = provider === 'grok' || provider === 'mcode'
+  const grok = provider === 'grok' || provider === 'mcode' || provider === 'qoder'
   const label = grok ? 'Token 预算' : '最多回合'
   return <div className="native-goal-options candidate-hint">
-    <label>{label} <input className="native-goal-rounds-input" type="number" min="1" step="1" placeholder="官方默认" aria-label={`${provider === 'mcode' ? 'MiniMax Code' : grok ? 'Grok' : 'DeepSeek'} Goal ${label}`} value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} /></label>
-    <span>{grok ? '原生 Goal · 留空使用默认预算' : '由 DeepSeek Harness 自动继续'}</span>
+    <label>{label} <input className="native-goal-rounds-input" type="number" min="1" step="1" placeholder={provider === 'qoder' ? '留空不设置' : '官方默认'} aria-label={`${provider === 'qoder' ? 'Qoder' : provider === 'mcode' ? 'MiniMax Code' : grok ? 'Grok' : 'DeepSeek'} Goal ${label}`} value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} /></label>
+    <span>{grok ? provider === 'qoder' ? '未提供可核验 Token 时停止预算任务；留空使用原生轮次限制' : '原生 Goal · 留空使用默认预算' : '由 DeepSeek Harness 自动继续'}</span>
   </div>
 }
 
@@ -1555,14 +1597,15 @@ export async function dispatchComposerDelivery(
       selection?: NativeTurnSelectionRequest,
       bubble?: TurnBubbleInput
     ) => void | Promise<void>
-  }
+  },
+  clientTurnKey?: string
 ): Promise<void> {
   if (delivery.kind === 'goal') {
     await handlers.runNativeAction(delivery.action)
     return
   }
-  const bubble: TurnBubbleInput | undefined = delivery.comments?.length
-    ? { comments: delivery.comments, displayText: delivery.displayText }
+  const bubble: TurnBubbleInput | undefined = delivery.comments?.length || clientTurnKey
+    ? { ...(delivery.comments?.length ? { comments: delivery.comments, displayText: delivery.displayText } : {}), ...(clientTurnKey ? { clientTurnKey } : {}) }
     : undefined
   if (force) {
     await handlers.forceSend(delivery.prompt, delivery.attachments, delivery.selection, bubble)

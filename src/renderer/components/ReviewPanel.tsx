@@ -271,7 +271,7 @@ export function ReviewPanel({
 
   return (
     <div className={`review-overlay ${coverSidebar ? 'is-cover' : ''} ${closing ? 'is-closing' : ''}`}>
-      <header className="scene-head">
+      <header className="scene-head responsive-toolbar">
         <div className="titles">
           <h1>代码审查</h1>
           <p>{scopeCopy.subtitle}</p>
@@ -295,12 +295,12 @@ export function ReviewPanel({
             </button>
           )}
           <button
-            className="scene-back-btn"
+            className="scene-back-btn toolbar-action"
             title="返回会话 (Esc)"
             aria-label="返回会话"
             onClick={requestClose}
           >
-            <UiIcon name="back" size={15} /> 返回会话
+            <UiIcon name="back" size={15} /><span className="toolbar-action-label">返回会话</span>
           </button>
         </div>
       </header>

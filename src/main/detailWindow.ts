@@ -1,6 +1,6 @@
 import { BrowserWindow, ipcMain, type IpcMainInvokeEvent } from 'electron'
 import { pathToFileURL } from 'node:url'
-import { type Session, type FilePreviewOptions, type FilePreviewResult } from '../shared/types'
+import { type Session, type FilePreviewOptions, type FilePreviewResult, type ThemePreference } from '../shared/types'
 import type { DetailExplanationContext } from '../shared/detailQuickChat'
 import type { Orchestrator } from './orchestrator'
 
@@ -13,16 +13,17 @@ export class DetailWindow {
     main(): BrowserWindow | null | undefined
     ui(path: string): string
     ready(sessionId: string): Promise<void>
+    theme(): ThemePreference | undefined
     readFile?(sessionId: string, path: string, options?: FilePreviewOptions, root?: string): Promise<FilePreviewResult>
   }) {}
   register(): void {
-    ipcMain.handle('detailWindow:action', async (event, action: string, value?: unknown) => {
+    ipcMain.handle('detailWindow:action', async (event, action: string, value?: unknown, clientTurnKey?: unknown) => {
       const entry = this.authorize(event)
       const { owner } = this.deps
       const id = entry.sessionId
       owner.assertUserSessionEnabled(id)
       switch (action) {
-        case 'initial': return { sessionId: id, quote: entry.context.selectedText, selectedMessageText: entry.context.selectedMessageText, nonce: entry.nonce }
+        case 'initial': return { sessionId: id, quote: entry.context.selectedText, selectedMessageText: entry.context.selectedMessageText, nonce: entry.nonce, theme: this.deps.theme() }
         case 'explain': {
           if (!entry.started) entry.started = this.deps.ready(id).then(() => {
             if (this.current !== entry || entry.window.isDestroyed()) return
@@ -36,7 +37,7 @@ export class DetailWindow {
         case 'send':
           if (typeof value !== 'string' || !value.trim()) throw new Error('请填写问题')
           await this.deps.ready(id)
-          return owner.sendDetailMessage(id, value)
+          return owner.sendDetailMessage(id, value, undefined, typeof clientTurnKey === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(clientTurnKey) ? { clientTurnKey } : undefined)
         case 'interrupt': return owner.interruptDetail(id)
         case 'readFile': {
           const request = value as { path?: string; options?: FilePreviewOptions; root?: string }
@@ -80,7 +81,7 @@ export class DetailWindow {
     const bounds = this.deps.main()?.getBounds()
     const window = new BrowserWindow({ width: 396, height: 480, minWidth: 396, minHeight: 480,
       x: bounds ? bounds.x + bounds.width - 420 : undefined, y: bounds ? bounds.y + 100 : undefined,
-      show: false, frame: false, transparent: true, hasShadow: true, resizable: false, title: '解释',
+      show: true, frame: false, transparent: true, hasShadow: true, resizable: false, title: '解释',
       webPreferences: { preload: this.deps.ui('preload/index.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: false,
         additionalArguments: ['--ua-detail-window'] } })
     const entry = { window, sessionId, context, nonce: Date.now() }
@@ -88,11 +89,14 @@ export class DetailWindow {
     window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
     window.webContents.on('will-navigate', event => event.preventDefault())
     window.on('closed', () => { if (this.current === entry) { this.current = undefined; this.deps.owner.closeDetail(sessionId) } })
-    window.once('ready-to-show', () => window.show())
     try {
       if (process.env.ELECTRON_RENDERER_URL) await window.loadURL(new URL('detail.html', process.env.ELECTRON_RENDERER_URL).href)
       else await window.loadFile(this.deps.ui('renderer/detail.html'))
-    } catch (error) { window.close(); throw error }
+    } catch (error) {
+      if (window.isDestroyed()) return
+      window.close()
+      throw error
+    }
   }
   forward(channel: string, payload: { sessionId: string }): void {
     const entry = this.current

@@ -1,11 +1,16 @@
 import { agentInitializationPrompt } from '@shared/agentInitialization'
+import { sessionDisplayTitle } from '@shared/task'
+import { useSessionFork } from './components/SessionForkProgress'
 import { APP_NAME } from '@shared/distribution'
+import { applyColorTheme } from './colorTheme'
 import { pendingAgentDetection } from '@shared/agentReadiness'
 export { agentInitializationPrompt } from '@shared/agentInitialization'
 import { parseAssistantCommand } from '@shared/assistant'
+import type { AssistantConversationSelection } from '@shared/assistantConversation'
+import { deleteConfirmedSession, deleteSessionWithConfirmation, useSessionDeletions } from './sessionDeletion'
 import './components/requirements.css'
 import { useRequirements } from './useRequirements'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { createPortal } from 'react-dom'
 import { enterStartup, updateStartup } from './startup'
 import type {
@@ -44,7 +49,13 @@ import {
 } from '@shared/types'
 import { NewTaskPanel } from './components/NewTaskPanel'
 import { SessionConversation } from './components/SessionConversation'
+import { SessionTaskContent } from './components/TaskDetail'
+import { TaskGenerationConversation } from './components/TaskGenerationConversation'
+import { SessionHeader } from './components/SessionHeader'
+export { SessionHeader } from './components/SessionHeader'
 import { WorktreeCreation } from './components/WorktreeCreation'
+import { WorktreeArchiveReview } from './components/WorktreeArchiveReview'
+import { isArchiveCancelled } from '@shared/worktreeArchive'
 import { MemberSession } from './components/TeamWorkspace'
 import { TeamSessionProvider, TeamSummary } from './components/TeamSessionExtras'
 import { teamSessionEvents } from './teamTimeline'
@@ -52,10 +63,17 @@ import type { TeamCatalog, TeamCreateProjectInput } from '@shared/teamTypes'
 import { teamRowSessionId, teamRowSessionIds } from '@shared/teamAttention'
 import { teamSessionRows } from './teamSessions'
 import { SessionList, type ReplyUnreadKind } from './components/SessionList'
+import { SpaceRequirementNavigation, WorkspaceDetail, useWorkspaceData } from './components/WorkspaceBrowser'
+import { AssistantConversations } from './components/AssistantConversations'
+import { RouterPanel, type RouterPanelViewState } from './components/RouterPanel'
+import { TaskBoard } from './components/TaskBoard'
+import { BROWSER_LOCATION_KEY, readBrowserValue, saveBrowserValue, sessionBrowserLocation, type BrowserLocation } from './scopeBrowser'
 import { subAgentsFromEvents, TurnStatusBar, type HandoffSessionTarget } from './components/EventStream'
 import { isSessionBusy, sessionActivityStatus } from '@shared/sessionStatus'
+import type { SessionAttentionSnapshot } from '@shared/sessionAttention'
 import { interactionRequestKey, isAsyncQuestion, isPendingInteraction } from '@shared/interactionRequests'
-import { Composer, type ComposerDraftSeed } from './components/Composer'
+import { Composer, type ComposerDraftSeed, type ComposerPrefill } from './components/Composer'
+import { WORKTREE_MERGE_PROMPT } from '@shared/sessionWorktreeStatus'
 import { GoalStatusBar } from './components/GoalStatusBar'
 import {
   currentSessionForkTargets,
@@ -73,13 +91,13 @@ import type { CapabilityInventorySyncRequest } from '@shared/capabilitySync'
 import { SubAgentPanel } from './components/SubAgentPanel'
 import { SideChatPanel } from './components/SideChatPanel'
 import { CommentPanel } from './components/CommentPanel'
-import { COMMENT_ANNOTATION_PREFIX, useComments } from './comments'
-import type { CommentThread } from '@shared/comments'
+import { COMMENT_ANNOTATION_PREFIX, findCommentHighlight, useComments } from './comments'
+import { findCommentSource, type CommentThread } from '@shared/comments'
 import { QuotaHoverButton } from './components/QuotaHoverButton'
 import type { Annotation } from './textAnnotations'
 import { AgentIcon } from './components/AgentIcon'
 import { FolderIcon, SidebarIcon, UiIcon } from './components/Icons'
-import { displayedContextWindow } from './contextWindow'
+import { computeContext, displayedContextWindow } from './contextWindow'
 import { contextCompactionAvailability, supportsManualContextCompaction } from './contextCompaction'
 import { ReviewPanel } from './components/ReviewPanel'
 import { ModelPicker } from './components/ModelPicker'
@@ -88,7 +106,7 @@ import { ImmersiveReader } from './components/ImmersiveReader'
 import { TokenUsagePanel } from './components/TokenUsagePanel'
 import { rollbackOptimisticSessionStatus, useNativeCapabilities, useSessionAttention } from './hooks'
 import { mergeZCodeEvent, mergeZCodeSnapshot } from './zcodeEvents'
-import { usageSnapshotKey, withCompactionTiming } from '@shared/eventSnapshots'
+import { mergeHydratedEvents, usageSnapshotKey, withCompactionTiming } from '@shared/eventSnapshots'
 import type { ZCodeEventCursor, ZCodeEventsSnapshot } from '@shared/zcode'
 
 const MERGEABLE_EVENT_TYPES = new Set<UAEvent['type']>([
@@ -151,12 +169,14 @@ export function mergeSessionEvent(events: UAEvent[], event: UAEvent, inPlace = f
     const index = events.findLastIndex(
       (item) =>
         item.type === event.type &&
-        item.payload?.optimistic === true &&
-        item.payload?.text === event.payload?.text
+        (event.payload?.clientTurnKey
+          ? item.payload?.clientTurnKey === event.payload.clientTurnKey
+          : item.payload?.optimistic === true && item.payload?.text === event.payload?.text)
     )
     if (index >= 0) {
       const next = inPlace ? events : [...events]
       const prior = next[index].payload || {}
+      if (event.payload?.optimistic && !prior.optimistic) return events
       const clientTurnKey = prior.clientTurnKey
       // 选中即评论 — the optimistic bubble carries the comment cards + instruction
       // text; the backend user_message may not echo them, so preserve them the
@@ -233,28 +253,7 @@ export function mergeSessionEvent(events: UAEvent[], event: UAEvent, inPlace = f
 }
 
 export function mergeHydratedSessionEvents(snapshot: UAEvent[], live: UAEvent[]): UAEvent[] {
-  const liveBySeq = new Map(live.map((event) => [event.seq, event]))
-  return [...snapshot.filter((event) => !liveBySeq.has(event.seq)), ...live]
-    .sort((a, b) => a.seq - b.seq)
-    .reduce((events, event) => mergeSessionEvent(events, event, true), [] as UAEvent[])
-}
-
-export function unreadAfterReplyStatus(
-  current: ReplyUnreadKind | undefined,
-  previousStatus: string | undefined,
-  status: string,
-  source: ReplyUnreadKind,
-  shouldMark = true,
-  session?: Session
-): ReplyUnreadKind | undefined {
-  if (isToolSession(session)) return undefined
-  if (previousStatus === status) return current
-  const wasBusy = isSessionBusy(previousStatus)
-  // The Dock badge also treats failures and interruptions as attention. Mark the
-  // same terminal states here so every badged session has a visible unread row.
-  const attention = status === 'error' ||
-    wasBusy && (status === 'idle' || status === 'completed' || status === 'cancelled' || status === 'interrupted')
-  return shouldMark && attention ? source : current
+  return mergeHydratedEvents(snapshot, live, mergeSessionEvent)
 }
 
 const SIDEBAR_UNREAD_KEY = 'ua.sidebarUnread'
@@ -365,6 +364,18 @@ export function App(): JSX.Element {
   const [settingsNavigationKey, setSettingsNavigationKey] = useState(0)
   const [sidebarShortcuts, setSidebarShortcuts] = useState<readonly SettingsCategory[]>(DEFAULT_SIDEBAR_SHORTCUTS)
   const [requirementsEnabled, setRequirementsEnabled] = useState(false)
+  const [spaceRequirementSidebar, setSpaceRequirementSidebar] = useState(true)
+  const workspaceData = useWorkspaceData(requirementsEnabled)
+  const [browserLocation, setBrowserLocation] = useState<BrowserLocation>(() => {
+    const saved = readBrowserValue<BrowserLocation | null>(BROWSER_LOCATION_KEY, null)
+    return saved?.kind === 'assistant' || (saved?.kind === 'space' || saved?.kind === 'requirement') && typeof saved.id === 'string' ? saved : { kind: 'space', id: '' }
+  })
+  const [browserReturn, setBrowserReturn] = useState<BrowserLocation | null>(null)
+  const [assistantWorkspaceOpen, setAssistantWorkspaceOpen] = useState(false)
+  const [assistantReplacements, setAssistantReplacements] = useState<Record<string, string>>({})
+  const [boardReturn, setBoardReturn] = useState(false)
+  const [browserNotice, setBrowserNotice] = useState('')
+  const knownRequirementOwners = useRef(new Map<string,string>())
   const settingsNavigationGuard = useRef<(() => boolean) | null>(null)
   const [settingsTeamId, setSettingsTeamId] = useState<string>()
   const [teamError, setTeamError] = useState('')
@@ -379,14 +390,15 @@ export function App(): JSX.Element {
   const [enabledAgentIds, setEnabledAgentIds] = useState<string[]>(() => [...DEFAULT_ENABLED_AGENT_IDS])
   useEffect(() => window.uniagent.onUniAgentManagementChanged(resource => {
     if (!['settings','agents'].includes(resource)) return
-    void window.uniagent.getAppSettings().then(settings => { setEnabledAgentIds(settings.enabledAgentIds ?? [...DEFAULT_ENABLED_AGENT_IDS]); setSidebarShortcuts(settings.sidebarShortcuts ?? DEFAULT_SIDEBAR_SHORTCUTS); setRequirementsEnabled(settings.requirementsEnabled === true) }).catch(() => {})
+    void window.uniagent.getAppSettings().then(settings => { applyColorTheme(settings.theme); setEnabledAgentIds(settings.enabledAgentIds ?? [...DEFAULT_ENABLED_AGENT_IDS]); setSidebarShortcuts(settings.sidebarShortcuts ?? DEFAULT_SIDEBAR_SHORTCUTS); setRequirementsEnabled(settings.requirementsEnabled === true); setSpaceRequirementSidebar(settings.spaceRequirementSidebar !== false) }).catch(() => {})
     if (resource === 'agents') void window.uniagent.getLifecycleSnapshot().then(setAgents).catch(() => {})
   }), [])
   const [agentChoiceSettingsLoading, setAgentChoiceSettingsLoading] = useState(true)
   const [sessionsLoading, setSessionsLoading] = useState(true)
+  const [attentionLoading, setAttentionLoading] = useState(true)
   const [sessionsLoadError, setSessionsLoadError] = useState<string | null>(null)
   const blockingError = startupError || sessionsLoadError
-  const startupBlocking = !startupReady || agentsLoading || agentChoiceSettingsLoading || sessionsLoading || teamsLoading || !!blockingError
+  const startupBlocking = !startupReady || agentsLoading || agentChoiceSettingsLoading || sessionsLoading || attentionLoading || teamsLoading || !!blockingError
   useEffect(() => {
     if (!startupBlocking) return
     const block = (event: KeyboardEvent): void => {
@@ -399,8 +411,8 @@ export function App(): JSX.Element {
   useEffect(() => {
     if (!startupVisible || !startupBlocking || blockingError) return
     updateStartup(sessionsLoading ? '正在加载会话…'
-      : agentsLoading || !startupReady ? '正在初始化 Agent…' : teamsLoading ? '正在恢复团队…' : '正在加载配置…')
-  }, [startupVisible, startupBlocking, blockingError, sessionsLoading, agentsLoading, teamsLoading, startupReady])
+      : agentsLoading || !startupReady ? '正在初始化 Agent…' : teamsLoading ? '正在恢复团队…' : attentionLoading ? '正在恢复提醒…' : '正在加载配置…')
+  }, [startupVisible, startupBlocking, blockingError, sessionsLoading, attentionLoading, agentsLoading, teamsLoading, startupReady])
   useEffect(() => {
     if (!startupVisible) return
     if (blockingError) { updateStartup('', true); return }
@@ -424,8 +436,11 @@ export function App(): JSX.Element {
   }, [])
   const sessionsRef = useRef(sessions)
   sessionsRef.current = sessions
+  const sidebarTaskOpenGenerationRef = useRef(0)
   const [activeId, setActiveId] = useState<string | null>(null)
   const [sessionReturnId, setSessionReturnId] = useState<string | null>(null)
+  const [generationTaskId, setGenerationTaskId] = useState<string | null>(null)
+  const taskConversationRef = useRef<HTMLDivElement>(null)
   const [eventView, setEventView] = useState<{ events: Record<string, UAEvent[]>; zcodeCursors: Record<string, ZCodeEventCursor> }>({ events: {}, zcodeCursors: {} })
   const eventsBySession = eventView.events
   function setEventsBySession(update: Record<string, UAEvent[]> | ((previous: Record<string, UAEvent[]>) => Record<string, UAEvent[]>)): void {
@@ -456,18 +471,21 @@ export function App(): JSX.Element {
   const [refreshingNativeSessionId, setRefreshingNativeSessionId] = useState<string | null>(null)
   const nativeRefreshesRef = useRef(new Set<string>())
   const syncedNativeVersionsRef = useRef<Record<string, string>>({})
-  const [unreadBySession, setUnreadBySession] = useState<Partial<Record<string, ReplyUnreadKind>>>(loadSidebarUnread)
+  const [unreadBySession, setUnreadBySession] = useState<Partial<Record<string, ReplyUnreadKind>>>({})
   const [savedPendingInteractions, setSavedPendingInteractions] = useState<PendingInteractionIds>(loadSidebarPending)
   const [hydratedSessions, setHydratedSessions] = useState<Record<string, boolean>>({})
   const hydratedSessionsRef = useRef(new Set<string>())
-  useEffect(() => { saveSidebarState(SIDEBAR_UNREAD_KEY, unreadBySession) }, [unreadBySession])
+  const [sessionLoadErrors, setSessionLoadErrors] = useState<Record<string, string>>({})
+  const [sessionLoadRetry, setSessionLoadRetry] = useState(0)
   useEffect(() => { saveSidebarState(SIDEBAR_PENDING_KEY, savedPendingInteractions) }, [savedPendingInteractions])
   // 需求12/13: history & scheduled tasks are sidebar nav entries whose content
   // renders in the MAIN chat area (codex-style), not a floating drawer.
   // 'settings' = 设置页内展示（带分类导航）；'settings-window' = 全窗展示（左侧侧栏快捷入口打开，无分类导航）。
-  const [panel, setPanel] = useState<null | 'history' | 'automations' | 'diagnostics' | 'settings' | 'settings-window' | 'capabilities' | 'capability-sync' | 'tokens'>(
+  const [panel, setPanel] = useState<null | 'history' | 'automations' | 'diagnostics' | 'settings' | 'settings-window' | 'capabilities' | 'capability-sync' | 'tokens' | 'workspace' | 'board' | 'router'>(
     null
   )
+  const [routerFocusRequestId, setRouterFocusRequestId] = useState<string>()
+  const routerViewState = useRef<RouterPanelViewState>()
   const [capabilitySyncRequest, setCapabilitySyncRequest] = useState<CapabilityInventorySyncRequest | null>(null)
   // Doc5 — which sub-agent's detail panel is open (child thread id), if any.
   const [openSubAgent, setOpenSubAgent] = useState<string | null>(null)
@@ -507,7 +525,8 @@ export function App(): JSX.Element {
   // header expand/collapse button without rewriting the default.
   const [overlayCover, setOverlayCover] = useState(false)
   // 需求五 — when the user clicks a path in a reply, FileBrowser opens focused on it.
-  const [fileFocus, setFileFocus] = useState<{ path: string; line?: number; root?: string } | null>(null)
+  const [fileFocus, setFileFocus] = useState<{ path: string; line?: number; root?: string; requirement?: boolean } | null>(null)
+  const [sourceFocus, setSourceFocus] = useState<{ sessionId: string; seq: number } | null>(null)
   const [reviewChangeSet, setReviewChangeSet] = useState<ReviewChangeSet | null>(null)
   // 需求三（会话节点回退）— the rewind flow: preview loading → confirm → executing.
   // Kept as one discriminated state so the UI can never show confirm + loading at
@@ -520,9 +539,8 @@ export function App(): JSX.Element {
     | { phase: 'error'; sessionId: string; message: string }
   >(null)
   const [rewindWarning, setRewindWarning] = useState<string | null>(null)
-  // 需求三 — target turn's user text, pushed into the Composer after a successful
-  // rewind (nonce forces a refill even if the text repeats). Never auto-sent.
-  const [composerPrefill, setComposerPrefill] = useState<{ text: string; nonce: number }>({
+  // 回退替换输入，工作树合并追加指令；nonce 触发预填，不自动发送。
+  const [composerPrefill, setComposerPrefill] = useState<ComposerPrefill>({
     text: '',
     nonce: 0
   })
@@ -537,19 +555,6 @@ export function App(): JSX.Element {
     annotation: Annotation
     nonce: number
   } | null>(null)
-  // 选中即评论 →「解释」— each selection owns a fresh floating explanation.
-  const [detailPopover, setDetailPopover] = useState<{
-    sessionId: string
-    quote: string
-    selectedMessageText: string
-    nonce: number
-  } | null>(null)
-  useEffect(() => {
-    if (detailPopover && detailPopover.sessionId !== activeId) {
-      void window.uniagent.closeDetail(detailPopover.sessionId)
-      setDetailPopover(null)
-    }
-  }, [activeId, detailPopover])
   const [e2eFixtures, setE2EFixtures] = useState(false)
   const [newTaskPrefill, setNewTaskPrefill] = useState<{ text: string } | null>(null)
   const [quickCreateSeed, setQuickCreateSeed] = useState<
@@ -566,6 +571,12 @@ export function App(): JSX.Element {
   // Both fork modes share loading, cancellation and commit ownership.
   const [forkBusy, setForkBusy] = useState<string | null>(null)
   const [forkError, setForkError] = useState('')
+  const compactFork = useSessionFork(activeId, async id => {
+    const updated = await window.uniagent.listSessions()
+    const events = await window.uniagent.getEvents(id)
+    setSessions(updated); setEventsBySession(previous => ({ ...previous, [id]: events }))
+    setActiveId(id); setPanel(null)
+  }, setForkError, agents)
   const forkOperationRef = useRef<{ nextToken: number; activeToken: number | null }>({
     nextToken: 0, activeToken: null
   })
@@ -575,7 +586,7 @@ export function App(): JSX.Element {
   // 需求15: sidebar is resizable (drag the right edge) and collapsible.
   const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
     const v = Number(localStorage.getItem('ua.sidebarWidth'))
-    return v >= 200 && v <= 520 ? v : 260
+    return v >= 200 && v <= 520 ? v : 220
   })
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(
     () => localStorage.getItem('ua.sidebarCollapsed') === '1'
@@ -583,11 +594,6 @@ export function App(): JSX.Element {
   // Kept in sync with activeId so the (once-installed) event listener can tell
   // whether an incoming turn belongs to the session the user is currently viewing.
   const activeIdRef = useRef<string | null>(null)
-  // 团队成员的未读归属于侧栏的团队行（Leader session）；事件监听器只安装一次，
-  // 所以通过 ref 读取最新的归属表与当前展示行。
-  const teamRowIdsRef = useRef<Map<string, string>>(new Map())
-  const displayedRowIdRef = useRef<string | null>(null)
-  const sideStatusBySessionRef = useRef<Record<string, string>>({})
   useEffect(() => {
     activeIdRef.current = activeId
     setRewind(null)
@@ -612,15 +618,22 @@ export function App(): JSX.Element {
     const timer = setInterval(() => { void redetectAgents({ silent: true }) }, 10 * 60 * 1000)
     return () => clearInterval(timer)
   }, [])
-  // 异常（待登录/不健康）时快轮询：外部登录或修复完成后 UI 自动追平，全部恢复即停。
-  const hasAgentAnomaly = agents.some((a) =>
-    a.lifecycle?.availability === 'needs-auth' || a.lifecycle?.availability === 'unhealthy'
-  )
+  // 只重查异常 Agent，避免一个待登录状态让全部 Agent 每 30 秒进入检测态。
+  const anomalousAgentIds = JSON.stringify(agents.filter((agent) =>
+    (agent.lifecycle?.availability === 'needs-auth' || agent.lifecycle?.availability === 'unhealthy') &&
+    agent.lifecycle.detectionStatus !== 'detecting' && agent.lifecycle.updateStatus !== 'updating'
+  ).map(agent => agent.id))
   useEffect(() => {
-    if (!hasAgentAnomaly) return
-    const timer = setInterval(() => { void redetectAgents({ silent: true }) }, 30 * 1000)
+    const ids: string[] = JSON.parse(anomalousAgentIds)
+    if (!ids.length) return
+    let checking = false
+    const timer = setInterval(() => {
+      if (checking) return
+      checking = true
+      void Promise.allSettled(ids.map(id => window.uniagent.detectAgent(id))).finally(() => { checking = false })
+    }, 30 * 1000)
     return () => clearInterval(timer)
-  }, [hasAgentAnomaly])
+  }, [anomalousAgentIds])
   // Load agents + subscribe to pushes once.
   useEffect(() => {
     let cancelled = false
@@ -645,8 +658,10 @@ export function App(): JSX.Element {
       .then((settings) => {
         if (!cancelled) {
           setEnabledAgentIds(settings.enabledAgentIds ?? [...DEFAULT_ENABLED_AGENT_IDS])
+          applyColorTheme(settings.theme)
           setSidebarShortcuts(settings.sidebarShortcuts ?? DEFAULT_SIDEBAR_SHORTCUTS)
           setRequirementsEnabled(settings.requirementsEnabled === true)
+          setSpaceRequirementSidebar(settings.spaceRequirementSidebar !== false)
         }
       })
       .catch(() => {})
@@ -690,6 +705,20 @@ export function App(): JSX.Element {
         return { ...prev, events: next }
       })
     }
+    let attentionRevision = -1
+    const receiveAttention = (snapshot: SessionAttentionSnapshot): void => {
+      if (cancelled || !snapshot || snapshot.revision < attentionRevision) return
+      attentionRevision = snapshot.revision
+      setUnreadBySession(snapshot.unreadBySession)
+    }
+    // Subscribe before the initial read; a delayed IPC response must not replace a newer push.
+    const offAttention = window.uniagent.onSessionAttentionChanged(receiveAttention)
+    void window.uniagent.getSessionAttention({ unread: loadSidebarUnread(), pending: loadSidebarPending() })
+      .then(receiveAttention).catch(error => console.warn('[session-attention]', error))
+      .finally(() => { if (!cancelled) setAttentionLoading(false) })
+    const updateMainStatus = (sessionId: string, status: Session['status']): void => {
+      setStatusBySession(previous => ({ ...previous, [sessionId]: status }))
+    }
     const offEvent = window.uniagent.onEvent((ev) => {
       if (archivedEventCaches.current.has(ev.sessionId)) return
       eventBatch.push(ev)
@@ -718,29 +747,12 @@ export function App(): JSX.Element {
         else delete next[sessionId]
         return next
       })
-      setStatusBySession((prev) => {
-        const was = prev[sessionId]
-        const rowId = teamRowSessionId(teamRowIdsRef.current, sessionId)
-        setUnreadBySession((unread) => {
-          const next = unreadAfterReplyStatus(unread[rowId], was, status, 'main', displayedRowIdRef.current !== rowId, sessionsRef.current.find((session) => session.id === sessionId))
-          return next === unread[rowId] ? unread : { ...unread, [rowId]: next }
-        })
-        return { ...prev, [sessionId]: status }
-      })
+      updateMainStatus(sessionId, status)
       setSessions((prev) =>
         prev.map((s) => (s.id === sessionId
           ? { ...s, status: status as Session['status'], updatedAt: updatedAt ?? Date.now() }
           : s))
       )
-    })
-    const offSideStatus = window.uniagent.onSideStatus(({ sessionId, status }) => {
-      const previous = sideStatusBySessionRef.current[sessionId]
-      sideStatusBySessionRef.current[sessionId] = status
-      const rowId = teamRowSessionId(teamRowIdsRef.current, sessionId)
-      setUnreadBySession((unread) => {
-        const next = unreadAfterReplyStatus(unread[rowId], previous, status, 'side', true, sessionsRef.current.find((session) => session.id === sessionId))
-        return next === unread[rowId] ? unread : { ...unread, [rowId]: next }
-      })
     })
     const offQueue = window.uniagent.onQueueChange(({ sessionId, queue }) => {
       setQueueBySession((prev) => ({ ...prev, [sessionId]: queue }))
@@ -761,31 +773,21 @@ export function App(): JSX.Element {
       })
 
     const offSessionUpdated = window.uniagent.onSessionUpdated(({ session, backendConfigCorrectionSeq, hasLiveStreamer }) => {
-      if (isToolSession(session) || isToolSession(sessionsRef.current.find((item) => item.id === session.id))) {
-        setUnreadBySession((current) => current[session.id] ? { ...current, [session.id]: undefined } : current)
-      }
       if (backendConfigCorrectionSeq !== undefined) {
         setCorrectionSeqBySession((prev) => ({ ...prev, [session.id]: backendConfigCorrectionSeq }))
       }
       if (hasLiveStreamer !== undefined) {
         setLiveStreamerBySession((prev) => ({ ...prev, [session.id]: hasLiveStreamer }))
       }
-      // A terminal session snapshot also repairs a missed terminal status push.
-      // Busy snapshots are not copied here: turn/status events own that lifecycle.
-      if (!isSessionBusy(session.status)) {
-        setStatusBySession((prev) => ({ ...prev, [session.id]: session.status }))
-      }
-      setSessions((prev) => prev.map((s) => (s.id === session.id ? session : s)))
+      // Snapshots repair missed status pushes from other entry points.
+      updateMainStatus(session.id, session.status)
+      setSessions((prev) => prev.some(s => s.id === session.id) ? prev.map(s => s.id === session.id ? session : s) : [session, ...prev])
     })
 
     // Background creations never steal focus.
     const offCreated = window.uniagent.onSessionCreated((session) => {
       const key = sessionDedupKey(session)
       setSessions((prev) => [session, ...prev.filter((s) => sessionDedupKey(s) !== key)])
-      const rowId = teamRowSessionId(teamRowIdsRef.current, session.id)
-      if (displayedRowIdRef.current !== rowId && !isToolSession(session)) {
-        setUnreadBySession((unread) => ({ ...unread, [rowId]: 'main' }))
-      }
     })
     const offLifecycle = window.uniagent.onLifecycleProgress((progress) => {
       // Per-Agent lifecycle progress (update/check) is shown inline beside that
@@ -839,7 +841,7 @@ export function App(): JSX.Element {
       offEvent()
       offZCodeReset()
       offStatus()
-      offSideStatus()
+      offAttention()
       offQueue()
       offSessionUpdated()
       offCreated()
@@ -872,32 +874,38 @@ export function App(): JSX.Element {
   const activeMember = !!activeTeam && activeId !== activeTeam.memberSessions[activeTeam.team.leaderMemberId] && activeId !== 'team:' + activeTeam.id
   const activeSession = runtimeSessions.find(s => s.id === (activeId?.startsWith('team:') ? activeTeam?.memberSessions[activeTeam.team.leaderMemberId] : activeId) && !activeMember && (!s.teamBinding || !!activeTeam)) || null
   useEffect(() => { comments?.configure(activeSession, agents) }, [activeSession, agents, comments?.configure])
+  useEffect(() => { if (comments?.open) setSideChatOpen(false) }, [comments?.open])
   useEffect(() => window.uniagent.onDetailPromoted(result => {
-    setDetailPopover(null)
-    if (result.kind === 'side') { setOpenSubAgent(null); setSideChatOpen(true) }
+    if (result.kind === 'side') { handleSelect(result.sessionId); comments?.close(); setOpenSubAgent(null); setSideChatOpen(true) }
     else if (result.session) handleSidePromoted(result.session)
   }), [])
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined
+    let cancelled = false
+    let revision = 0
     const locate = (event: Event): void => {
       const thread = (event as CustomEvent<CommentThread>).detail
       if (thread.sessionId !== activeSession?.id) return
+      const current = ++revision
+      clearTimeout(timer)
       setCommentNotice('')
-      const find = (): HTMLElement | undefined => Array.from(document.querySelectorAll<HTMLElement>('[data-anno-id]'))
-        .find(node => node.dataset.annoId === COMMENT_ANNOTATION_PREFIX + thread.id && node.getBoundingClientRect().width > 0)
+      const find = (): HTMLElement | undefined => findCommentHighlight(thread.id)
       const existing = find()
       if (existing) { existing.scrollIntoView({ block: 'center', behavior: 'smooth' }); existing.focus(); return }
       if (thread.anchor.filePath) { setReaderEventSeq(null); handleOpenFile(thread.anchor.filePath) }
       else {
         setFilesOpen(false)
         void window.uniagent.getEvents(thread.sessionId).then(events => {
-          if (!events.some(event => event.seq === thread.anchor.seq && event.type === 'agent_message')) { setCommentNotice('原回复已不存在，评论中仍保留原文引用'); return }
+          if (cancelled || current !== revision) return
+          const source = findCommentSource(events, thread.anchor)
+          if (!source) { setCommentNotice('原回复已不存在，评论中仍保留原文引用'); return }
           setEventsBySession(previous => ({ ...previous, [thread.sessionId]: events }))
-          setReaderEventSeq(thread.anchor.seq)
-        }).catch(() => setCommentNotice('无法读取原回复，评论中仍保留原文引用'))
+          setReaderEventSeq(source.seq)
+        }).catch(() => { if (!cancelled && current === revision) setCommentNotice('无法读取原回复，评论中仍保留原文引用') })
       }
       let attempts = 0
       const retry = (): void => {
+        if (cancelled || current !== revision) return
         const node = find()
         if (node) { node.scrollIntoView({ block: 'center', behavior: 'smooth' }); node.focus(); return }
         if (++attempts < 20) timer = setTimeout(retry, 100)
@@ -907,26 +915,20 @@ export function App(): JSX.Element {
     }
     const edit = (event: Event): void => { if (activeSession) handleEditAnnotation(activeSession.id, (event as CustomEvent<Annotation>).detail.id) }
     window.addEventListener('ua:locate-comment', locate); window.addEventListener('ua:edit-pending-comment', edit)
-    return () => { clearTimeout(timer); window.removeEventListener('ua:locate-comment', locate); window.removeEventListener('ua:edit-pending-comment', edit) }
+    return () => { cancelled = true; clearTimeout(timer); window.removeEventListener('ua:locate-comment', locate); window.removeEventListener('ua:edit-pending-comment', edit) }
   }, [activeSession?.id])
   // Team members share their Leader's sidebar row. Unread is stored per row so the
   // dot, the read action and the Dock badge always describe the same session.
   const teamRowIds = useMemo(() => teamRowSessionIds(teamCatalog.projects), [teamCatalog.projects])
-  teamRowIdsRef.current = teamRowIds
   const displayedRowId = panel || startupVisible
     ? null
     : activeSession ? teamRowSessionId(teamRowIds, activeSession.id)
       : activeMember && activeId ? teamRowSessionId(teamRowIds, activeId)
         : null
-  displayedRowIdRef.current = displayedRowId
   useSessionAttention(displayedRowId)
   useEffect(() => { if (activeId === 'team:' + activeTeam?.id) setActiveId(activeTeam!.memberSessions[activeTeam!.team.leaderMemberId]) }, [activeId, activeTeam?.id])
-  const sidebarSessions = useMemo(() => [...runtimeSessions.filter(s => !s.teamBinding), ...teamSessionRows(teamCatalog.projects, runtimeSessions)], [runtimeSessions, teamCatalog.projects])
-  useEffect(() => {
-    if (!activeTeam || panel) return
-    const ids = Object.values(activeTeam.memberSessions)
-    if (ids.some(id => unreadBySession[id])) setUnreadBySession(previous => Object.fromEntries(Object.entries(previous).filter(([id]) => !ids.includes(id))))
-  }, [activeTeam?.id, panel, unreadBySession])
+  const deletion = useSessionDeletions()
+  const sidebarSessions = useMemo(() => [...runtimeSessions.filter(s => !s.teamBinding&&!s.config.managedPurpose), ...teamSessionRows(teamCatalog.projects, runtimeSessions)].filter(session => !deletion.hiddenIds.has(session.id)), [runtimeSessions, teamCatalog.projects, deletion.hiddenIds])
   async function handleCreateTeam(input: TeamCreateProjectInput): Promise<void> {
     const p = await window.uniagent.createTeamProject(input)
     setTeamCatalog(c => {
@@ -970,10 +972,8 @@ export function App(): JSX.Element {
   const readerEvent = readerEventSeq === null
     ? undefined
     : activeEvents.find((event) => event.seq === readerEventSeq && event.type === 'agent_message')
-  // While a freshly opened session's history is being hydrated from the
-  // orchestrator, `eventsBySession[activeId]` is still undefined. Show a loading
-  // overlay over the chat area so the user sees progress instead of a blank body.
-  const sessionHydrating = !!activeId && eventsBySession[activeId] === undefined
+  // Notices can arrive before the complete history returned by the orchestrator.
+  const sessionHydrating = !!activeId && !hydratedSessions[activeId] && !sessionLoadErrors[activeId]
   const activeQueue = activeId ? queueBySession[activeId] || [] : []
   const activeRuntimeStatus = activeSession?.status || 'idle'
   const activeStatus = activeSession ? activityBySession[activeSession.id] : 'idle'
@@ -987,6 +987,8 @@ export function App(): JSX.Element {
     return [pending, ...events]
   }, [activeTeam, activeSession, activeEvents])
   const worktreeInputBlocked = !!activeSession?.config.worktree && (activeSession.config.worktree.state !== 'ready' || !!activeSession.worktreeTask && !activeSession.worktreeTaskError)
+  const composerDisabled = !activeAgent?.installed || !!activeAgent.incompatible || worktreeInputBlocked
+  const archivedAssistantConversation = assistantWorkspaceOpen && !!activeSession?.archived
   const worktreeDraftRestored = useRef('')
   useEffect(() => {
     const task = activeSession?.worktreeTask
@@ -1085,7 +1087,6 @@ export function App(): JSX.Element {
     if (!activeSession || !activeToolSession) return
     const sessionId = activeSession.id
     const updated = await window.uniagent.enableToolSession(sessionId)
-    setUnreadBySession((current) => ({ ...current, [teamRowSessionId(teamRowIdsRef.current, sessionId)]: undefined }))
     setSessions((current) => current.map((session) => session.id === sessionId ? updated : session))
   }
 
@@ -1197,6 +1198,7 @@ export function App(): JSX.Element {
     if (!activeId || hydratedSessionsRef.current.has(activeId)) return
     const sessionId = activeId
     let cancelled = false
+    setSessionLoadErrors(previous => previous[sessionId] ? { ...previous, [sessionId]: '' } : previous)
     window.uniagent.getSessionRuntimeState(sessionId).then((runtime) => {
       if (cancelled) return
       const { events: evs, backendConfigCorrectionSeq } = runtime
@@ -1218,17 +1220,19 @@ export function App(): JSX.Element {
       }))
       hydratedSessionsRef.current.add(sessionId)
       setHydratedSessions(previous => ({ ...previous, [sessionId]: true }))
+    }).catch(error => {
+      if (!cancelled) setSessionLoadErrors(previous => ({ ...previous, [sessionId]: error instanceof Error ? error.message : String(error) }))
     })
     return () => {
       cancelled = true
     }
-  }, [activeId])
+  }, [activeId, sessionLoadRetry])
 
   // Context load (Doc1 需求3): sum the latest usage snapshot for this session.
   const contextInfo = useMemo(() => computeContext(activeEvents), [activeEvents])
   const contextWindow = useMemo(() => {
     const m = activeAgent?.models.find((x) => x.id === activeSession?.config.model)
-    const configured = activeSession?.config.maxMode ? m?.maxContextWindow : m?.contextWindow
+    const configured = activeAgent?.adapter === 'qoder' ? activeSession?.config.qoderContextWindow ?? m?.contextWindow : activeSession?.config.maxMode ? m?.maxContextWindow : m?.contextWindow
     // A usage tick is authoritative only for the turn that produced it. Between
     // turns, a model/Max toggle must update the meter immediately instead of
     // being masked by the previous turn's window. During a new turn, also ignore
@@ -1239,17 +1243,19 @@ export function App(): JSX.Element {
       configured,
       activeId ? correctionSeqBySession[activeId] : undefined
     )
-  }, [activeAgent, activeSession?.config.model, activeSession?.config.maxMode, activeEvents, activeStatus, activeId, correctionSeqBySession])
+  }, [activeAgent, activeSession?.config.model, activeSession?.config.maxMode, activeSession?.config.qoderContextWindow, activeEvents, activeStatus, activeId, correctionSeqBySession])
   const supportsManualCompact = supportsManualContextCompaction(activeAgent)
   const compactAvailability = contextCompactionAvailability(
     supportsManualCompact,
     activeStatus,
     activeEvents,
     !!(activeId && liveStreamerBySession[activeId]) || activeAgent?.adapter === 'kimi' ||
-      (activeAgent?.adapter === 'claude' && !!activeSession?.nativeSessionId),
+      ((activeAgent?.adapter === 'claude' || activeAgent?.adapter === 'qoder') && !!activeSession?.nativeSessionId),
     !!(activeId && modelPreparingBySession[activeId])
   )
   const invalidateForkOperation = (): void => {
+    // Navigation and starting another action also cancel delayed sidebar opens.
+    sidebarTaskOpenGenerationRef.current++
     forkOperationRef.current.activeToken = null
     setForkBusy(null)
     setHistoryForkConfirmation(null)
@@ -1291,6 +1297,9 @@ export function App(): JSX.Element {
   }
 
   function openNewTask(seed: (Partial<Pick<SessionConfig, 'agentId' | 'projectId' | 'requirementId'>> & { teamId?: string }) | null = null): void {
+    setAssistantWorkspaceOpen(false)
+    setBoardReturn(false)
+    setBrowserReturn(null)
     invalidateForkOperation()
     setQuickCreateSeed(seed ? { ...seed } : null)
     setComposerDraftSeed(null)
@@ -1326,6 +1335,13 @@ export function App(): JSX.Element {
     return () => window.removeEventListener('uniagent-open-assistant-session', open)
   }, [])
 
+  async function handleAssistantCommand(sessionId: string, command: 'new' | 'clear', selection?: AssistantConversationSelection): Promise<void> {
+    const session = await window.uniagent.assistantCommand(sessionId, command, crypto.randomUUID(), selection)
+    setSessions(current => [...current.filter(item => item.id !== session.id), session].map(item => item.id === sessionId && command === 'clear' ? { ...item, archived: true } : item))
+    setAssistantReplacements(current => ({ ...current, [sessionId]: session.id }))
+    if (activeIdRef.current === sessionId) setActiveId(session.id)
+  }
+
   async function handleSend(
     prompt: string,
     attachments?: Attachment[],
@@ -1338,14 +1354,12 @@ export function App(): JSX.Element {
     const assistantCommand = sessions.find(session => session.id === sessionId)?.config.assistantSnapshot ? parseAssistantCommand(prompt) : undefined
     if (assistantCommand && !bubble?.comments?.length && !bubble?.displayText) {
       if (attachments?.length) throw new Error('会话命令不支持附件，请移除附件后重试')
-      const session = await window.uniagent.assistantCommand(sessionId, assistantCommand, crypto.randomUUID())
-      setSessions(current => [...current.filter(item => item.id !== session.id), session].map(item => item.id === sessionId && assistantCommand === 'clear' ? { ...item, archived: true } : item))
-      if (activeIdRef.current === sessionId) setActiveId(session.id)
+      await handleAssistantCommand(sessionId, assistantCommand)
       return
     }
     const previousStatus = statusBySession[sessionId]
     const optimisticTs = Date.now()
-    const busyAtSend = isSessionBusy(activeRuntimeStatus)
+    const busyAtSend = isSessionBusy(activeRuntimeStatus) || compactAvailability.compacting
     // 选中即评论 — the sent bubble shows the instruction (`displayText`) + structured
     // comment cards; carry them onto the optimistic event so the user sees them
     // immediately, and pass them to the backend so the persisted turn keeps them.
@@ -1358,6 +1372,7 @@ export function App(): JSX.Element {
     const optimisticQueueItem: QueueItem | undefined = busyAtSend && activatePlan !== true
       ? {
           id: `optimistic-queue-${sessionId}-${optimisticTs}`,
+          clientTurnKey: bubble?.clientTurnKey,
           prompt,
           attachments,
           nativeContext: optimisticNativeContext(selection, activeNativeCapabilities),
@@ -1376,7 +1391,7 @@ export function App(): JSX.Element {
             text: prompt,
             attachments,
             optimistic: true,
-            clientTurnKey: `optimistic-${sessionId}-${optimisticTs}`,
+            clientTurnKey: bubble?.clientTurnKey || `optimistic-${sessionId}-${optimisticTs}`,
             ...(activatePlan === true ? { command: 'plan' } : {}),
             ...(bubbleDecoration || {}),
             nativeContext: optimisticNativeContext(selection, activeNativeCapabilities)
@@ -1564,6 +1579,7 @@ export function App(): JSX.Element {
         void window.uniagent.setPrefs(updated.config.agentId, {
           model: updated.config.model,
           effort: updated.config.effort,
+          ...(updated.config.agentId === 'kimi' ? { kimiThinking: updated.config.kimiThinking } : {}),
           ...(updated.config.agentId === 'zcode' ? { zcodeThinking: updated.config.zcodeModelSelection?.options?.reasoningLevel } : {}),
           permissionMode: updated.config.permissionMode,
           fastMode: updated.config.fastMode,
@@ -1630,9 +1646,9 @@ export function App(): JSX.Element {
     setFileFocus({ path, line })
     setFilesOpen(true)
   }
-  function handleOpenRequirement(path: string, root: string): void {
+  function handleOpenRequirement(path: string, root: string, line?: number): void {
     setReviewOpen(false)
-    setFileFocus({ path, root })
+    setFileFocus({ path, root, line, requirement: true })
     setFilesOpen(true)
   }
 
@@ -1774,16 +1790,11 @@ export function App(): JSX.Element {
     if (!activeId) return
     // The main-process explain command atomically replaces any prior detail fork,
     // avoiding a close/open IPC race when the user selects a new passage quickly.
-    setDetailPopover((prev) => ({
-      sessionId: activeId,
-      quote: a.quote,
-      selectedMessageText: a.selectedMessageText,
-      nonce: (prev?.nonce ?? 0) + 1,
-    }))
     void window.uniagent.explainDetailSelection(activeId, { selectedText: a.quote, selectedMessageText: a.selectedMessageText,
       sourceConversationId: activeId, targetedReplyLabel: '所选文本' }).catch(error => setCommentNotice(String(error.message || error)))
   }
   function handleSelectionSide(a: { seq: number; start: number; end: number; quote: string }): void {
+    comments?.close()
     // 选中即评论 →「侧边聊天」— pin the selection to the SIDE composer's 待评论托盘
     // (keyed `side:<sessionId>`, cached like the main tray) and open the drawer;
     // no textarea prefill so the side input stays at its resting height.
@@ -1828,8 +1839,10 @@ export function App(): JSX.Element {
     sourceAgentId: string,
     nativeId: string,
     targetAgentId: string,
-    point?: HistoryForkPoint
+    point?: HistoryForkPoint,
+    planId?: string
   ): Promise<void> {
+    if (planId) { await compactFork.start(planId); return }
     await handleForkSession(sourceAgentId, nativeId, targetAgentId, undefined, point)
   }
 
@@ -1838,8 +1851,10 @@ export function App(): JSX.Element {
     nativeId: string,
     cwd?: string,
     point?: HistoryForkPoint,
-    compatibilityMode = false
+    compatibilityMode = false,
+    planId?: string
   ): Promise<void> {
+    if (planId) { await compactFork.start(planId); return }
     await handleForkSession(agentId, nativeId, agentId, cwd, point, compatibilityMode)
   }
 
@@ -1905,11 +1920,12 @@ export function App(): JSX.Element {
     }
   }
 
-  async function handleHistoryPositionFork(): Promise<void> {
+  async function handleHistoryPositionFork(planId?: string): Promise<void> {
     if (!activeSession?.nativeSessionId || !historyForkConfirmation ||
         historyForkConfirmation.kind === 'import' || forkOperationRef.current.activeToken !== null) return
     const action = historyForkConfirmation
     setHistoryForkConfirmation(null)
+    if (planId) { await compactFork.start(planId); return }
     if (!action.point || !activeHistoryForkPoints.includes(action.point)) {
       setForkError('所选分叉位置已不可用，请重新选择')
       return
@@ -1931,7 +1947,7 @@ export function App(): JSX.Element {
     }
   }
 
-  async function handleLatestSessionFork(): Promise<void> {
+  async function handleLatestSessionFork(planId?: string): Promise<void> {
     if (!latestSessionFork || latestSessionFork.action.kind === 'import' || forkOperationRef.current.activeToken !== null) return
     const source = sessions.find((session) => session.id === latestSessionFork.sessionId)
     const targetAgentId = latestSessionFork.action.kind === 'cross'
@@ -1944,6 +1960,7 @@ export function App(): JSX.Element {
       return
     }
     setLatestSessionFork(null)
+    if (planId) { await compactFork.start(planId); return }
     await handleForkSession(
       source.config.agentId,
       source.nativeSessionId,
@@ -1956,22 +1973,23 @@ export function App(): JSX.Element {
 
   function forgetSidebarAttention(ids: string[]): void {
     const removed = new Set(ids)
-    setUnreadBySession(previous => Object.fromEntries(Object.entries(previous).filter(([id]) => !removed.has(id))))
     setSavedPendingInteractions(previous => Object.fromEntries(Object.entries(previous).filter(([id]) => !removed.has(id))))
     for (const id of ids) hydratedSessionsRef.current.delete(id)
     setHydratedSessions(previous => Object.fromEntries(Object.entries(previous).filter(([id]) => !removed.has(id))))
+    setSessionLoadErrors(previous => Object.fromEntries(Object.entries(previous).filter(([id]) => !removed.has(id))))
   }
 
   // G2-4: archive / unarchive / permanently delete a session.
-  async function handleArchive(id: string): Promise<void> {
-    const updated = await window.uniagent.archiveSession(id)
-    if (updated) {
+  async function handleArchive(id: string): Promise<boolean> {
+    const updated = await window.uniagent.archiveSession(id).catch(error => { if (isArchiveCancelled(error)) return undefined; throw error })
+    if (updated?.archived) {
       forgetSidebarAttention([id])
       archivedEventCaches.current.add(id)
       setSessions((prev) => prev.map((s) => (s.id === id ? updated : s)))
       setEventsBySession(prev => { const next = { ...prev }; delete next[id]; return next })
     }
-    setActiveId((current) => (current === id ? null : current))
+    if (updated?.archived) setActiveId((current) => (current === id ? null : current))
+    return !!updated?.archived
   }
   async function handleUnarchive(id: string): Promise<void> {
     const updated = await window.uniagent.unarchiveSession(id)
@@ -1991,11 +2009,12 @@ export function App(): JSX.Element {
     const updated = await window.uniagent.pinSession(id, pinned)
     if (updated) setSessions((prev) => prev.map((s) => (s.id === id ? updated : s)))
   }
-  async function handleDelete(id: string): Promise<void> {
+  async function handleDelete(id: string, confirmationId?: string): Promise<void> {
     const team = teamCatalog.projects.find(p => p.memberSessions[p.team.leaderMemberId] === id)
+    const deletedIds = team ? Object.values(team.memberSessions) : [id]
     try {
-      await window.uniagent.deleteSession(id)
-      const deletedIds = team ? Object.values(team.memberSessions) : [id]
+      if (confirmationId) await deleteConfirmedSession(id, confirmationId, deletedIds)
+      else if (!await deleteSessionWithConfirmation(id, deletedIds)) return
       forgetSidebarAttention(deletedIds)
       for (const deletedId of deletedIds) archivedEventCaches.current.delete(deletedId)
       setEventView(prev => {
@@ -2013,13 +2032,17 @@ export function App(): JSX.Element {
       if (team) refreshTeams()
     } catch (error) {
       if (team) setTeamError(String(error))
-      else throw error
+      throw error
     }
   }
 
   // Opening a session closes any open history/scheduled panel so the session
   // view takes the main area.
   function handleSelect(id: string): void {
+    setGenerationTaskId(null)
+    setAssistantWorkspaceOpen(false)
+    setBoardReturn(false)
+    setBrowserReturn(null)
     setSessionReturnId(null)
     invalidateForkOperation()
     setPanel(null)
@@ -2030,21 +2053,46 @@ export function App(): JSX.Element {
     setReviewInitialFile(undefined)
     setActiveId(id)
     setSideChatOpen(sideOpenBySessionRef.current[id] ?? false)
-    const rowId = teamRowSessionId(teamRowIdsRef.current, id)
-    setUnreadBySession((prev) => (prev[rowId] ? { ...prev, [rowId]: undefined } : prev))
   }
   function handleCardSessionJump(id: string): void {
     const sourceId = activeId
     handleSelect(id)
     if (sourceId && sourceId !== id) setSessionReturnId(sourceId)
   }
+  async function refreshSidebarSessions(): Promise<Session[]> {
+    const baseline = new Map(sessionsRef.current.map(session => [session.id, session]))
+    const next = await window.uniagent.listSessions()
+    setSessions(current => {
+      const latest = new Map(current.map(session => [session.id, session]))
+      const returnedIds = new Set(next.map(session => session.id))
+      const rows = next.filter(session => !baseline.has(session.id) || latest.has(session.id)).map(session => {
+        const previous = latest.get(session.id)
+        // Pushes may advance taskState.version without touching outer updatedAt.
+        return previous && (previous !== baseline.get(session.id) || (previous.updatedAt || previous.createdAt) > (session.updatedAt || session.createdAt)) ? previous : session
+      })
+      return [...rows, ...current.filter(session => !baseline.has(session.id) && !returnedIds.has(session.id))]
+    })
+    return next
+  }
+  async function handleSidebarTaskOpen(id: string): Promise<void> {
+    const generation = ++sidebarTaskOpenGenerationRef.current
+    const next = await refreshSidebarSessions()
+    if (generation !== sidebarTaskOpenGenerationRef.current) return
+    const session = next.find(session => session.id === id)
+    if (!session) throw new Error('任务已移除，请刷新后重试')
+    handleSelect(id)
+    if (panel === 'board') setBoardReturn(true)
+    else if (panel === 'workspace' || assistantWorkspaceOpen) setBrowserReturn(browserLocation)
+    else if (activeId && activeId !== id) setSessionReturnId(activeId)
+    else setBrowserReturn(sessionBrowserLocation(session, workspaceData.requirements, workspaceData.projects, requirementsEnabled) ?? null)
+  }
 
   // 需求1.3: batch archive / delete over a selection.
   async function handleArchiveMany(ids: string[]): Promise<void> {
     for (const id of ids) await handleArchive(id)
   }
-  async function handleDeleteMany(ids: string[]): Promise<void> {
-    for (const id of ids) await handleDelete(id)
+  async function handleDeleteMany(ids: string[], confirmations: Record<string, string> = {}): Promise<void> {
+    for (const id of ids) await handleDelete(id, confirmations[id])
   }
 
   const installedAgents = agents.filter((a) => a.lifecycle?.availability === 'available')
@@ -2128,11 +2176,15 @@ export function App(): JSX.Element {
   const requestDockRef = useRef<HTMLDivElement>(null)
   // 需求12/13: a nav entry opens history / scheduled tasks in the MAIN area and
   // clears the active session so its inline panel takes over the chat area.
-  function openPanel(p: 'history' | 'automations' | 'diagnostics' | 'settings' | 'settings-window' | 'capabilities' | 'capability-sync' | 'tokens'): void {
+  function openPanel(p: 'history' | 'automations' | 'diagnostics' | 'settings' | 'settings-window' | 'capabilities' | 'capability-sync' | 'tokens' | 'board' | 'router', routerRequestId?: string): void {
     // 离开设置视图（页内 / 全窗共用同一 SettingsPanel 实例，二者互切不丢状态）时过未保存守卫。
     const leavingSettingsView = (panel === 'settings' || panel === 'settings-window') && p !== 'settings' && p !== 'settings-window'
     if (leavingSettingsView && settingsNavigationGuard.current?.() === false) return
+    setGenerationTaskId(null)
+    setAssistantWorkspaceOpen(false)
+    setBoardReturn(false)
     invalidateForkOperation()
+    if (p === 'router') setRouterFocusRequestId(routerRequestId)
     setPanel(p)
     setQuickCreateSeed(null)
     setActiveId(null)
@@ -2199,9 +2251,41 @@ export function App(): JSX.Element {
 
   const settingsCover = panel === 'settings'
   const sidebarHidden = sidebarCollapsed || settingsCover
+  const navigationLocation = panel === 'board' ? undefined : panel === 'workspace' ? browserLocation : activeSession ? sessionBrowserLocation(activeSession, workspaceData.requirements, workspaceData.projects, requirementsEnabled) : browserLocation
+  const returnScope = browserReturn || (spaceRequirementSidebar && activeSession && !assistantWorkspaceOpen ? sessionBrowserLocation(activeSession, workspaceData.requirements, workspaceData.projects, requirementsEnabled) : undefined)
+  const onSessionReturn = sessionReturnId && sessions.some(session => session.id === sessionReturnId)
+    ? () => handleSelect(sessionReturnId)
+    : boardReturn ? () => openPanel('board') : returnScope ? () => openBrowser(returnScope) : undefined
+  const sessionReturnLabel = sessionReturnId ? '返回点击前的 Session' : boardReturn ? '返回任务看板' : '返回工作详情'
+
+  function openBrowser(location: BrowserLocation): void {
+    if ((panel === 'settings' || panel === 'settings-window') && settingsNavigationGuard.current?.() === false) return
+    setGenerationTaskId(null)
+    setBoardReturn(false)
+    invalidateForkOperation()
+    setBrowserLocation(location); saveBrowserValue(BROWSER_LOCATION_KEY, location)
+    setAssistantWorkspaceOpen(location.kind === 'assistant')
+    setBrowserNotice(''); setBrowserReturn(null); setActiveId(null); setPanel(location.kind === 'assistant' ? null : 'workspace'); setReviewOpen(false); setFilesOpen(false)
+  }
+  useEffect(() => {
+    for (const r of workspaceData.requirements) if (r.projectId) knownRequirementOwners.current.set(r.id, r.projectId)
+    if (browserLocation.kind === 'space' && !browserLocation.id && workspaceData.projects.length) {
+      const project = workspaceData.projects.find(p => p.isDefault) || workspaceData.projects[0]
+      setBrowserLocation({ kind: 'space', id: project.id })
+      return
+    }
+    if (panel !== 'workspace' || browserLocation.kind === 'assistant' || workspaceData.projectsLoading || workspaceData.projectsError || workspaceData.requirementsLoading || workspaceData.requirementsError) return
+    const exists = browserLocation.kind === 'space' ? workspaceData.projects.some(p => p.id === browserLocation.id) : requirementsEnabled && workspaceData.requirements.some(r => r.id === browserLocation.id)
+    if (exists) return
+    const owner = browserLocation.kind === 'requirement' ? knownRequirementOwners.current.get(browserLocation.id) : undefined
+    const project = workspaceData.projects.find(p => p.id === owner) || workspaceData.projects.find(p => p.isDefault) || workspaceData.projects[0]
+    const fallback: BrowserLocation = project ? { kind:'space',id:project.id } : { kind:'assistant' }
+    setBrowserLocation(fallback); saveBrowserValue(BROWSER_LOCATION_KEY, fallback); setBrowserNotice('原对象已移除或停用，已返回可用入口。')
+  }, [panel, browserLocation, workspaceData.projects, workspaceData.requirements, workspaceData.projectsLoading, workspaceData.requirementsLoading, workspaceData.projectsError, workspaceData.requirementsError, requirementsEnabled])
 
   return (
-    <div ref={(element) => { if (element) element.inert = startupBlocking }} className={`app ${sidebarHidden ? 'sidebar-collapsed' : ''} ${settingsCover ? 'settings-cover' : ''} ${overlayCover && (reviewOpen || filesOpen) ? 'overlay-cover' : ''}`}>
+    <div ref={(element) => { if (element) element.inert = startupBlocking }} className={`app ${sidebarHidden ? 'sidebar-collapsed' : ''} ${settingsCover ? 'settings-cover' : ''} ${overlayCover && (reviewOpen || filesOpen) ? 'overlay-cover' : ''}`} style={{ '--sidebar-width': `${sidebarWidth}px` } as CSSProperties}>
+      <WorktreeArchiveReview/>
       {sidebarCollapsed && !settingsCover && (
         <button
           className="sidebar-reveal"
@@ -2226,7 +2310,7 @@ export function App(): JSX.Element {
           <div className="sidebar-header">
             <div className="logo">
               <img className="logo-icon" src="./app-icon.svg" width={18} height={18} alt="" draggable={false} />
-              {APP_NAME}
+              <span className="logo-name">{APP_NAME}</span>
             </div>
             <div className="header-actions">
               <button
@@ -2246,7 +2330,10 @@ export function App(): JSX.Element {
               </button>
             </div>
           </div>
-          {sidebarShortcuts.length > 0 && <div className="sidebar-nav">
+          <div className="sidebar-nav">
+            <button className={`sidebar-nav-item ${panel === 'board' ? 'active' : ''}`} onClick={() => openPanel('board')}>
+              <span className="nav-ic"><UiIcon name="table-of-contents" /></span>任务看板
+            </button>
             {SETTINGS_CATEGORIES.filter(item => sidebarShortcuts.includes(item.id)).map(item => (
               <button
                 key={item.id}
@@ -2256,8 +2343,9 @@ export function App(): JSX.Element {
                 <span className="nav-ic"><UiIcon name={item.icon} /></span> {item.label}
               </button>
             ))}
-          </div>}
-          <SessionList
+          </div>
+          {spaceRequirementSidebar ? <SpaceRequirementNavigation data={workspaceData} location={navigationLocation} sessions={sidebarSessions} agents={agents} pending={pendingInteractionBySession} unread={unreadBySession} status={activityBySession} onNavigate={openBrowser} onCreate={openNewTask} onRouter={() => openPanel('router')} routerSelected={panel === 'router'} activeTaskId={!panel ? activeId : null} onOpenTask={handleSidebarTaskOpen} sessionsLoading={sessionsLoading} sessionsError={sessionsLoadError} onRetrySessions={async () => { await refreshSidebarSessions(); setSessionsLoadError(null) }} /> : <SessionList
+            onRouter={() => openPanel('router')} routerSelected={panel === 'router'}
             assistantPrivateSessionIds={assistantPrivateSessionIds}
             sessions={sidebarSessions}
             teamProjects={teamCatalog.projects}
@@ -2277,7 +2365,7 @@ export function App(): JSX.Element {
             onQuickCreate={openNewTask}
             onOpenRequirement={handleOpenRequirement}
             requirementsEnabled={requirementsEnabled}
-          />
+          />}
           {/* 需求6: 侧栏底部只留「设置」入口 —「CLI 状态」已迁入设置页。 */}
           <div className="sidebar-footer">
             <button
@@ -2289,22 +2377,64 @@ export function App(): JSX.Element {
             </button>
             <QuotaHoverButton agents={agents} enabledAgentIds={enabledAgentIds} zcodeProviderId={activeSession?.config.agentId === 'zcode' ? activeSession.config.zcodeModelSelection?.providerId : undefined} />
           </div>
-          <div
-            className="sidebar-resizer"
-            title="拖动调整宽度"
-            onMouseDown={() => {
-              dragRef.current = true
-              document.body.classList.add('resizing-sidebar')
-            }}
-          />
       </aside>
+      {(!sidebarHidden || settingsCover) && (
+        <div
+          className="sidebar-resizer"
+          title="拖动调整宽度"
+          onMouseDown={() => {
+            dragRef.current = true
+            document.body.classList.add('resizing-sidebar')
+          }}
+        />
+      )}
 
-      <main className={`main${sideChatOpen && activeSession && activeAgent?.capabilities.sideChat === true && !panel ? ' side-chat-open' : ''}${summaryDockOpen ? ' summary-dock-open' : ''}`}>
+      <main className={`main${sideChatOpen && !archivedAssistantConversation && activeSession && activeAgent?.capabilities.sideChat === true && !panel ? ' side-chat-open' : ''}${summaryDockOpen ? ' summary-dock-open' : ''}`}>
         {(teamError || teamCatalog.errors.length > 0) && <div className="team-error" role="alert">{teamError || teamCatalog.errors.join('；')}</div>}
-        <div style={{ display: !panel && !activeSession && !activeTeam ? 'contents' : 'none' }}>
-          <NewTaskPanel teams={teamCatalog.teams} teamUnavailableReasons={teamCatalog.unavailableReasons} onCreateTeam={handleCreateTeam} onManageTeams={() => { setSettingsCategory('teams'); setSettingsTeamId(undefined); openPanel('settings') }} key={newTaskKey} agents={agents} enabledAgentIds={enabledAgentIds} loading={agentsLoading || agentsRedetecting || agentChoiceSettingsLoading || sessionsLoading} loadError={sessionsLoadError} onCreate={handleCreate} onCreateNativeAction={handleCreateNativeAction} onCommitCreatedSession={handleCommitCreatedSession} promptPrefill={newTaskPrefill} onOpenAssistantSettings={() => { setSettingsCategory('assistants'); openPanel('settings') }} onOpenSettings={() => openPanel('settings')} onRedetect={redetectAgents} quickCreateSeed={quickCreateSeed} requirementsEnabled={requirementsEnabled} />
+        {assistantWorkspaceOpen && !panel && <AssistantConversations agents={agents} sessions={sessions} activeId={activeId} replacements={assistantReplacements} unread={unreadBySession}
+          onSelect={id => {
+            if (id) handleSelect(id)
+            else { setActiveId(null); setSideChatOpen(false); setReviewOpen(false); setFilesOpen(false) }
+            setAssistantWorkspaceOpen(true)
+          }}
+          onSessions={rows => setSessions(current => {
+            // A channel read can finish after /new or a live session update.
+            // Add discovered rows without deleting or rolling back newer state.
+            const merged = new Map(current.map(session => [session.id, session]))
+            for (const row of rows) {
+              const previous = merged.get(row.id)
+              if (!previous || (row.updatedAt || row.createdAt) > (previous.updatedAt || previous.createdAt)) merged.set(row.id, row)
+            }
+            return [...merged.values()]
+          })}
+          onCreated={session => setSessions(current => [session, ...current.filter(item => item.id !== session.id)])}
+          onNew={(id, selection) => handleAssistantCommand(id, 'new', selection)}
+          onArchive={handleArchive} onUnarchive={handleUnarchive}
+          onSettings={() => openSettingsCategory('assistants')}/>
+        }
+        <div style={{ display: !panel && !activeSession && !activeTeam && !assistantWorkspaceOpen ? 'contents' : 'none' }}>
+          <NewTaskPanel teams={teamCatalog.teams} teamUnavailableReasons={teamCatalog.unavailableReasons} onCreateTeam={handleCreateTeam} onManageTeams={() => { setSettingsCategory('teams'); setSettingsTeamId(undefined); openPanel('settings') }} key={newTaskKey} agents={agents} enabledAgentIds={enabledAgentIds} loading={agentsLoading || agentsRedetecting || agentChoiceSettingsLoading || sessionsLoading} loadError={sessionsLoadError} onCreate={handleCreate} onCreateNativeAction={handleCreateNativeAction} onCommitCreatedSession={handleCommitCreatedSession} promptPrefill={newTaskPrefill} onRouterSubmitting={() => openPanel('router')} onRouterSubmitted={() => openPanel('router')} onOpenAssistantSettings={() => { setSettingsCategory('assistants'); openPanel('settings') }} onOpenSettings={() => openPanel('settings')} onRedetect={redetectAgents} quickCreateSeed={quickCreateSeed} requirementsEnabled={requirementsEnabled} />
         </div>
-        {panel === 'history' ? (
+        {panel === 'board' ? (
+          <TaskBoard projects={workspaceData.projects} requirements={workspaceData.requirements} agents={agents} unreadBySession={unreadBySession} onCreate={() => openNewTask()} onOpenRouter={id => openPanel('router', id)} onDeleteTask={handleDelete} onOpenTask={async id => {
+            const next = await window.uniagent.listSessions()
+            if (!next.some(session => session.id === id)) throw new Error('任务已移除，请刷新看板后重试')
+            setSessions(next); handleSelect(id); setBoardReturn(true)
+          }}/>
+        ) : panel === 'workspace' ? (
+          <WorkspaceDetail key={browserLocation.kind === 'assistant' ? 'assistant' : browserLocation.kind + ':' + browserLocation.id} location={browserLocation} data={workspaceData} requirementsEnabled={requirementsEnabled} sessions={sidebarSessions} agents={agents} pending={pendingInteractionBySession} unread={unreadBySession} status={activityBySession} sessionsLoading={sessionsLoading} sessionsError={sessionsLoadError} onRetrySessions={async () => { const next = await window.uniagent.listSessions(); setSessions(next); setSessionsLoadError(null) }} onNavigate={openBrowser} onCreate={openNewTask} onOpenRouter={id => openPanel('router', id)} onDeleteTask={handleDelete} onOpenFile={handleOpenRequirement} onOpenDirectory={root => { setReviewOpen(false); setFileFocus({ path: '', root, requirement: true }); setOverlayCover(false); setFilesOpen(true) }} onOpenTask={async (id, seq) => {
+            const next = await window.uniagent.listSessions()
+            if (!next.some(session => session.id === id)) throw new Error('任务已移除，请刷新后重试')
+            if (seq !== undefined) {
+              const session = next.find(session => session.id === id)
+              if (browserLocation.kind !== 'requirement' || session?.config.requirementId !== browserLocation.id) throw new Error('来源任务已变更需求归属')
+              const events = await window.uniagent.getEvents(id)
+              if (!events.some(event => event.seq === seq)) throw new Error('来源消息暂不可定位')
+              setEventsBySession(previous => ({ ...previous, [id]: events })); setSourceFocus({ sessionId: id, seq })
+            } else setSourceFocus(null)
+            setSessions(next); handleSelect(id); setBrowserReturn(browserLocation)
+          }} onManage={openSettingsCategory} notice={browserNotice} />
+        ) : panel === 'router' ? <RouterPanel focusRequestId={routerFocusRequestId} agents={agents} enabledAgentIds={enabledAgentIds} requirementsEnabled={requirementsEnabled} viewState={routerViewState} onOpenTask={handleSelect} onSettings={()=>openSettingsCategory('requirement-tasks')} onOpenFile={handleOpenFile} mergeEvent={mergeSessionEvent}/> : panel === 'history' ? (
           <ResumePanel
             agents={installedAgents}
             e2eFixtures={e2eFixtures}
@@ -2313,7 +2443,7 @@ export function App(): JSX.Element {
             onForkCross={handleCrossImport}
           />
         ) : panel === 'automations' ? (
-          <AutomationsPanel onOpenSession={handleSelect} />
+          <AutomationsPanel onOpenSession={handleSelect} requirementsEnabled={requirementsEnabled} />
         ) : panel === 'diagnostics' ? (
           <DiagnosticsPanel />
         ) : panel === 'capabilities' ? (
@@ -2329,7 +2459,10 @@ export function App(): JSX.Element {
             onCategoryChange={category => { setSettingsCategory(category); setSettingsTeamId(undefined) }}
             onSidebarShortcutsChange={setSidebarShortcuts}
             onRequirementsEnabledChange={setRequirementsEnabled}
+            onSidebarStyleChange={setSpaceRequirementSidebar}
+            onOpenScope={openBrowser}
             onOpenSession={handleSelect}
+            sessions={runtimeSessions}
             agents={agents}
             detecting={agentsRedetecting}
             onRedetect={redetectAgents}
@@ -2344,17 +2477,25 @@ export function App(): JSX.Element {
             onForkCross={handleCrossImport}
           />
         ) : activeTeam && activeMember && activeId ? (
-          <MemberSession key={activeId} sessionId={activeId} p={activeTeam} agents={agents} sessions={runtimeSessions} events={eventsBySession[activeId] || []} loading={!eventsBySession[activeId]} onBack={() => handleSelect(activeTeam.memberSessions[activeTeam.team.leaderMemberId])} onForkLatest={sessionId => setLatestSessionFork({ sessionId, action: { kind: 'same' } })} />
+          <MemberSession key={activeId} sessionId={activeId} p={activeTeam} agents={agents} sessions={runtimeSessions} events={eventsBySession[activeId] || []} loading={!eventsBySession[activeId]} onBack={() => boardReturn ? openPanel('board') : handleSelect(activeTeam.memberSessions[activeTeam.team.leaderMemberId])} onForkLatest={sessionId => setLatestSessionFork({ sessionId, action: { kind: 'same' } })} />
         ) : activeSession ? (
           <TeamSessionProvider key={activeSession.id} project={activeTeam} sessions={runtimeSessions} agents={agents} onOpenMember={handleSelect}>
-          <div className="session-view">
-            <SessionHeader
+          <div className="session-view" ref={taskConversationRef} style={generationTaskId === activeSession.id ? { display: 'none' } : undefined} id={assistantWorkspaceOpen ? 'assistant-conversation-content' : undefined} role={assistantWorkspaceOpen ? 'tabpanel' : undefined} aria-label={assistantWorkspaceOpen ? sessionDisplayTitle(activeSession) : undefined}>
+            {!assistantWorkspaceOpen && <SessionHeader
               session={activeSession}
               agents={agents}
-              onReturn={sessionReturnId && sessions.some((session) => session.id === sessionReturnId)
-                ? () => handleSelect(sessionReturnId)
+              projects={workspaceData.projects}
+              requirements={workspaceData.requirements}
+              onNavigate={openBrowser}
+              onOpenGeneration={() => { setSideChatOpen(false); comments?.close(); setOpenSubAgent(null); setFilesOpen(false); setReviewOpen(false); setReaderEventSeq(null); setGenerationTaskId(activeSession.id) }}
+              onMergeWorktree={!activeToolSession && !activeSession.readOnly && !activeSession.archived && activeSession.taskState?.phase !== 'archived' && !composerDisabled && !sessionHydrating && !activeSessionExternallyOccupied && !modelPreparingBySession[activeSession.id] && !compactAvailability.providerSwitchCompacting && rewind?.phase !== 'executing'
+                ? () => setComposerPrefill(previous => ({ text: WORKTREE_MERGE_PROMPT, nonce: previous.nonce + 1, sessionId: activeSession.id, append: true }))
                 : undefined}
-              onOpenSide={activeToolSession || activeAgent?.capabilities.sideChat !== true ? undefined : () => { setOpenSubAgent(null); setSideChatOpen(true) }}
+              onReturn={onSessionReturn}
+              returnLabel={sessionReturnLabel}
+              onOpenSide={activeToolSession || activeAgent?.capabilities.sideChat !== true ? undefined : () => { comments?.close(); setOpenSubAgent(null); setSideChatOpen(true) }}
+              onOpenComments={activeToolSession || !comments ? undefined : () => { setOpenSubAgent(null); setSideChatOpen(false); comments.setTab('ai'); comments.show() }}
+              commentsOpen={comments?.open}
               onOpenFiles={() => { setReviewOpen(false); setFilesOpen(true) }}
               onForkLatest={currentSessionForkTargets(activeAgent, agents).length
                 ? () => setLatestSessionFork({ sessionId: activeSession.id, action: { kind: 'same' } })
@@ -2363,7 +2504,94 @@ export function App(): JSX.Element {
               onRefreshNativeSession={handleRefreshNativeSession}
               refreshingNativeSession={refreshingNativeSessionId === activeSession.id}
               nativeRefreshDisabled={isSessionBusy(activeStatus) || sessionHydrating || rewind?.phase === 'executing'}
+            />}
+            <SessionTaskContent session={activeSession} status={activeStatus} events={conversationEvents} loading={sessionHydrating} onArchived={() => { if (boardReturn) openPanel('board'); else if (returnScope) openBrowser(returnScope); else openPanel('board') }} onOpenFile={handleOpenFile} composer={<>
+            <TurnStatusBar
+              events={conversationEvents}
+              status={activeStatus}
+              summary={summaryPinned ? undefined : summaryCard(false) ?? undefined}
+              summaryOpen={summaryHover && !summaryDismissed && !summaryPinned}
+              onTimerHoverChange={(hovering) => {
+                setSummaryHover(hovering)
+                if (!hovering) setSummaryDismissed(false)
+              }}
             />
+            <div className="interaction-dock-slot" ref={requestDockRef} />
+            {activeSession.readOnly && !activeToolSession ? (
+              <ForkBar
+                session={activeSession}
+                agents={installedAgents}
+                onForkSame={() =>
+                  handleForkSame(
+                    activeSession.config.agentId,
+                    activeSession.nativeSessionId || '',
+                    activeSession.config.workdir
+                  )
+                }
+                onImport={() =>
+                  handleImport(
+                    activeSession.config.agentId,
+                    activeSession.nativeSessionId || '',
+                    activeSession.config.workdir,
+                    activeSession.title
+                  )
+                }
+                onForkCross={(target) =>
+                  setLatestSessionFork({ sessionId: activeSession.id, action: { kind: 'cross', targetAgentId: target } })
+                }
+              />
+            ) : (
+              <Composer
+                key={`composer:${activeSession.id}`}
+                sessionId={activeSession.id}
+                status={activeStatus}
+                runtimeStatus={activeRuntimeStatus}
+                agent={activeAgent}
+                config={activeSession.config}
+                onSend={handleSend}
+                onForceSend={handleForceSend}
+                onInterrupt={handleInterrupt}
+                interruptsTeam={!!activeTeam}
+                allowRoleConfig={!!activeTeam}
+                onUpdateConfig={handleUpdateConfig}
+                onSetCollaborationMode={handleSetCollaborationMode}
+                onRunNativeAction={handleRunNativeAction}
+                queue={activeQueue}
+                onDequeue={handleDequeue}
+                onPromoteQueue={handlePromoteQueue}
+                onEditQueueItem={handleEditQueueItem}
+                onQueueEditingChange={(itemId) => {
+                  if (activeId) void window.uniagent.setQueueEditing(activeId, itemId)
+                }}
+                capabilities={activeNativeCapabilities}
+                capabilitiesReady={activeNativeCapabilitiesReady}
+                draftSeed={composerDraftSeed}
+                onConsumeDraftSeed={(seed) => {
+                  setComposerDraftSeed((current) => current === seed ? null : current)
+                }}
+                contextUsed={contextInfo.used}
+                contextUsedPercentage={contextInfo.usedPercentage}
+                contextWindow={contextWindow}
+                prefill={composerPrefill}
+                pendingComments={annotationsBySession[activeSession.id] || []}
+                onEditPendingComment={(id) => handleEditAnnotation(activeSession.id, id)}
+                onRemovePendingComment={(id) => handleRemoveAnnotation(activeSession.id, id)}
+                onCompact={handleCompactSession}
+                canCompact={compactAvailability.canCompact}
+                compacting={compactAvailability.compacting}
+                providerSwitchCompacting={compactAvailability.providerSwitchCompacting}
+                preparingModel={!!modelPreparingBySession[activeSession.id]}
+                disabledReason={compactAvailability.disabledReason}
+                disabled={composerDisabled || archivedAssistantConversation}
+                inputPlaceholder={worktreeInputBlocked ? '工作树就绪后可继续输入' : undefined}
+                sessionExternallyOccupied={activeSessionExternallyOccupied}
+                toolSessionReadOnly={activeToolSession}
+                onEnableToolSession={handleEnableToolSession}
+                refreshingNativeSession={refreshingNativeSessionId === activeSession.id}
+                onRefreshNativeSession={handleRefreshNativeSession}
+              />
+            )}
+            </>}>
             {activeAgent?.capabilities.nativeGoal === true && activeSession.goal && (
               <div className="goal-status-shell">
                 <GoalStatusBar
@@ -2376,6 +2604,9 @@ export function App(): JSX.Element {
               </div>
             )}
             <SessionConversation loading={sessionHydrating}
+                loadError={sessionLoadErrors[activeSession.id]}
+                onRetryLoad={() => setSessionLoadRetry(value => value + 1)}
+                recovery={activeSession.recovery}
                 workspaceNotice={activeSession.config.workspaceNotice}
                 afterConversation={<WorktreeCreation key={activeSession.id} session={activeSession} />}
                 onRequestEarlier={activeAgent?.adapter === 'zcode' && !isSessionBusy(activeStatus) &&
@@ -2398,17 +2629,19 @@ export function App(): JSX.Element {
                 events={conversationEvents}
                 status={activeStatus}
                 sessionId={activeSession.id}
-                requestDockRef={activeToolSession ? undefined : requestDockRef}
-                readOnly={activeSession.readOnly}
-                onRespond={activeToolSession ? undefined : handleRespond}
+                requestDockRef={activeToolSession || archivedAssistantConversation ? undefined : requestDockRef}
+                readOnly={activeSession.readOnly || archivedAssistantConversation}
+                onRespond={activeToolSession || archivedAssistantConversation ? undefined : handleRespond}
                 subagents={activeAgent?.capabilities.structuredSubagents === true ? activeSubAgents : undefined}
                 onOpenSubAgent={activeAgent?.capabilities.structuredSubagents === true ? handleOpenSubAgent : undefined}
                 waitingForHandoff={activeSession.waitingForHandoff}
                 handoffSessionTargets={handoffSessionTargets}
                 onJumpToSession={handleCardSessionJump}
                 scrollToBottomSignal={scrollToBottomSignal}
+                focusSeq={sourceFocus?.sessionId === activeSession.id ? sourceFocus.seq : undefined}
+                onFocusLocated={seq => setSourceFocus(current => current?.sessionId === activeSession.id && current.seq === seq ? null : current)}
                 onOpenTurnReview={handleOpenTurnReview}
-                onRewindToTurn={activeToolSession ? undefined : handleRewindToTurn}
+                onRewindToTurn={activeToolSession || archivedAssistantConversation ? undefined : handleRewindToTurn}
                 onOpenFile={handleOpenFile}
                 onOpenReader={handleOpenReader}
                 historyFork={!activeToolSession && activeSession.nativeSessionId ? {
@@ -2417,14 +2650,14 @@ export function App(): JSX.Element {
                   busy: !!forkBusy,
                   onFork: (point) => setHistoryForkConfirmation({ kind: 'same', point }),
                 } : undefined}
-                onImplementPlan={activeSession.readOnly || activeToolSession ? undefined : handleImplementPlan}
-                onRevisePlan={activeSession.readOnly || activeToolSession ? undefined : handleRevisePlan}
+                onImplementPlan={activeSession.readOnly || activeToolSession || archivedAssistantConversation ? undefined : handleImplementPlan}
+                onRevisePlan={activeSession.readOnly || activeToolSession || archivedAssistantConversation ? undefined : handleRevisePlan}
                 selection={
-                  !activeToolSession && activeAgent
+                  !activeToolSession && !archivedAssistantConversation && activeAgent
                     ? {
-                        annotations: comments?.annotations(annotationsBySession[activeSession.id] || [], activeSession.id) || [],
+                        annotations: comments?.annotations(annotationsBySession[activeSession.id] || [], activeSession.id, activeEvents) || [],
                         onSideComment: (selection) => { setSideChatOpen(false); void comments?.begin({ ...selection,
-                          sourceText: activeEvents.find(event => event.seq === selection.seq)?.payload.text }) },
+                          sourceText: findCommentSource(activeEvents, selection)?.payload.text }) },
                         onComment: (a) => handleAddAnnotation(activeSession.id, a),
                         editRequest: annotationEditRequest?.sessionId === activeSession.id && !annotationEditRequest.annotation.filePath
                           ? annotationEditRequest
@@ -2446,8 +2679,8 @@ export function App(): JSX.Element {
               <ImmersiveReader
                 key={readerEvent.sessionId + ':' + readerEvent.seq}
                 event={readerEvent}
-                readOnly={activeToolSession}
-                sessionTitle={activeSession.title}
+                readOnly={activeToolSession || archivedAssistantConversation}
+                sessionTitle={sessionDisplayTitle(activeSession)}
                 agentName={activeAgent?.name || activeSession.config.agentId}
                 annotations={annotationsBySession[activeSession.id] || []}
                 onAddComment={(annotation) => handleAddAnnotation(activeSession.id, annotation)}
@@ -2493,101 +2726,14 @@ export function App(): JSX.Element {
             {/* 需求4(反馈) — 任务列表胶囊固定在输入框上方，而非对话流中间。
                 计时胶囊重构 — 常驻胶囊：运行中计时、结束后定格上一轮耗时，边框色
                 表达状态；悬停弹出摘要悬浮窗（固定后由右侧面板承接）。 */}
-            <TurnStatusBar
-              events={conversationEvents}
-              status={activeStatus}
-              summary={summaryPinned ? undefined : summaryCard(false) ?? undefined}
-              summaryOpen={summaryHover && !summaryDismissed && !summaryPinned}
-              onTimerHoverChange={(hovering) => {
-                setSummaryHover(hovering)
-                if (!hovering) setSummaryDismissed(false)
-              }}
-            />
-            <div className="interaction-dock-slot" ref={requestDockRef} />
-            {activeSession.readOnly && !activeToolSession ? (
-              <ForkBar
-                session={activeSession}
-                agents={installedAgents}
-                onForkSame={() =>
-                  handleForkSame(
-                    activeSession.config.agentId,
-                    activeSession.nativeSessionId || '',
-                    activeSession.config.workdir
-                  )
-                }
-                onImport={() =>
-                  handleImport(
-                    activeSession.config.agentId,
-                    activeSession.nativeSessionId || '',
-                    activeSession.config.workdir,
-                    activeSession.title
-                  )
-                }
-                onForkCross={(target) =>
-                  handleCrossImport(
-                    activeSession.config.agentId,
-                    activeSession.nativeSessionId || '',
-                    target
-                  )
-                }
-              />
-            ) : (
-              <Composer
-                key={`composer:${activeSession.id}`}
-                sessionId={activeSession.id}
-                status={activeStatus}
-                runtimeStatus={activeRuntimeStatus}
-                agent={activeAgent}
-                config={activeSession.config}
-                onSend={handleSend}
-                onForceSend={handleForceSend}
-                onInterrupt={handleInterrupt}
-                interruptsTeam={!!activeTeam}
-                allowRoleConfig={!!activeTeam}
-                onUpdateConfig={handleUpdateConfig}
-                onSetCollaborationMode={handleSetCollaborationMode}
-                onRunNativeAction={handleRunNativeAction}
-                queue={activeQueue}
-                onDequeue={handleDequeue}
-                onPromoteQueue={handlePromoteQueue}
-                onEditQueueItem={handleEditQueueItem}
-                onQueueEditingChange={(itemId) => {
-                  if (activeId) void window.uniagent.setQueueEditing(activeId, itemId)
-                }}
-                capabilities={activeNativeCapabilities}
-                capabilitiesReady={activeNativeCapabilitiesReady}
-                draftSeed={composerDraftSeed}
-                onConsumeDraftSeed={(seed) => {
-                  setComposerDraftSeed((current) => current === seed ? null : current)
-                }}
-                contextUsed={contextInfo.used}
-                contextWindow={contextWindow}
-                prefill={composerPrefill}
-                pendingComments={annotationsBySession[activeSession.id] || []}
-                onEditPendingComment={(id) => handleEditAnnotation(activeSession.id, id)}
-                onRemovePendingComment={(id) => handleRemoveAnnotation(activeSession.id, id)}
-                onCompact={handleCompactSession}
-                canCompact={compactAvailability.canCompact}
-                compacting={compactAvailability.compacting}
-                providerSwitchCompacting={compactAvailability.providerSwitchCompacting}
-                preparingModel={!!modelPreparingBySession[activeSession.id]}
-                disabledReason={compactAvailability.disabledReason}
-                disabled={!activeAgent?.installed || !!activeAgent.incompatible || worktreeInputBlocked}
-                inputPlaceholder={worktreeInputBlocked ? '工作树就绪后可继续输入' : undefined}
-                sessionExternallyOccupied={activeSessionExternallyOccupied}
-                toolSessionReadOnly={activeToolSession}
-                onEnableToolSession={handleEnableToolSession}
-                refreshingNativeSession={refreshingNativeSessionId === activeSession.id}
-                onRefreshNativeSession={handleRefreshNativeSession}
-              />
-            )}
+            </SessionTaskContent>
             {activeAgent?.capabilities.structuredSubagents === true && (
               <SubAgentPanel
                 key={`subagent:${activeSession.id}`}
                 open={!!openSubAgent}
                 sessionId={activeSession.id}
                 subagents={activeSubAgents}
-                canCancel={(activeAgent?.adapter === 'grok' || activeAgent?.adapter === 'deepseek' || activeAgent?.adapter === 'kimi' || activeAgent?.adapter === 'mcode') && !activeToolSession && !activeSession.teamBinding && !activeSession.readOnly && !activeSession.archived && (activeSession.status === 'running' || activeSession.status === 'awaiting-approval')}
+                canCancel={(activeAgent?.adapter === 'grok' || activeAgent?.adapter === 'deepseek' || activeAgent?.adapter === 'kimi' || activeAgent?.adapter === 'mcode' || activeAgent?.adapter === 'qoder') && !activeToolSession && !activeSession.teamBinding && !activeSession.readOnly && !activeSession.archived && (activeSession.status === 'running' || activeSession.status === 'awaiting-approval')}
                 activeThreadId={openSubAgent || ''}
                 initialView={subPanelView}
                 onSelect={setOpenSubAgent}
@@ -2595,7 +2741,12 @@ export function App(): JSX.Element {
               />
             )}
           </div>
-          {summaryDockOpen && (
+          {generationTaskId === activeSession.id && <TaskGenerationConversation key={activeSession.id} session={activeSession} onBack={() => {
+            const title = taskConversationRef.current?.querySelector<HTMLButtonElement>('.session-info-trigger')
+            setGenerationTaskId(null)
+            requestAnimationFrame(() => { if (title?.isConnected) title.focus({ preventScroll: true }) })
+          }}/>}
+          {generationTaskId !== activeSession.id && summaryDockOpen && (
             <aside className="summary-dock" style={{ width: summaryWidth }} aria-label="会话摘要">
               <div
                 className="summary-dock-grip"
@@ -2613,32 +2764,33 @@ export function App(): JSX.Element {
         ) : null}
         {filesOpen && (
           <FileBrowser
-            key={`files:${activeSession?.id || fileFocus?.root}`}
-            sessionId={activeSession?.id || ''}
-            workdir={activeSession?.config.workdir || fileFocus?.root || ''}
-            rootPath={fileFocus?.root}
+            key={`files:${fileFocus?.requirement ? fileFocus.root : activeSession?.id || fileFocus?.root}`}
+            sessionId={fileFocus?.requirement ? '' : activeSession?.id || ''}
+            workdir={fileFocus?.requirement ? fileFocus.root || '' : activeSession?.config.workdir || fileFocus?.root || ''}
+            rootPath={fileFocus?.requirement && fileFocus.path ? undefined : fileFocus?.root}
             focusPath={fileFocus?.path}
             focusLine={fileFocus?.line}
-            annotations={activeSession ? annotationsBySession[activeSession.id] || [] : []}
-            onAddComment={activeSession && !activeToolSession && !activeSession.readOnly && !activeSession.archived
+            annotations={!fileFocus?.requirement && activeSession ? annotationsBySession[activeSession.id] || [] : []}
+            onAddComment={!fileFocus?.requirement && activeSession && !activeToolSession && !activeSession.readOnly && !activeSession.archived
               ? (annotation) => handleAddAnnotation(activeSession.id, annotation) : undefined}
             onUpdateComment={(id, comment) => activeSession && handleUpdateAnnotation(activeSession.id, id, comment)}
             onRemoveComment={(id) => activeSession && handleRemoveAnnotation(activeSession.id, id)}
-            editRequest={annotationEditRequest?.annotation.filePath && annotationEditRequest.sessionId === activeSession?.id
+            editRequest={!fileFocus?.requirement && annotationEditRequest?.annotation.filePath && annotationEditRequest.sessionId === activeSession?.id
               ? annotationEditRequest : undefined}
             onEditRequestHandled={(nonce) => {
               setAnnotationEditRequest((current) => current?.nonce === nonce ? null : current)
             }}
-            onOpenFile={handleOpenFile}
+            onOpenFile={fileFocus?.requirement ? (path, line) => handleOpenRequirement(path, fileFocus.root!, line) : handleOpenFile}
             coverSidebar={overlayCover}
             onToggleCover={() => setOverlayCover((v) => !v)}
+            returnLabel={fileFocus?.requirement ? '返回需求' : undefined}
             onClose={() => {
               setFilesOpen(false)
               setFileFocus(null)
             }}
           />
         )}
-        {activeSession && !activeToolSession && activeAgent?.capabilities.sideChat === true && (
+        {activeSession && !activeToolSession && !archivedAssistantConversation && activeAgent?.capabilities.sideChat === true && (
           <SideChatPanel
             key={`side:${activeSession.id}`}
             open={sideChatOpen && !panel}
@@ -2674,13 +2826,14 @@ export function App(): JSX.Element {
         <HistoryConfirmation
           action={latestSessionFork.action}
           agentName={latestForkSourceAgent?.name || latestForkSource.config.agentId}
-          title={latestForkSource.title}
+          title={sessionDisplayTitle(latestForkSource)}
           sourceAgentId={latestForkSource.config.agentId}
+          sourceNativeId={latestForkSource.nativeSessionId}
           targetAgents={latestForkTargets}
           chooseTarget
           onChangeAction={(action) => setLatestSessionFork((current) => current ? { ...current, action } : null)}
           onCancel={() => setLatestSessionFork(null)}
-          onConfirm={() => { void handleLatestSessionFork() }}
+          onConfirm={planId => { void handleLatestSessionFork(planId) }}
         />
       )}
       {/* Message forks share the history confirmation and loading flow. */}
@@ -2688,8 +2841,9 @@ export function App(): JSX.Element {
         <HistoryConfirmation
           action={historyForkConfirmation}
           agentName={activeAgent?.name || activeSession.config.agentId}
-          title={activeSession.title}
+          title={sessionDisplayTitle(activeSession)}
           sourceAgentId={activeSession.config.agentId}
+          sourceNativeId={activeSession.nativeSessionId}
           targetAgents={[
             ...(activeAgent && supportsSessionCapability(activeAgent, 'sessionFork') ? [activeAgent] : []),
             ...eligibleCrossForkTargets(activeAgent, agents)
@@ -2699,9 +2853,11 @@ export function App(): JSX.Element {
             : undefined}
           onChangeAction={setHistoryForkConfirmation}
           onCancel={() => setHistoryForkConfirmation(null)}
-          onConfirm={() => { void handleHistoryPositionFork() }}
+          onConfirm={planId => { void handleHistoryPositionFork(planId) }}
         />
       )}
+      {compactFork.view}
+      {activeSession?.forkedFrom?.exportId && <button className="fork-archive-entry" onClick={() => void window.uniagent.revealForkArchive(activeSession.forkedFrom!.exportId!)}>已带入压缩后的上下文 · 查看历史资料</button>}
       {forkBusy && (
         <dialog
           ref={(dialog) => { if (dialog && !dialog.open) dialog.showModal() }}
@@ -2856,153 +3012,7 @@ export function eligibleCrossForkTargets(
  * LAST call's input (`contextTokens`), which is bounded — NOT the per-turn input
  * sum. `turn` carries the per-turn breakdown + cost for the popover.
  */
-export function computeContext(events: UAEvent[]): {
-  used: number
-  window?: number
-  detail: { input?: number; output?: number; cached?: number; cost?: number | null }
-} {
-  // Replaced snapshots retain their display position, not their chronological position.
-  const latestNotice = (kind: 'context' | 'usage'): UAEvent | undefined =>
-    events.reduce<UAEvent | undefined>((found, event) =>
-      event.type === 'system_notice' && event.payload?.kind === kind && event.payload.usage &&
-      (!found || event.seq > found.seq) ? event : found, undefined)
-  const contextEvent = latestNotice('context')
-  const usageEvent = latestNotice('usage')
-  const contextUsed = contextEvent ? boundedTokens(contextEvent.payload.usage.contextTokens) : undefined
-  const usageUsed = usageEvent ? boundedTokens(usageEvent.payload.usage.contextTokens) : undefined
-  // 需求(实时上下文): a live `context` tick updates only the occupancy figure.
-  // It stays authoritative over a newer usage footer that carries no bounded
-  // figure, so an asynchronous cumulative footer can never hide it.
-  if (contextEvent && contextUsed !== undefined &&
-      (!usageEvent || usageUsed === undefined || usageEvent.seq < contextEvent.seq)) {
-    return { used: contextUsed, window: contextEvent.payload.usage.contextWindow, detail: {} }
-  }
-  if (usageEvent) {
-    const u = usageEvent.payload.usage
-    const input = u.inputTokens ?? u.input_tokens ?? 0
-    const output = u.outputTokens ?? u.output_tokens ?? 0
-    const cached = u.cachedInputTokens ?? u.cached_input_tokens ?? 0
-    const cost = u.cost ?? usageEvent.payload.cost ?? null
-    // Occupancy: how full the window is right now = the last call's input.
-    // Never fall back to an input/output sum: for providers whose footer is
-    // cumulative across model calls (Grok reports 2.4M billed tokens for a
-    // 256k window), that number is unbounded and reads as a permanent 100%.
-    return { used: usageUsed ?? 0, window: u.contextWindow, detail: { input, output, cached, cost } }
-  }
-  if (contextEvent && contextUsed !== undefined) {
-    return { used: contextUsed, window: contextEvent.payload.usage.contextWindow, detail: {} }
-  }
-  return { used: 0, detail: {} }
-}
-
-/** Context occupancy must be a finite, non-negative token count. */
-function boundedTokens(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
-}
-
-function SessionHeader({
-  session,
-  agents,
-  onReturn,
-  onOpenSide,
-  onOpenFiles,
-  onForkLatest,
-  forkLatestDisabled,
-  onRefreshNativeSession,
-  refreshingNativeSession,
-  nativeRefreshDisabled
-}: {
-  session: Session
-  agents: AgentDef[]
-  onReturn?: () => void
-  onOpenSide?: () => void
-  onOpenFiles?: () => void
-  onForkLatest?: () => void
-  forkLatestDisabled?: boolean
-  onRefreshNativeSession?: () => void | Promise<void>
-  refreshingNativeSession?: boolean
-  nativeRefreshDisabled?: boolean
-}): JSX.Element {
-  const baseAgent = agents.find((a) => a.id === session.config.agentId)
-  const agent = baseAgent ? agentForSession(baseAgent, session) : undefined
-  const sideCapable = agent?.capabilities.sideChat === true
-  // 改动2 — the top status bar is just a TITLE (会话名 + 工作目录) plus action
-  // toggles. 计时胶囊重构 removed the 摘要 toggle: the summary card now opens from
-  // the timer capsule (hover popover / pinned dock). Branch/changes live in the
-  // summary card's 环境信息; the permission tier stays in the composer bottom.
-  return (
-    <div className="session-header">
-      {onReturn && (
-        <button type="button" className="session-return-btn" onClick={onReturn} title="返回点击前的 Session" aria-label="返回点击前的 Session">
-          <UiIcon name="back" size={18} />
-        </button>
-      )}
-      {session.config.workdir && onOpenFiles && (
-        <button
-          type="button"
-          className="topbar-files-btn"
-          onClick={onOpenFiles}
-          title="文件查看器"
-          aria-label="打开文件查看器"
-        >
-          <FolderIcon />
-        </button>
-      )}
-      <span className="topbar-title" title={`${session.title || '未命名会话'} · ${session.config.workdir}`}>
-        <span className="topbar-title-main">{session.title || '未命名会话'}</span>
-        <span className="topbar-title-sub topbar-title-path">
-          <span> · </span>
-          <span className="topbar-title-path-value">{session.config.workdir}</span>
-        </span>
-      </span>
-      {session.config.worktree && <span className="session-worktree-badge" title={`工作树 · ${session.config.worktree.workdir}`}><UiIcon name="fork" size={11} />工作树</span>}
-      <span className="topbar-spacer" />
-      {session.config.agentId === 'codex' && session.importMode === 'direct' && session.nativeSessionId && onRefreshNativeSession && (
-        <button
-          type="button"
-          className="summary-toggle session-refresh-toggle"
-          onClick={() => void onRefreshNativeSession()}
-          disabled={refreshingNativeSession || nativeRefreshDisabled}
-          aria-label="刷新原生会话"
-          aria-busy={!!refreshingNativeSession}
-          title={refreshingNativeSession ? '正在刷新原生会话' : nativeRefreshDisabled ? '正在处理会话，请稍后刷新' : '刷新原生会话'}
-        >
-          <span className="summary-toggle-glyph" aria-hidden>
-            <UiIcon name="refresh" size={14} />
-          </span>
-          刷新
-        </button>
-      )}
-      {onForkLatest && (
-        <button
-          type="button"
-          className="summary-toggle session-refresh-toggle session-fork-toggle"
-          onClick={onForkLatest}
-          disabled={forkLatestDisabled}
-          title={forkLatestDisabled ? '当前回复完成后可分叉' : '从最新内容分叉新会话'}
-          aria-label="从最新内容分叉新会话"
-        >
-          <span className="summary-toggle-glyph" aria-hidden>
-            <UiIcon name="fork" size={14} />
-          </span>
-          分叉
-        </button>
-      )}
-      {sideCapable && onOpenSide && (
-        <button
-          className="summary-toggle session-side-toggle"
-          onClick={onOpenSide}
-          title="侧边对话（临时支线，不写回主会话）"
-        >
-          <span className="summary-toggle-glyph" aria-hidden>
-            <UiIcon name="message-square" size={14} />
-          </span>
-          侧边
-        </button>
-      )}
-    </div>
-  )
-}
+export { computeContext } from './contextWindow'
 
 /**
  * 计时胶囊重构 — the summary card content, shared by the timer capsule's hover

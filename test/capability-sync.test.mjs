@@ -302,7 +302,7 @@ await test('unified inventory exposes shared Skills only to Codex and TraeX', as
   await mkdir(join(home,'.claude/skills/local'),{recursive:true});await writeFile(join(home,'.claude/skills/local/SKILL.md'),'# Local\n')
   await writeFile(join(home,'.claude.json'),JSON.stringify({mcpServers:{claude_mcp:{command:'node'}}}),{mode:0o600})
   await mkdir(join(home,'.agents/skills/shared-one'),{recursive:true});await writeFile(join(home,'.agents/skills/shared-one/SKILL.md'),'# Shared\n')
-  const result=await listInventory(home);assert.deepEqual(result.inventories.map(item=>item.agentId),['codex','traex','claude'])
+  const result=await listInventory(home);assert.deepEqual(result.inventories.map(item=>item.agentId),['codex','traex','claude','qoder'])
   const claude=result.inventories.find(item=>item.agentId==='claude');assert.equal(claude.writable,true);assert.equal(claude.items.find(item=>item.name==='local').manageable,true)
   assert.equal(claude.items.find(item=>item.name==='local').removal,'skill')
   assert.equal(claude.items.some(item=>item.name==='shared-one'),false)
@@ -312,7 +312,7 @@ await test('unified inventory exposes shared Skills only to Codex and TraeX', as
   assert.equal(codex.items.find(item=>item.name==='shared-one').scope,'shared');assert.equal(codex.items.find(item=>item.name==='shared-one').manageable,true)
   assert.equal(codex.items.some(item=>item.kind==='plugin'),false)
   assert.equal(codex.items.some(item=>item.kind==='command'),true)
-  assert.deepEqual(codex.items.filter(item=>item.kind==='tool').map(item=>item.name).sort(),['send_to_feishu','uniagent_query','uniagent_task'])
+  assert.deepEqual(codex.items.filter(item=>item.kind==='tool').map(item=>item.name).sort(),['send_to_feishu','uniagent_automation','uniagent_query','uniagent_task'])
   for(const item of codex.items) for(const key of ['id','agentId','kind','name','scope','origin','owner','fingerprint','manageable','copyable','status']) assert.equal(key in item,true)
   // 管理页刻意展示读取入口与原始文件位置；其余字段仍不能附带账户目录或凭据。
   const withoutLocations={...result,inventories:result.inventories.map(inv=>({...inv,items:inv.items.map(({location,entryPath,manifestPath,...rest})=>rest)}))}

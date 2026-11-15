@@ -1,4 +1,10 @@
 .requirement-picker .project-picker-trigger { color: var(--purple); }
+.project-picker-trigger.requirement-scope-trigger { color:var(--purple); }
+.project-picker-trigger.requirement-scope-trigger > .ui-icon:first-child { transform:none; color:var(--purple); }
+.scope-picker-list { max-height:260px; }
+.project-picker-list .scope-picker-requirement { padding-left:26px; }
+.scope-picker-requirement > .ui-icon:first-child { color:var(--purple); }
+.project-editor-field > select { min-width:0; padding:9px 12px; border:1px solid var(--border-soft); border-radius:7px; background:var(--bg-elev2); color:var(--text); font:inherit; font-size:13px; }
 .requirement-hint { font-size: 12px; line-height: 1.6; color: var(--text-dim); margin: 0; }
 .requirement-error { color: var(--red); font-size: 12px; padding: 8px 0; overflow-wrap: anywhere; }
 .requirement-empty { padding: 16px; }

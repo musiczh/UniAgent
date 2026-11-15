@@ -4,6 +4,7 @@ import type { Session, UAEvent } from '@shared/types'
 import { isVisibleDetailEvent } from '@shared/detailQuickChat'
 import { EventStream } from './EventStream'
 import { UiIcon } from './Icons'
+import { cancelSendOrigin, captureSendOrigin } from '../conversationMotion'
 
 /**
  * 选中即评论 / 解释 — a lightweight floating fork chat explaining a text selection.
@@ -65,6 +66,10 @@ export function DetailChatPopover({
     const offEv = window.uniagent.onDetailEvent((p) => {
       if (p.sessionId !== sessionId) return
       setEvents((prev) => {
+        if (p.event.type === 'user_message' && p.event.payload.clientTurnKey) {
+          const index = prev.findIndex(row => row.type === p.event.type && row.payload.clientTurnKey === p.event.payload.clientTurnKey)
+          if (index >= 0) { const next = [...prev]; next[index] = p.event; return next }
+        }
         const id = (p.event.payload as { id?: string } | undefined)?.id
         if (id) {
           const idx = prev.findIndex(
@@ -148,12 +153,16 @@ export function DetailChatPopover({
   function send(): void {
     const v = text.trim()
     if (!v || status === 'running' || promotingRef.current) return
+    const clientTurnKey = captureSendOrigin(taRef.current)
+    setEvents(current => [...current, { sessionId, seq: -Date.now(), ts: Date.now(), type: 'user_message', payload: { text: v, clientTurnKey, optimistic: true } }])
     setText('')
     if (taRef.current) taRef.current.style.height = ''
     setStatus('running')
     setError('')
-    void window.uniagent.sendDetailMessage(sessionId, v).catch((err) => {
-      setText(v)
+    void window.uniagent.sendDetailMessage(sessionId, v, undefined, { clientTurnKey }).catch((err) => {
+      cancelSendOrigin(clientTurnKey)
+      setEvents(current => current.filter(event => !event.payload.optimistic || event.payload.clientTurnKey !== clientTurnKey))
+      setText(current => current || v)
       setStatus('idle')
       setError(err instanceof Error ? err.message : '发送失败，请重试')
     })
@@ -191,6 +200,7 @@ export function DetailChatPopover({
     }
   }
 
+  const savingHint = promoting ? '正在保存解释，请稍候' : ''
   return createPortal(
       <div ref={popRef} className="detail-pop" role="dialog" aria-label="解释" style={position ? { ...position, right: 'auto' } : undefined}>
         <div
@@ -234,32 +244,38 @@ export function DetailChatPopover({
               {displayTitle}
             </span>
           </div>
-          <button
-            className="detail-icon-btn primary"
-            title="添加到侧边对话"
-            aria-label="添加到侧边对话"
-            onClick={() => { void preserve('side') }}
-            disabled={status === 'running' || promoting}
-          >
-            <UiIcon name="message-square" size={17} />
-          </button>
-          <button
-            className="detail-icon-btn primary"
-            title={promoting ? '正在保存…' : status === 'running' ? '生成结束后可添加为 Session' : '添加为 Session'}
-            aria-label="添加为 Session"
-            onClick={() => { void preserve('session') }}
-            disabled={status === 'running' || promoting}
-          >
-            <UiIcon name="plus" size={17} />
-          </button>
-          <button className="detail-icon-btn" title="关闭并丢弃" aria-label="关闭并丢弃" onClick={discardAndClose} disabled={promoting}>
-            <UiIcon name="close" size={16} />
-          </button>
+          <span className="detail-icon-action" title={savingHint || (status === 'running'
+            ? '保留为侧边对话（解释生成完成后可用）' : '保留为侧边对话：在原会话的侧边栏继续交流')}>
+            <button
+              className="detail-icon-btn primary"
+              aria-label="保留为侧边对话"
+              onClick={() => { void preserve('side') }}
+              disabled={status === 'running' || promoting}
+            >
+              <UiIcon name="message-square" size={17} />
+            </button>
+          </span>
+          <span className="detail-icon-action" title={savingHint || (status === 'running'
+            ? '保存为新会话（解释生成完成后可用）' : '保存为新会话：将解释和追问保存到会话列表')}>
+            <button
+              className="detail-icon-btn primary"
+              aria-label="保存为新会话"
+              onClick={() => { void preserve('session') }}
+              disabled={status === 'running' || promoting}
+            >
+              <UiIcon name="plus" size={17} />
+            </button>
+          </span>
+          <span className="detail-icon-action" title={savingHint || '关闭解释：丢弃未保存的解释和追问'}>
+            <button className="detail-icon-btn" aria-label="关闭解释" onClick={discardAndClose} disabled={promoting}>
+              <UiIcon name="close" size={16} />
+            </button>
+          </span>
         </div>
         {error && <div className="detail-error" role="alert">{error}</div>}
         <div className="detail-stream">
           {visibleEvents.some((event) =>
-            (event.type === 'agent_message' && event.payload?.text) ||
+            event.type === 'user_message' || (event.type === 'agent_message' && event.payload?.text) ||
             event.type === 'error' ||
             (event.type === 'system_notice' && event.payload?.kind !== 'usage')
           ) ? (

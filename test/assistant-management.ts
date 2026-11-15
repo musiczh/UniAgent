@@ -9,6 +9,7 @@ import { ASSISTANT_TOOLS, ASSISTANT_REVIEW_TOOLS, type AssistantScope } from '..
 import { MANAGE_CONFIRMATION_PREFIX, type ManageOperation } from '../src/shared/uniagentManage'
 import type { AppSettings, Session, SessionConfig, UAEvent } from '../src/shared/types'
 import type { Requirement } from '../src/shared/requirementTypes'
+import { COLOR_THEMES } from '../src/shared/colorThemes'
 
 const directory = await mkdtemp(join(tmpdir(),'uniagent-management-'))
 const caller = { id:'assistant', title:'助手', status:'running', createdAt:1, config:{ agentId:'codex',workdir:directory,assistantSnapshot:{} } } as Session
@@ -62,6 +63,7 @@ async function execute(operation: string, params: Record<string,unknown>, resour
   return settled(manager,operationId)
 }
 try {
+  assert.equal(ASSISTANT_TOOLS.filter(tool => tool.name === 'uniagent_settings').length,1,'settings must expose one discoverable tool')
   assert.equal(ASSISTANT_TOOLS.filter(tool => tool.name === 'uniagent_manage').length,1)
   assert.deepEqual(ASSISTANT_REVIEW_TOOLS.map(tool => tool.name),['assistant_memory','session_search'])
   await assert.rejects(manager.call({...scope,jobId:'review'},{action:'describe'}),/unavailable/)
@@ -105,6 +107,13 @@ try {
 
   assert.equal((await execute('update',{section:'app',patch:{autoCheckUpdate:'false'},expectedRevision:manageRevision(settings)},'settings')).state,'failed')
   assert.equal(writes,0,'invalid types must never reach the settings store')
+  for (const theme of COLOR_THEMES) {
+    assert.equal((await execute('update',{section:'app',patch:{theme:theme.id},expectedRevision:manageRevision(settings)},'settings')).state,'completed')
+    assert.equal(settings.theme,theme.id)
+  }
+  const themeWrites = writes
+  assert.equal((await execute('update',{section:'app',patch:{theme:'unknown'},expectedRevision:manageRevision(settings)},'settings')).state,'failed')
+  assert.equal(writes,themeWrites,'unknown themes never reach the settings store')
   const list = await manager.call(scope,{action:'query',resource:'tasks',operation:'list'}) as any
   assert.equal(list.items.length,1)
   assert.equal(list.excludedCurrentSessionId,caller.id)
@@ -208,6 +217,40 @@ try {
   assert.equal(target.config.effort,'medium')
   assert.equal(target.config.permissionMode,'full-access','a partial patch must preserve unselected configuration')
   assert.equal(target.config.workdir,directory)
+
+  const readSettings = (path: string) => manager.callSettings(scope,{action:'read',params:{path}}) as Promise<any>
+  assert.equal((await readSettings('/')).kind,'directory')
+  await assert.rejects(manager.callSettings({...scope,jobId:'review'},{action:'read',params:{path:'/'}}),/unavailable/)
+  await assert.rejects(manager.callSettings({...scope,active:false},{action:'read',params:{path:'/'}}),/unavailable/)
+  await assert.rejects(manager.callSettings(scope,{action:'read',params:{path:'/'},extra:true}),/invalid_settings/)
+  const tree = await readSettings('/general/worktree'), settingsId = randomUUID()
+  const settingsRequest = {action:'update',params:{path:'/general/worktree',patch:{autoSyncWorktree:true},expectedRevision:tree.revision,operationId:settingsId}}
+  const beforeSettings = writes
+  await Promise.all([manager.callSettings(scope,settingsRequest),manager.callSettings(scope,settingsRequest)])
+  const settingsResult = await settled(manager,settingsId)
+  assert.equal(settingsResult.state,'completed');assert.equal(writes,beforeSettings+1)
+  assert.equal((settingsResult.result as any).value.autoSyncWorktree,true)
+  assert.equal((await manager.callSettings(scope,{action:'read',params:{operationId:settingsId}}) as ManageOperation).state,'completed')
+  await assert.rejects(manager.callSettings(scope,{...settingsRequest,params:{...settingsRequest.params,patch:{autoSyncWorktree:false}}}),/operation_id_conflict/)
+  const staleSettingsId = randomUUID()
+  const staleSettings = await manager.callSettings(scope,{...settingsRequest,params:{...settingsRequest.params,operationId:staleSettingsId}}) as ManageOperation
+  assert.equal(staleSettings.state,'failed');assert.match(staleSettings.error!,/revision_conflict/)
+  assert.equal(writes,beforeSettings+1)
+  const leaf = await readSettings('/general/power/preventSleep')
+  const leafResult = await manager.callSettings(scope,{action:'update',params:{path:leaf.path,patch:true,expectedRevision:leaf.revision,operationId:randomUUID()}}) as ManageOperation
+  assert.equal(leafResult.state,'completed');assert.equal(settings.preventSleep,true)
+  const updates = await readSettings('/agent/preferences'), confirmSettingsId = randomUUID()
+  const confirmedSettings = await manager.callSettings(scope,{action:'update',params:{path:updates.path,patch:{autoUpdateAgentsWhenIdle:true},expectedRevision:updates.revision,operationId:confirmSettingsId}}) as ManageOperation
+  assert.equal(confirmedSettings.state,'awaiting_confirmation')
+  assert.equal(settings.autoUpdateAgentsWhenIdle,undefined,'protected settings wait for the host user')
+  await approve!(true)
+  assert.equal((await settled(manager,confirmSettingsId)).state,'completed');assert.equal(settings.autoUpdateAgentsWhenIdle,true)
+  const pendingSettings = await readSettings('/agent/preferences'), pendingSettingsId = randomUUID()
+  await manager.callSettings(scope,{action:'update',params:{path:pendingSettings.path,patch:{autoUpdateAgentsOnLaunch:true},expectedRevision:pendingSettings.revision,operationId:pendingSettingsId}})
+  settings={...settings,autoUpdateAgentsWhenIdle:false}
+  await approve!(true)
+  assert.match((await settled(manager,pendingSettingsId)).error!,/revision_conflict/)
+  assert.equal(settings.autoUpdateAgentsOnLaunch,false,'a host confirmation must not bypass concurrent edits')
 
   const root = join(directory,'documents'), file = join(root,'context.md'), outside = join(directory,'outside.txt')
   await mkdir(root); await writeFile(file,'中文😀内容'); await writeFile(outside,'private')

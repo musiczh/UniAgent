@@ -22,7 +22,7 @@ import {
 } from './atomicFs.ts'
 import {
   assertSafeDestination, assertSafePathChain, cloneToml, discoverProvider, ensurePrivateDirectory, mcpRecord,
-  mergeMcpCredentialSafe, parseMcpBlocks, parseToml, providerPaths, rootPreference, setMcpServer, setRootPreference,
+  mergeMcpCredentialSafe, parseMcpBlocks, parseToml, parseNativeConfig, stringifyNativeConfig, providerPaths, rootPreference, setMcpServer, setRootPreference,
   stringifyToml, validateSkillTree, type TomlRecord
 } from './provider.ts'
 import { listCapabilityInventories, managedInventoryId } from './inventory.ts'
@@ -62,7 +62,7 @@ interface Journal {
   seal: string
   transactionRootIdentity?: TransactionRootIdentity
   id: string
-  provider: 'codex' | 'traex'
+  provider: CapabilityProviderId
   sharedAgents: boolean
   planId: string
   state: JournalState
@@ -167,7 +167,7 @@ export class CapabilitySyncService extends EventEmitter {
   private dataRoot: string
   private readonly allowedProviders: ReadonlySet<CapabilityProviderId>
 
-  constructor(home = homedir(), dataRoot = join(home, '.uniagent-public/capability-sync'), faultInjector?: (stage: string) => void, providers: readonly CapabilityProviderId[] = ['codex', 'traex']) {
+  constructor(home = homedir(), dataRoot = join(home, '.uniagent-public/capability-sync'), faultInjector?: (stage: string) => void, providers: readonly CapabilityProviderId[] = ['codex', 'traex', 'qoder']) {
     super()
     this.home = resolve(home)
     this.dataRoot = resolve(dataRoot)
@@ -456,6 +456,10 @@ export class CapabilitySyncService extends EventEmitter {
     const targetById = new Map(targetInv.items.map((item) => [item.id, item]))
     for (let index = 0; index < result.items.length; index++) {
       const item = result.items[index]
+      if (item.kind === 'global-preference' && req.source !== req.target && (req.source === 'qoder' || req.target === 'qoder')) {
+        result.items[index] = { ...item, status: 'incompatible', compatible: false, selectable: false, cloneSafe: false, defaultSelected: false }
+        continue
+      }
       if (item.kind !== 'mcp' || !item.selectable) continue
       const source = sourceById.get(item.id)
       const target = targetById.get(item.id)
@@ -468,7 +472,7 @@ export class CapabilitySyncService extends EventEmitter {
       }
     }
 
-    const agents = await this.readAgentsInputs(sourceInv, targetInv, req.source)
+    const agents = await this.readAgentsInputs(sourceInv, targetInv, req.source, req.target)
     result.items = result.items.filter((item) => item.kind !== 'global-instructions')
     const agentsItem = this.agentsItem(agents, sourceInv, targetInv)
     if (agentsItem) result.items.push(agentsItem)
@@ -478,7 +482,7 @@ export class CapabilitySyncService extends EventEmitter {
 
   /** Resolve capability-center opaque ids into the canonical ids of a fresh sync scan. */
   async prepareInventorySelection(req: CapabilityInventorySyncRequest): Promise<CapabilityInventorySyncPreparation> {
-    if (!this.allowedProviders.has(req.source) || !this.allowedProviders.has(req.target) || req.source === req.target || !['codex', 'traex'].includes(req.source) || !['codex', 'traex'].includes(req.target) ||
+    if (!this.allowedProviders.has(req.source) || !this.allowedProviders.has(req.target) || req.source === req.target || !['codex', 'traex', 'qoder'].includes(req.source) || !['codex', 'traex', 'qoder'].includes(req.target) ||
         !req.selections.length || req.selections.length > 1000 || new Set(req.selections).size !== req.selections.length) {
       throw new Error('invalid_selection')
     }
@@ -529,14 +533,15 @@ export class CapabilitySyncService extends EventEmitter {
   }
 
   /** Build an explicit deletion plan for user-owned Skill/MCP entries only. */
-  async planRemoval(target: 'codex' | 'traex', selections: string[]): Promise<CapabilitySyncPlan> {
+  async planRemoval(target: CapabilityProviderId, selections: string[]): Promise<CapabilitySyncPlan> {
     if (!this.allowedProviders.has(target)) throw new Error('capability_provider_unavailable')
     const other = target === 'codex' ? 'traex' : 'codex'
     const source = this.allowedProviders.has(other) ? other : target
     const sourceInv = await discoverProvider(source, this.home)
     const targetInv = await discoverProvider(target, this.home)
     const allowed = targetInv.items.filter((item) =>
-      item.owner === 'user' && (item.compatible || (item.kind === 'skill' && item.linked)) && (item.kind === 'skill' || item.kind === 'mcp'))
+      item.owner === 'user' && (item.compatible || (item.kind === 'skill' && item.linked) ||
+        (target === 'qoder' && item.kind === 'mcp' && !item.issueCode)) && (item.kind === 'skill' || item.kind === 'mcp'))
     const publicToCanonical = new Map(allowed.map((item) => [managedInventoryId(target, item.id), item.id]))
     if (!selections.length || new Set(selections).size !== selections.length ||
         selections.some((id) => !publicToCanonical.has(id))) throw new Error('invalid_selection')
@@ -645,7 +650,7 @@ export class CapabilitySyncService extends EventEmitter {
       await new Promise<void>((resolve) => this.lockIdleWaiters.add(resolve))
     }
     const operationLock = this.acquireOperationLock()
-    this.locks.add('codex'); this.locks.add('traex')
+    for (const provider of this.allowedProviders) this.locks.add(provider)
     try {
       let journal: Journal
       try { journal = await this.readJournal(this.journalPath(transactionId), transactionId) }
@@ -706,7 +711,7 @@ export class CapabilitySyncService extends EventEmitter {
         return { ...job }
       }
     } finally {
-      this.locks.delete('codex'); this.locks.delete('traex')
+      for (const provider of this.allowedProviders) this.locks.delete(provider)
       this.releaseLockWaiters()
       this.releaseOperationLock(operationLock)
     }
@@ -932,7 +937,7 @@ export class CapabilitySyncService extends EventEmitter {
       if (this.cancelled.has(job.id)) throw new Error('cancelled')
       const verified = await discoverProvider(plan.public.target, this.home)
       await this.verifyCommitted(plan, verified, expected)
-      if (expected.agentsFingerprint) await verifyAgentsShared(this.home, expected.agentsFingerprint)
+      if (expected.agentsFingerprint) await verifyAgentsShared(this.home, expected.agentsFingerprint, plan.public.source, plan.public.target)
       if (this.cancelled.has(job.id)) throw new Error('cancelled')
 
       journal.state = 'completed'
@@ -1016,8 +1021,8 @@ export class CapabilitySyncService extends EventEmitter {
       else if (operation.kind === 'memory') {
         output.add(memoryTarget(targetPaths.memories, operation.name))
       } else {
-        output.add(providerPaths('codex', this.home).agents)
-        output.add(providerPaths('traex', this.home).agents)
+        output.add(providerPaths(plan.public.source, this.home).agents)
+        output.add(providerPaths(plan.public.target, this.home).agents)
         output.add(join(this.home, '.agents/AGENTS.md'))
       }
     }
@@ -1074,7 +1079,7 @@ export class CapabilitySyncService extends EventEmitter {
     for (const operation of plan.public.operations) {
       this.validateOperationRoots()
       if (operation.action === 'noop' || operation.action === 'skip') continue
-      if (operation.kind === 'global-instructions') { await this.stageAgents(plan.public.agentsStrategy!, plan.scan.agents, byTarget, journal); continue }
+      if (operation.kind === 'global-instructions') { await this.stageAgents(plan.public.agentsStrategy!, plan.scan.agents, byTarget, journal, plan.public.source, plan.public.target); continue }
       const source = plan.scan.sourceInv.items.find((item) => item.id === operation.itemId)
       const target = operation.kind === 'skill' ? join(targetPaths.skills, operation.name)
         : operation.kind === 'memory' ? memoryTarget(targetPaths.memories, operation.name) : targetPaths.config
@@ -1083,7 +1088,7 @@ export class CapabilitySyncService extends EventEmitter {
       if (operation.action === 'delete') {
         if (operation.kind === 'mcp' || operation.kind === 'global-preference') {
           await this.ensureConfigStage(entry, journal)
-          await this.mutateConfig(entry.stage, operation.kind, operation.name, undefined)
+          await this.mutateConfig(entry.stage, operation.kind, operation.name, undefined, entry.target)
         } else entry.remove = true
         continue
       }
@@ -1101,15 +1106,15 @@ export class CapabilitySyncService extends EventEmitter {
       } else if (operation.kind === 'mcp') {
         await this.ensureConfigStage(entry, journal)
         const sourceValue = await this.mcpValue(source)
-        const config = parseToml(await readFile(entry.stage, 'utf8'))
+        const config = parseNativeConfig(await readFile(entry.stage, 'utf8'), entry.target)
         const targetValue = mcpRecord(config)[source.privateKey || source.name]
         const merged = mergeMcpCredentialSafe(sourceValue, isRecord(targetValue) ? targetValue : undefined)
         if (merged.credentialRequired || !merged.value) throw new Error('credential_required')
-        await this.mutateConfig(entry.stage, 'mcp', source.privateKey || source.name, merged.value)
+        await this.mutateConfig(entry.stage, 'mcp', source.privateKey || source.name, merged.value, entry.target)
       } else {
         await this.ensureConfigStage(entry, journal)
-        const sourceConfig = parseToml(await readFile(source.privateRef, 'utf8'))
-        await this.mutateConfig(entry.stage, 'global-preference', source.privateKey || source.name, rootPreference(sourceConfig, source.privateKey || source.name))
+        const sourceConfig = parseNativeConfig(await readFile(source.privateRef, 'utf8'), source.privateRef)
+        await this.mutateConfig(entry.stage, 'global-preference', source.privateKey || source.name, rootPreference(sourceConfig, source.privateKey || source.name), entry.target)
       }
     }
     for (const entry of stages) {
@@ -1124,7 +1129,7 @@ export class CapabilitySyncService extends EventEmitter {
 
   private async ensureConfigStage(entry: StagedEntry, journal: Journal): Promise<void> {
     if (journal.entries[entry.index].stageIdentity) return
-    const content = await readFile(entry.target)
+    const content = await readFile(entry.target).catch(error => { if (entry.target.endsWith('.json') && error.code === 'ENOENT') return Buffer.from('{}'); throw error })
     await this.createOwnedStage(entry, journal, 'file')
     await writeFile(entry.stage, content, { mode: 0o600 })
   }
@@ -1145,19 +1150,19 @@ export class CapabilitySyncService extends EventEmitter {
     this.faultInjector?.(`after-stage-owned-${entry.index}`)
   }
 
-  private async mutateConfig(stage: string, kind: 'mcp' | 'global-preference', name: string, value: unknown): Promise<void> {
-    const config = parseToml(await readFile(stage, 'utf8'))
+  private async mutateConfig(stage: string, kind: 'mcp' | 'global-preference', name: string, value: unknown, target: string): Promise<void> {
+    const config = parseNativeConfig(await readFile(stage, 'utf8'), target)
     if (kind === 'mcp') setMcpServer(config, name, value as TomlRecord | undefined)
     else setRootPreference(config, name, value)
-    const text = stringifyToml(config)
+    const text = stringifyNativeConfig(config, target)
     await writeFile(stage, text, { mode: 0o600 })
     // Validate the exact persisted bytes, not only the in-memory object.
-    parseToml(await readFile(stage, 'utf8'))
+    parseNativeConfig(await readFile(stage, 'utf8'), target)
   }
 
-  private async stageAgents(strategy: AgentsStrategy, inputs: AgentsInputs, stages: Map<string, StagedEntry>, journal: Journal): Promise<void> {
-    const codex = providerPaths('codex', this.home).agents
-    const traex = providerPaths('traex', this.home).agents
+  private async stageAgents(strategy: AgentsStrategy, inputs: AgentsInputs, stages: Map<string, StagedEntry>, journal: Journal, source: CapabilityProviderId, target: CapabilityProviderId): Promise<void> {
+    const codex = providerPaths(source, this.home).agents
+    const traex = providerPaths(target, this.home).agents
     const shared = join(this.home, '.agents/AGENTS.md')
     const content = this.agentsContent(strategy, inputs, true)
     if (!content) throw new Error('agents_source_empty')
@@ -1191,7 +1196,7 @@ export class CapabilitySyncService extends EventEmitter {
       }
     }
     const configEntry = byTarget.get(targetPaths.config)
-    const config = configEntry && !configEntry.remove ? parseToml(await readFile(configEntry.stage, 'utf8')) : undefined
+    const config = configEntry && !configEntry.remove ? parseNativeConfig(await readFile(configEntry.stage, 'utf8'), configEntry.target) : undefined
     if (config) stringifyToml(config)
     const current: ExpectedState = { fingerprints: new Map() }
     for (const operation of plan.public.operations) {
@@ -1651,13 +1656,13 @@ export class CapabilitySyncService extends EventEmitter {
     return target
   }
 
-  private allowedTarget(target: string, provider: 'codex' | 'traex', sharedAgents: boolean): boolean {
+  private allowedTarget(target: string, provider: CapabilityProviderId, sharedAgents: boolean): boolean {
     const candidate = resolve(target)
-    const providerRoot = provider === 'codex' ? join(this.home, '.codex') : join(this.home, '.trae')
+    const providerRoot = providerPaths(provider, this.home).root
     const exact = new Set<string>()
     const skillRoots: string[] = []
-    if (provider === 'codex') {
-      exact.add(join(providerRoot, 'config.toml'))
+    if (provider === 'codex' || provider === 'qoder') {
+      exact.add(join(providerRoot, provider === 'qoder' ? 'settings.json' : 'config.toml'))
       exact.add(join(providerRoot, 'AGENTS.md'))
       for (const name of MEMORY_NAMES) exact.add(join(providerRoot, name))
       skillRoots.push(join(providerRoot, 'skills'))
@@ -1671,6 +1676,7 @@ export class CapabilitySyncService extends EventEmitter {
       }
     }
     if (sharedAgents) {
+      exact.add(providerPaths('qoder', this.home).agents)
       exact.add(join(this.home, '.codex/AGENTS.md'))
       exact.add(join(this.home, '.trae/AGENTS.md'))
       exact.add(join(this.home, '.trae/cli/AGENTS.md'))
@@ -1682,10 +1688,10 @@ export class CapabilitySyncService extends EventEmitter {
 
   private validateSymlinkTarget(target: string, link: string): void {
     if (!link || link.length > 4096 || link.includes('\0')) throw new Error('invalid_symlink')
-    const skillRoots = [join(this.home, '.codex/skills'), join(this.home, '.trae/skills'), join(this.home, '.trae/cli/skills')].map((path) => resolve(path))
+    const skillRoots = [providerPaths('qoder', this.home).skills, join(this.home, '.codex/skills'), join(this.home, '.trae/skills'), join(this.home, '.trae/cli/skills')].map((path) => resolve(path))
     if (skillRoots.includes(dirname(resolve(target))) && isSafeLeafName(basename(target))) return
     const resolved = resolve(dirname(target), link)
-    const agents = new Set([join(this.home, '.codex/AGENTS.md'), join(this.home, '.trae/AGENTS.md'), join(this.home, '.trae/cli/AGENTS.md')].map((path) => resolve(path)))
+    const agents = new Set([providerPaths('qoder', this.home).agents, join(this.home, '.codex/AGENTS.md'), join(this.home, '.trae/AGENTS.md'), join(this.home, '.trae/cli/AGENTS.md')].map((path) => resolve(path)))
     if (!agents.has(resolve(target)) || resolved !== resolve(this.home, '.agents/AGENTS.md')) throw new Error('invalid_symlink')
   }
 
@@ -2353,19 +2359,19 @@ export class CapabilitySyncService extends EventEmitter {
   }
 
   private async mcpValue(item: CanonicalCapability): Promise<TomlRecord> {
-    const config = parseToml(await readFile(item.privateRef, 'utf8'))
+    const config = parseNativeConfig(await readFile(item.privateRef, 'utf8'), item.privateRef)
     const value = mcpRecord(config)[item.privateKey || item.name]
     if (!isRecord(value)) throw new Error('invalid_mcp_schema')
     return cloneToml(value)
   }
 
-  private async readAgentsInputs(source: Inventory, target: Inventory, sourceId: 'codex' | 'traex'): Promise<AgentsInputs> {
+  private async readAgentsInputs(source: Inventory, target: Inventory, sourceId: CapabilityProviderId, targetId: CapabilityProviderId): Promise<AgentsInputs> {
     const sourceText = await this.inventoryText(source, 'global-instructions:agents')
     const targetText = await this.inventoryText(target, 'global-instructions:agents')
     const sharedPath = join(this.home, '.agents/AGENTS.md')
     let shared: string | undefined
     try { await assertSafePathChain(sharedPath, this.home); shared = await readFile(sharedPath, 'utf8') } catch { /* absent or unsafe */ }
-    return sourceId === 'codex' ? { codex: sourceText, traex: targetText, shared } : { codex: targetText, traex: sourceText, shared }
+    return sourceId === 'qoder' || targetId === 'qoder' ? { codex: sourceText, traex: targetText, shared } : sourceId === 'codex' ? { codex: sourceText, traex: targetText, shared } : { codex: targetText, traex: sourceText, shared }
   }
 
   private async inventoryText(inventory: Inventory, id: string): Promise<string | undefined> {
@@ -2487,7 +2493,7 @@ function compareJournalOrderDescending(left: Journal, right: Journal): number {
 function isJournal(value: unknown): value is Journal {
   if (!isRecord(value) || !hasOnlyKeys(value, ['version','sealVersion','seal','transactionRootIdentity','id','provider','sharedAgents','planId','state','commitIndex','rollbackIndex','createdAt','completedAt','updatedAt','transactionOrder','preparationNonce','transactionLocation','renameIntent','entries','rollbackKind','cleanup','job']) ||
       ![1,2,3,4].includes(value.version as number) || (value.version === 1 ? value.transactionOrder != null : !finiteInteger(value.transactionOrder, 1)) ||
-      value.sealVersion !== 1 || typeof value.seal !== 'string' || !/^[a-f0-9]{64}$/.test(value.seal) || !isCanonicalUuid(value.id) || !['codex','traex'].includes(String(value.provider)) || typeof value.sharedAgents !== 'boolean' ||
+      value.sealVersion !== 1 || typeof value.seal !== 'string' || !/^[a-f0-9]{64}$/.test(value.seal) || !isCanonicalUuid(value.id) || !['codex','traex','qoder'].includes(String(value.provider)) || typeof value.sharedAgents !== 'boolean' ||
       !boundedText(value.planId) || !JOURNAL_STATES.has(value.state as JournalState) || !finiteInteger(value.commitIndex, 0, MAX_ENTRIES) ||
       !finiteInteger(value.rollbackIndex, 0, MAX_ENTRIES) || !finiteInteger(value.createdAt, 1) || !finiteInteger(value.updatedAt, value.createdAt as number) ||
       !Array.isArray(value.entries) || !isJob(value.job)) return false
@@ -2855,13 +2861,13 @@ function mergeMarkdownInputs(inputs: AgentsInputs): string {
   return output
 }
 
-async function verifyAgentsShared(home: string, expectedFingerprint: string): Promise<void> {
+async function verifyAgentsShared(home: string, expectedFingerprint: string, source: CapabilityProviderId, target: CapabilityProviderId): Promise<void> {
   const sharedPath = join(home, '.agents/AGENTS.md')
   const shared = await realpath(sharedPath)
-  const codex = await realpath(providerPaths('codex', home).agents)
-  const traex = await realpath(providerPaths('traex', home).agents)
+  const codex = await realpath(providerPaths(source, home).agents)
+  const traex = await realpath(providerPaths(target, home).agents)
   if (shared !== codex || shared !== traex) throw new Error('verification_failed')
-  const [sharedInfo, codexInfo, traexInfo] = await Promise.all([stat(sharedPath), stat(providerPaths('codex', home).agents), stat(providerPaths('traex', home).agents)])
+  const [sharedInfo, codexInfo, traexInfo] = await Promise.all([stat(sharedPath), stat(providerPaths(source, home).agents), stat(providerPaths(target, home).agents)])
   if (sharedInfo.ino !== codexInfo.ino || sharedInfo.ino !== traexInfo.ino) throw new Error('verification_failed')
   if (semanticHash(await readFile(sharedPath)) !== expectedFingerprint) throw new Error('verification_failed')
 }

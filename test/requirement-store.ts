@@ -24,14 +24,17 @@ try {
   const a = await store.create({ name: '共享需求' }), b = await store.create({ name: '另一个需求' })
   for (const sid of ['a','b','team']) { scopes.set(sid, a.id); events.set(sid, [event(sid, 1, '共享需求，保留登录态。'), event(sid, 2, '测试通过', 'command_exec')]) }
   const proof = [{ kind: 'user' as const, sessionId: 'a', seq: 1, quote: '保留登录态' }]
-  const read = (id = a.id) => store.context(id, 'a', { action: 'bootstrap' })
+  const read = (id = a.id) => store.context(id, 'a', { action: 'bootstrap' }, { background: true })
   let operation = 0
   const commit = async (documents: RequirementDocumentInput[], extra: Partial<RequirementContextRequest> = {}) => store.context(a.id, 'a',
     { action: 'commit', expectedRevision: (await read()).revision, operationId: 'op-' + ++operation, documents, ...extra })
-  await check('bootstrap only exposes core, state and navigation', async () => {
-    const c = await read()
+  await check('ordinary bootstrap exposes a short overview and retrieval instructions', async () => {
+    const c = await store.context(a.id, 'a', { action: 'bootstrap' })
     assert.equal(c.formatVersion, 2)
-    assert.equal(c.core.kind, 'core'); assert.equal(c.state.kind, 'state')
+    assert.equal(c.core, undefined); assert.equal(c.state, undefined)
+    assert.equal(c.readingStatus, 'missing')
+    assert.equal(c.sync.pending, undefined)
+    assert.equal((await store.context(a.id,'a',{action:'read',documentId:'core'})).document.kind,'core')
     assert.deepEqual(c.navigation, [])
     assert.equal(c.recentSources, undefined)
     assert.ok(existsSync(join(a.dir, 'INDEX.md')))
@@ -43,9 +46,9 @@ try {
     assert.equal((await store.create({ name: '共享需求' })).name, '共享需求 2')
     const unsafe = await store.create({ name: '../../危险/目录' })
     assert.ok(unsafe.dir.startsWith(join(home, 'requirements') + '/'))
-    const config = store.resolveSessionConfig({ agentId: 'codex', workdir: '/w', requirementId: a.id, requirementDir: '/forged', requirementDocPath: '/forged/context.md' })
+    const config = store.resolveSessionConfig({ agentId: 'codex', workdir: '/w', additionalDirectories: ['/space-extra'], requirementId: a.id, requirementDir: '/forged', requirementDocPath: '/forged/context.md' })
     assert.equal(config.requirementDocPath, a.docPath)
-    assert.ok(config.additionalDirectories?.includes(a.dir))
+    assert.deepEqual(config.additionalDirectories, ['/space-extra'], 'requirement context does not expand the source workspace')
     setRequirementsEnabled(false)
     try {
       const disabled = store.resolveSessionConfig(config, true)
@@ -168,6 +171,20 @@ try {
     assert.equal(store.get(a.id)?.projectId,'client')
     await store.clearProjectBindings('client');assert.equal(store.get(a.id)?.projectId,undefined)
   })
+  await check('restarting a pending read resets its continuation without sharing a background receipt', async () => {
+    const sid='reader-restart'
+    scopes.set(sid,a.id);events.set(sid,[event(sid,0,'首次输入'),event(sid,1,'第一份回复','agent_message'),event(sid,2,'第二份回复','agent_message')])
+    await store.recordInput(a.id,events.get(sid)![0])
+    await store.finishTurn(a.id,{...event(sid,3,''),type:'turn_completed',state:'success'})
+    const first=await store.context(a.id,sid,{action:'pending'})
+    const second=await store.context(a.id,sid,{action:'pending',...first.next})
+    assert.equal(second.events[0].seq,1)
+    const restarted=await store.context(a.id,sid,{action:'pending'})
+    assert.equal((await store.context(a.id,sid,{action:'pending',...restarted.next})).events[0].seq,1)
+    const background=await store.context(a.id,sid,{action:'pending'},{background:true})
+    await store.context(a.id,sid,{action:'pending',...background.next},{background:true})
+    assert.equal((await store.context(a.id,sid,{action:'pending',...second.next})).events[0].seq,2)
+  })
   await check('failed turn has a visible sync gap but no transcript or completion claim', async () => {
     await store.recordInput(a.id,event('b',20,'未完成研究'))
     await store.finishTurn(a.id,{...event('b',21,''),type:'turn_completed',state:'failed'})
@@ -186,16 +203,17 @@ try {
     await assert.rejects(commit([{id:'cycle',kind:'spec',title:'循环',content:'x',dependencies:['cycle'],sources:proof}]),/循环依赖/)
     await assert.rejects(commit([{id:'sensitive',kind:'knowledge',title:'敏感',content:'api_key=fixture-secret-value',sources:proof}]),/凭证/)
   })
-  await check('core bootstrap does not load unrelated topic bodies; damaged bodies fail closed', async () => {
-    const topic=await store.context(a.id,'a',{action:'read',documentId:'large'})
-    const body=join(a.dir,'.uniagent','bodies',topic.document.contentHash+'.md'),original=readFileSync(body,'utf8')
-    writeFileSync(body,'damaged')
+  await check('packed snapshots reject corruption and ignore unpublished slots', async () => {
+    const manifest=JSON.parse(readFileSync(join(a.dir,'.uniagent','manifest.json'),'utf8'))
+    const slot=manifest.checkpoints.find((entry:any)=>entry.revision===manifest.revision).slot
+    const path=join(a.dir,'.uniagent','checkpoints',slot+'.json'),original=readFileSync(path,'utf8')
+    writeFileSync(path,'damaged')
+    await assert.rejects(store.context(a.id,'a',{action:'read',documentId:'large'}))
+    writeFileSync(path,original)
     assert.equal((await read()).core.content,'必须保留登录态。')
-    await assert.rejects(store.context(a.id,'a',{action:'read',documentId:'large'}),/正文校验/)
-    writeFileSync(body,original)
-    const revision=(await read()).revision
-    writeFileSync(join(a.dir,'.uniagent','revisions','a'.repeat(64)+'.json'),'{unfinished')
-    assert.equal((await read()).revision,revision,'unpublished snapshots never replace the manifest pointer')
+    const free=Array.from({length:21},(_,i)=>i).find(i=>!manifest.checkpoints.some((entry:any)=>entry.slot===i))
+    writeFileSync(join(a.dir,'.uniagent','checkpoints',free+'.json'),'{unfinished')
+    assert.equal((await read()).revision,manifest.revision,'unpublished slots never replace the manifest pointer')
   })
   await check('restart recovery finds durable session input without copying it', async () => {
     const recovered=new RequirementStore(home)
@@ -232,7 +250,7 @@ try {
     writeFileSync(a.docPath,'incomplete projection')
     await read();assert.ok(readFileSync(a.docPath,'utf8').includes('必须保留登录态'))
     const outside=join(home,'outside.md');writeFileSync(outside,'unchanged')
-    const path=join(a.dir,'knowledge','large.md');rmSync(path);symlinkSync(outside,path)
+    const path=join(a.dir,'knowledge','INDEX.md');rmSync(path);symlinkSync(outside,path)
     await assert.rejects(store.context(a.id,'a',{action:'read',documentId:'large/../../outside'}))
     assert.equal((await read()).projectionStatus,'ready')
     assert.equal(readFileSync(outside,'utf8'),'unchanged','projection repair must not follow a symlink')

@@ -4,10 +4,11 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { createRequire, syncBuiltinESMExports } from 'node:module'
 import { promisify } from 'node:util'
 import test from 'node:test'
 import { ACPConnection } from '../src/main/acp/acpConnection'
-import { closeACPConnections, flushACPProcessRecords, inspectACPProcess, prepareACPConnections, sameProcessIdentity, type ProcessIdentity } from '../src/main/acp/acpProcessLifecycle'
+import { awaitACPStartup, closeACPConnections, flushACPProcessRecords, inspectACPProcess, prepareACPConnections, sameProcessIdentity, type ProcessIdentity } from '../src/main/acp/acpProcessLifecycle'
 
 const childCode = `process.on('SIGTERM',()=>{});require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const frame=JSON.parse(line);process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:frame.id,result:{protocolVersion:1,agentCapabilities:{}}})+String.fromCharCode(10))});setInterval(()=>{},1000)`
 const descendantCode = `const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e',${JSON.stringify(childCode)}],{stdio:'ignore'});process.on('SIGTERM',()=>process.exit(0));require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const frame=JSON.parse(line);setTimeout(()=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:frame.id,result:{protocolVersion:1,agentCapabilities:{},childPid:child.pid}})+String.fromCharCode(10)),300)});setInterval(()=>{},1000)`
@@ -50,6 +51,36 @@ if (fixture) {
     try { await assert.rejects(connection.initialize(), /正在退出/) }
     finally { await connection.closeAndWait() }
     output({ blocked: true })
+  } else if (mode === 'setup-retry') {
+    await assert.rejects(prepareACPConnections(directory, Promise.reject(new Error('fixture setup failure'))), /fixture setup failure/)
+    const connection = new ACPConnection({ bin: process.execPath, args: ['-e', childCode], providerLabel: 'Grok' })
+    try { await connection.initialize(); output({ recovered: true }) }
+    finally { await closeACPConnections() }
+  } else if (mode === 'scoped-retry' || mode === 'legacy-retry') {
+    const parent = await inspectACPProcess(process.ppid)
+    assert.ok(parent.ok && parent.process)
+    const owner = { ...parent.process, startTime: 'Mon Jan 1 00:00:00 2001' }
+    const root: ProcessIdentity = { pid: process.pid, ppid: owner.pid, uid: owner.uid, pgid: process.pid, startTime: owner.startTime }
+    const path = join(directory, `${owner.pid}-${root.pid}.json`)
+    const record = { version: 1, owner, root, processes: [], ...(mode === 'scoped-retry' ? { provider: 'mcode' } : {}) }
+    await writeFile(path, JSON.stringify(record))
+    await assert.rejects(prepareACPConnections(directory), /进程归属无法确认/)
+    const other = new ACPConnection({ bin: process.execPath, args: ['-e', childCode], providerLabel: 'Grok alias', recoveryScope: 'grok' })
+    const affected = new ACPConnection({ bin: process.execPath, args: ['-e', childCode], providerLabel: 'MiniMax alias', recoveryScope: 'mcode' })
+    const sibling = new ACPConnection({ bin: process.execPath, args: ['-e', childCode], providerLabel: 'mcode' })
+    try {
+      await assert.rejects(affected.initialize(), /本地进程恢复未完成/)
+      if (mode === 'scoped-retry') {
+        await other.initialize()
+        await awaitACPStartup('kimi')
+      } else {
+        await assert.rejects(other.initialize(), /本地进程恢复未完成/, 'unattributed legacy records remain guarded')
+      }
+      await writeFile(path, JSON.stringify({ ...record, owner: parent.process }))
+      await Promise.all([affected.initialize(), sibling.initialize()])
+      if (mode === 'legacy-retry') await other.initialize()
+      output({ recovered: true })
+    } finally { await closeACPConnections() }
   } else {
     await prepareACPConnections(directory)
     const connections: ACPConnection[] = []
@@ -111,11 +142,56 @@ if (fixture) {
     } finally { await cleanup(); await rm(directory, { recursive: true, force: true }) }
   })
 
+  test('closeAndWait accepts valid process snapshots that finish within the inspection timeout', async () => {
+    const connection = new ACPConnection({ bin: process.execPath, args: ['-e', childCode], providerLabel: 'Grok' })
+    try {
+      await connection.initialize()
+      const inspected = await inspectACPProcess((connection as any).child.pid)
+      assert.ok(inspected.ok && inspected.process)
+      owned.push(inspected.process)
+      const refresh = (connection as any).refreshProcessTree.bind(connection)
+      ;(connection as any).refreshProcessTree = async (owner: any, ...args: any[]) => {
+        const sweeping = owner.sweepStartedAt !== undefined
+        const scan = await refresh(owner, ...args)
+        // Successful scans may take up to one second; retain real kernel identities.
+        if (sweeping && scan.ok) await new Promise(resolve => setTimeout(resolve, 600))
+        return scan
+      }
+      await connection.closeAndWait()
+      assert.equal(await alive(inspected.process), false, 'slow successful inspection must still confirm the owned process exit')
+    } finally { connection.close('SIGKILL'); await cleanup() }
+  })
+
+  test('PID inspection accepts a slow valid kernel identity and still rejects a timed out query', async () => {
+    const expected = await inspectACPProcess(process.pid)
+    assert.ok(expected.ok && expected.process)
+    const childProcess = createRequire(import.meta.url)('node:child_process') as typeof import('node:child_process')
+    const execute = childProcess.execFile
+    let waitMs = 600
+    childProcess.execFile = function (file: string, ...args: any[]) {
+      if (file !== '/bin/ps' || !args[0]?.includes('-p')) return Reflect.apply(execute, childProcess, [file, ...args])
+      const code = `setTimeout(() => { const value = require('node:child_process').execFileSync('/bin/ps', process.argv.slice(1), {encoding:'utf8'}); process.stdout.write(value) }, ${waitMs})`
+      return Reflect.apply(execute, childProcess, [process.execPath, ['-e', code, '--', ...args[0]], ...args.slice(1)])
+    } as typeof execFile
+    syncBuiltinESMExports()
+    try {
+      const slow = await inspectACPProcess(process.pid)
+      assert.ok(slow.ok && slow.process, 'a valid 600ms kernel query fits the process inspection budget')
+      assert.deepEqual(slow.process, expected.process)
+      waitMs = 2000
+      const stalled = await inspectACPProcess(process.pid)
+      assert.equal(stalled.ok, false, 'an unresponsive query must not establish process ownership')
+      if (!stalled.ok) assert.equal((stalled.error as { killed?: boolean }).killed, true)
+    } finally { childProcess.execFile = execute; syncBuiltinESMExports() }
+  })
+
   test('startup closes abandoned ACP processes before opening a usable replacement', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'ua-acp-recover-'))
     try {
       const [previous] = await host('crash', directory)
       assert.equal(await alive(previous.children[0]), true)
+      const [name] = (await readdir(directory)).filter(file => file.endsWith('.json'))
+      assert.equal(JSON.parse(await readFile(join(directory, name), 'utf8')).provider, 'session', 'new records carry their provider scope')
       const next = await host('recover', directory)
       assert.equal(next.at(-1).closed, true)
       assert.equal(await alive(previous.children[0]), false)
@@ -201,5 +277,19 @@ if (fixture) {
       await assert.rejects(host('recover', directory), /归属记录无法读取/)
       assert.equal(await alive(previous.children[0]), true)
     } finally { await cleanup(); await rm(directory, { recursive: true, force: true }) }
+  })
+
+  for (const mode of ['scoped-retry', 'legacy-retry']) {
+    test(`${mode}: recovery retries safely without poisoning future detection`, async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'ua-acp-retry-'))
+      try { assert.equal((await host(mode, directory))[0].recovered, true) }
+      finally { await cleanup(); await rm(directory, { recursive: true, force: true }) }
+    })
+  }
+
+  test('a failed startup setup is retried by the next connection', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'ua-acp-setup-retry-'))
+    try { assert.equal((await host('setup-retry', directory))[0].recovered, true) }
+    finally { await cleanup(); await rm(directory, { recursive: true, force: true }) }
   })
 }

@@ -7,6 +7,7 @@ import { APP_NAME } from '../src/shared/distribution'
 
 const result = await renderEventStream([], 'idle', 'sidebar-attention-restart', {
   setup: `
+    import { sessionAttentionFixture } from './test/regression/session-attention-fixture';
     const publicBase = document.createElement('base');
     publicBase.href = ${JSON.stringify(pathToFileURL(resolve('src/renderer/public') + '/').href)};
     document.head.append(publicBase);
@@ -14,29 +15,45 @@ const result = await renderEventStream([], 'idle', 'sidebar-attention-restart', 
       ['codex','claude','kimi','deepseek','grok','minimax','zcode'].map(id => '<div data-agent="' + id + '"></div>').join('') +
       '</div><div class="glow"></div><div class="constellation"></div><h1 id="ua-startup-title"></h1><div id="ua-startup-stage"></div><button id="ua-startup-restart"></button></div>');
     const listeners = {};
-    const subscribe = name => callback => { listeners[name] = callback; return () => { if (listeners[name] === callback) delete listeners[name]; }; };
+    const subscriptions = {};
+    const subscribe = name => callback => {
+      const callbacks = subscriptions[name] ||= new Set();
+      callbacks.add(callback);
+      listeners[name] ||= value => {
+        attention.push(name === 'side' ? 'sideStatus' : name, value);
+        for (const subscriber of callbacks) subscriber(value);
+      };
+      return () => { callbacks.delete(callback); if (!callbacks.size) delete listeners[name]; };
+    };
     const session = id => ({ id, title: id, status: 'idle', createdAt: 1, config: { agentId: 'codex', workdir: '/fixture', projectId: 'default' } });
     const sessions = ['main', 'side', 'question', 'native', 'status'].map(session);
     const agent = { id: 'codex', name: 'Codex', adapter: 'codex', bin: 'codex', installed: true,
       lifecycle: { availability: 'available' }, capabilities: { permissionModes: [] }, models: [] };
     const runtime = {};
     const historyLoads = [];
+    const attention = sessionAttentionFixture(() => sessions, (id, source) => source === 'main' ? runtime[id] || [] : [], () => window.fixture.focused);
+    listeners.side = value => attention.push('sideStatus', value);
+    listeners.sideEvent = value => attention.push('sideEvent', value);
     const methods = {
+      ...attention.methods,
       startupState: async () => ({ ready: true }), teamCatalog: async () => ({ teams: [], projects: [], errors: [] }),
-      getLifecycleSnapshot: async () => [agent], getAppSettings: async () => ({}), listSessions: async () => sessions,
-      getAssistantPrivateSessions: async () => [], listQueues: async () => ({}), e2eEnabled: async () => false,
+      getLifecycleSnapshot: async () => [agent], getAppSettings: async () => ({ spaceRequirementSidebar: false }), listSessions: async () => sessions,
+      getAssistantPrivateSessions: async () => [], getWorktreeArchiveReviews: async () => [], listQueues: async () => ({}), listForkJobs: async () => [], e2eEnabled: async () => false,
       listProjects: async () => [{ id: 'default', name: '默认项目', primaryDirectory: '/fixture', additionalDirectories: [], isDefault: true, createdAt: 1, updatedAt: 1 }],
       listRequirements: async () => [], listPresets: async () => [], getPrefs: async () => ({ lastByAgent: {} }),
-      getSessionRuntimeState: async (id, includeEvents = true) => { if (includeEvents) historyLoads.push(id); return { events: runtime[id] || [], hasLiveStreamer: false, nativeSessionOccupancy: { state: 'unknown' } }; },
-      archiveSession: async id => { const index = sessions.findIndex(item => item.id === id); return sessions[index] = { ...sessions[index], archived: true }; },
+      getSessionRuntimeState: async (id, includeEvents = true) => { if (includeEvents) { historyLoads.push(id); attention.reconcile(id); if (id === 'status') listeners.status({sessionId:id,status:'idle'}); } return { events: runtime[id] || [], hasLiveStreamer: false, nativeSessionOccupancy: { state: 'unknown' } }; },
+      archiveSession: async id => { const index = sessions.findIndex(item => item.id === id); window.fixture.badge.archiveSession(id); return sessions[index] = { ...sessions[index], archived: true }; },
       unarchiveSession: async id => { const index = sessions.findIndex(item => item.id === id); return sessions[index] = { ...sessions[index], archived: false }; },
       onEvent: subscribe('event'), onStatusChange: subscribe('status'), onSideStatus: subscribe('side'),
+      onSideEvent: subscribe('sideEvent'),
       onAppNotificationOpenSession: subscribe('open')
     };
     window.uniagent = new Proxy(methods, { get: (target, key) => key in target ? target[key] :
       String(key).startsWith('on') ? () => () => {} : async () => null });
     localStorage.clear();
-    window.fixture = { listeners, runtime, historyLoads, session };
+    window.fixture = { listeners, runtime, historyLoads, session, focused: true, get badge() { return attention.badge }, get badgeText() { return attention.text() } };
+    Object.defineProperty(document, 'hasFocus', { value: () => window.fixture.focused });
+    Object.defineProperty(document, 'visibilityState', { value: 'visible' });
     window.appReady = import('./src/renderer/App').then(({ App }) => {
       const node = document.body.appendChild(document.createElement('div'));
       let root;
@@ -47,7 +64,8 @@ const result = await renderEventStream([], 'idle', 'sidebar-attention-restart', 
   `,
   inspect: `(async () => {
     const pause = () => new Promise(resolve => setTimeout(resolve, 40));
-    const wait = async predicate => { for (let i = 0; i < 80; i++) { if (predicate()) return; await pause(); } throw new Error('sidebar fixture did not settle: ' + document.body.innerHTML.slice(-2000)); };
+    let checkpoint = 0;
+    const wait = async predicate => { const current = ++checkpoint; for (let i = 0; i < 80; i++) { if (predicate()) return; await pause(); } throw new Error('sidebar fixture checkpoint ' + current + ': ' + JSON.stringify({dock:window.fixture.badgeText,unread:window.fixture.badge.snapshot().unreadBySession,loads:window.fixture.historyLoads,rows:[...document.querySelectorAll('[data-session-id]')].map(node=>[node.dataset.sessionId,node.querySelector('.si-ask,.si-unread')?.className])})); };
     await window.appReady;
     await wait(() => document.querySelectorAll('.session-item[data-session-id]').length === 5 && window.fixture.listeners.status);
     const logo = document.querySelector('.sidebar-header .logo');
@@ -101,6 +119,25 @@ const result = await renderEventStream([], 'idle', 'sidebar-attention-restart', 
     document.querySelector('[data-session-id="side"] button[aria-label="恢复会话"]').click();
     await wait(() => document.querySelector('[data-session-id="side"] button[aria-label="归档会话"]'));
     const afterArchiveAndRestore = marker('side');
+    for (const id of ['main','side','question','native','status']) window.fixture.badge.removeSession(id);
+    document.querySelector('[data-session-id="main"]').click(); await pause();
+    window.fixture.focused = false;
+    const completion = { sessionId: 'main', seq: 100, ts: 100, type: 'turn_completed', state: 'success', payload: {} };
+    const sideCompletion = { ...completion, sessionId: 'side' };
+    emitStatus('main', 'idle'); await pause();
+    emit(completion);
+    window.fixture.listeners.sideEvent({ sessionId: 'side', event: sideCompletion });
+    await wait(() => marker('main') && marker('side'));
+    const backgroundCompletions = { dock: window.fixture.badgeText, main: marker('main'), side: marker('side') };
+    window.fixture.focused = true;
+    window.dispatchEvent(new Event('focus'));
+    await wait(() => !marker('main'));
+    const afterFocus = { dock: window.fixture.badgeText, main: marker('main'), side: marker('side') };
+    document.querySelector('[data-session-id="side"]').click(); await pause();
+    const afterReadingBoth = { dock: window.fixture.badgeText, main: marker('main'), side: marker('side') };
+    emit(completion);
+    window.fixture.listeners.sideEvent({ sessionId: 'side', event: sideCompletion }); await pause();
+    const afterReplayedCompletions = { dock: window.fixture.badgeText, main: marker('main'), side: marker('side') };
     window.unmountApp();
     localStorage.setItem('ua.sidebarUnread', '{');
     localStorage.setItem('ua.sidebarPendingInteractions', JSON.stringify({ question: ['request:q', 12], main: ['invalid'], bad: 'invalid' }));
@@ -108,7 +145,7 @@ const result = await renderEventStream([], 'idle', 'sidebar-attention-restart', 
     await wait(() => document.querySelectorAll('.session-item[data-session-id]').length === 5);
     await pause();
     const malformed = Object.fromEntries(['main','side','question','native','status'].map(id => [id, marker(id)]));
-    return { brand, before, restored, afterUnrelated, afterOpenQuestion, afterOneAnswer, afterAllAnswers, afterExpiredQuestion, afterExpiredStatus, secondRestart, afterArchiveAndRestore, malformed };
+    return { brand, before, restored, afterUnrelated, afterOpenQuestion, afterOneAnswer, afterAllAnswers, afterExpiredQuestion, afterExpiredStatus, secondRestart, afterArchiveAndRestore, backgroundCompletions, afterFocus, afterReadingBoth, afterReplayedCompletions, malformed };
   })()`
 })
 
@@ -131,5 +168,9 @@ assert.equal(result.afterExpiredQuestion, null, 'loading an expired native quest
 assert.equal(result.afterExpiredStatus, null, 'loading an expired status-only request clears the stale reminder')
 assert.deepEqual(result.secondRestart, { main: null, side: 'si-unread side', question: null, native: null, status: null }, 'reading and answering remain cleared after another restart')
 assert.equal(result.afterArchiveAndRestore, null, 'archiving and restoring a session does not resurrect unread attention')
+assert.deepEqual(result.backgroundCompletions, { dock: '2', main: 'si-unread ', side: 'si-unread side' }, 'each Dock count has a sidebar unread dot even without a busy status edge or while the selected session is unfocused')
+assert.deepEqual(result.afterFocus, { dock: '1', main: null, side: 'si-unread side' }, 'focusing the current session reads it in both the sidebar and Dock')
+assert.deepEqual(result.afterReadingBoth, { dock: '', main: null, side: null }, 'reading both sessions removes the badge and both unread dots')
+assert.deepEqual(result.afterReplayedCompletions, result.afterReadingBoth, 'replayed main and side completion events cannot recreate read attention')
 assert.deepEqual(result.malformed, { main: null, side: null, question: 'si-ask', native: null, status: null }, 'malformed storage is ignored while valid pending ids remain readable')
 console.log('sidebar attention restart: ok')

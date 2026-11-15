@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { AgentDef, Session, SideChatState, UAEvent } from '@shared/types'
-import type { NativeCapabilitySnapshot } from '@shared/nativeCapabilities'
+import type { AgentDef, Attachment, Session, SideChatState, TurnBubbleInput, UAEvent } from '@shared/types'
+import type { NativeCapabilitySnapshot, NativeTurnSelectionRequest } from '@shared/nativeCapabilities'
+import { isSessionBusy } from '@shared/sessionStatus'
 import { withCompactionTiming } from '@shared/eventSnapshots'
 import { isTaskTurnInput } from '@shared/tokenSpeed'
 import { contextCompactionAvailability, supportsManualContextCompaction } from '../contextCompaction'
@@ -114,6 +115,23 @@ export function SideChatPanel({
   }, [sessionId, rendered])
 
   const config = sideState?.config
+  async function sendInput(prompt: string, attachments?: Attachment[], selection?: NativeTurnSelectionRequest, activatePlan?: boolean, bubble?: TurnBubbleInput, force = false): Promise<void> {
+    const clientTurnKey = bubble?.clientTurnKey || crypto.randomUUID()
+    const decoration = { ...bubble, clientTurnKey }
+    const queued = !force && isSessionBusy(sideState?.status || 'idle')
+    if (queued) setSideState(current => current && ({ ...current, queue: [...current.queue, { id: `optimistic-${clientTurnKey}`, prompt, attachments, ...decoration }] }))
+    else setEvents(current => [...current, { sessionId, seq: -Date.now(), ts: Date.now(), type: 'user_message',
+      payload: { text: prompt, attachments, ...decoration, optimistic: true, ...(force ? { appendedToTurn: true } : {}) } }])
+    try {
+      if (force) await window.uniagent.forceSendSideMessage(sessionId, prompt, attachments, selection, decoration)
+      else await window.uniagent.sendSideMessage(sessionId, prompt, attachments, selection, activatePlan, decoration)
+      if (bubble?.comments?.length) onClearComments?.()
+    } catch (error) {
+      setEvents(current => current.filter(event => !event.payload.optimistic || event.payload.clientTurnKey !== clientTurnKey))
+      setSideState(current => current && ({ ...current, queue: current.queue.filter(item => item.clientTurnKey !== clientTurnKey || !item.id.startsWith('optimistic-')) }))
+      throw error
+    }
+  }
   const { snapshot: capabilities, ready: capabilitiesReady } = useNativeCapabilities(
     config?.agentId,
     config?.workdir
@@ -184,16 +202,18 @@ export function SideChatPanel({
         title="拖动调整宽度"
         onMouseDown={() => { dragRef.current = true }}
       />
-      <div className="subagent-panel-head">
+      <div className="subagent-panel-head responsive-toolbar">
         <span className="subagent-panel-title"><UiIcon name="message-square" size={15} /> 侧边对话</span>
         <span className="side-panel-hint">独立支线 · 配置互不影响</span>
         <button
-          className="side-promote-btn"
-          title="将当前侧边对话转为独立会话"
+          className="side-promote-btn toolbar-action"
+          title={promoting ? '正在转为独立会话' : '将当前侧边对话转为独立会话'}
+          aria-label="转为独立会话"
+          aria-busy={promoting}
           onClick={() => void promote()}
           disabled={promoting || status !== 'idle' || !hasConversation}
         >
-          <UiIcon name="fork" size={13} /> {promoting ? '转换中…' : '独立会话'}
+          <UiIcon name="fork" size={13} /><span className="toolbar-action-label">{promoting ? '转换中…' : '独立会话'}</span>
         </button>
         <button className="side-new-btn" title="清空并开始新的侧边对话" onClick={() => void startNew()} disabled={promoting}>
           新对话
@@ -236,14 +256,8 @@ export function SideChatPanel({
             status={status}
             agent={composerAgent}
             config={config}
-            onSend={(prompt, attachments, selection, activatePlan, bubble) => {
-              void window.uniagent.sendSideMessage(sessionId, prompt, attachments, selection, activatePlan, bubble)
-              if (bubble?.comments?.length) onClearComments?.()
-            }}
-            onForceSend={(prompt, attachments, selection, bubble) => {
-              void window.uniagent.forceSendSideMessage(sessionId, prompt, attachments, selection, bubble)
-              if (bubble?.comments?.length) onClearComments?.()
-            }}
+            onSend={sendInput}
+            onForceSend={(prompt, attachments, selection, bubble) => sendInput(prompt, attachments, selection, undefined, bubble, true)}
             onInterrupt={() => { void window.uniagent.interruptSide(sessionId) }}
             onUpdateConfig={(patch) => {
               setPanelError('')
@@ -288,6 +302,15 @@ export function SideChatPanel({
 }
 
 function appendSideEvent(events: UAEvent[], event: UAEvent): UAEvent[] {
+  if (event.type === 'user_message' && event.payload.clientTurnKey) {
+    const index = events.findIndex(item => item.type === event.type && item.payload.clientTurnKey === event.payload.clientTurnKey)
+    if (index >= 0) {
+      if (!events[index].payload.optimistic && event.payload.optimistic) return events
+      const next = [...events]
+      next[index] = { ...event, payload: { ...events[index].payload, ...event.payload, optimistic: event.payload.optimistic === true } }
+      return next
+    }
+  }
   const existing = events.findIndex(item => item.seq === event.seq)
   if (existing >= 0) {
     const next = [...events]

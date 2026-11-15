@@ -77,7 +77,7 @@ export interface TeamProject {
   legacyMessagesArchived?: boolean
 }
 export interface TeamCatalog { teams: TeamDefinition[]; projects: TeamProject[]; errors: string[]; unavailableReasons?: Record<string, string> }
-export interface TeamCreateProjectInput { teamId: string; spaceId: string; requirementId?: string; prompt: string; attachments?: Attachment[]; workspaceSelection?: WorkspaceSelection }
+export interface TeamCreateProjectInput { teamId: string; spaceId: string; requirementId?: string; taskRequestId?: string; taskScope?: import('./task').TaskScope; prompt: string; attachments?: Attachment[]; workspaceSelection?: WorkspaceSelection }
 export const DEFAULT_TEAM_RULES = '用户只与 Leader 对话。Leader 负责组织、派发、回答成员业务问题与验收交付；成员是工具，不直接要求用户管理。需要用户决策时先提供可查看材料，再合并提问。真实权限授权由用户处理。最终通过普通回复交付结论和文件，并登记团队完成状态。'
 export const DEFAULT_TEAM_LIMITS: TeamLimits = { concurrency: 0, maxAssignments: 0, taskMinutes: 0, runMinutes: 0 }
 export const TEAM_IPC = { catalog: 'team:catalog', save: 'team:save', delete: 'team:delete', createRole: 'team:createRole', createProject: 'team:createProject', send: 'team:send', stop: 'team:stop', resume: 'team:resume', archive: 'team:archive', rename: 'team:rename', session: 'team:session', respond: 'team:respond', changed: 'team:changed', artifact: 'team:artifact' } as const

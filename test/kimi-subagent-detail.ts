@@ -73,6 +73,8 @@ const transcript = [{
 const fixture = await createFakeKimi()
 const coldFixture = await createFakeKimi({ tasks: [] })
 const liveFixture = await createFakeKimi()
+const modernFixture = await createFakeKimi({ modern: true })
+const modernForeignFixture = await createFakeKimi({ modern: true, agents: [{ agentId: 'child-1', type: 'sub', parentAgentId: 'another-parent' }] })
 try {
   const store = new SessionStore(join(fixture.dir, 'sessions.json'))
   store.saveOrThrow([{
@@ -160,6 +162,11 @@ try {
       loadKimiSubAgentEvents('native-parent', 'child-1', coldFixture.bin, coldFixture.dir, { KIMI_CODE_HOME: coldFixture.home }),
       /subagent_not_owned/
     )
+    const modern = await loadKimiSubAgentEvents('native-parent', 'child-1', modernFixture.bin, modernFixture.dir, { KIMI_CODE_HOME: modernFixture.home })
+    assert.ok(modern.some(event => event.type === 'agent_message'))
+    const modernRequests = await readRequests(modernFixture)
+    assert.ok(modernRequests.every(row => row.method === 'GET' && !row.path.endsWith('/tasks')), 'new cold history reads only the transcript roster without subscribing or loading the parent')
+    await assert.rejects(loadKimiSubAgentEvents('native-parent', 'child-1', modernForeignFixture.bin, modernForeignFixture.dir, { KIMI_CODE_HOME: modernForeignFixture.home }, trusted), /subagent_not_owned/)
   } finally {
     orchestrator.disposeAll()
   }
@@ -167,5 +174,7 @@ try {
   await fixture.cleanup()
   await coldFixture.cleanup()
   await liveFixture.cleanup()
+  await modernFixture.cleanup()
+  await modernForeignFixture.cleanup()
 }
 console.log('kimi-subagent-detail: live runner routing, cold transcript ownership and rendered child output passed')

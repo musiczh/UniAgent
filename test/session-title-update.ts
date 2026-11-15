@@ -444,6 +444,23 @@ async function traexTitleRequestFailureRemainsActionable(): Promise<void> {
   } finally { runner.dispose() }
 }
 
+async function handoffExportDisablesInjectedAndNativeMcps(): Promise<void> {
+  const transport = new TitleTransport(undefined, undefined, { external: { command: '/usr/bin/true' } })
+  const runner = new AppServerRunner('handoff-export', { n: 0 }, agent('codex'),
+    { agentId: 'codex', workdir: '/repo', permissionMode: 'read-only' }, undefined, undefined, () => transport)
+  try {
+    await runner.restrictToHandoffExport()
+    await runner.ensureThreadReady()
+    const start = transport.requests.find(({ method }) => method === 'thread/start')!.params
+    const resume = transport.requests.find(({ method }) => method === 'thread/resume')!.params
+    for (const params of [start, resume]) {
+      assert.equal(params.config['mcp_servers.uniagent.enabled'], false, 'handoff export disables its injected MCP')
+      assert.equal(params.config['mcp_servers.uniagent.command'], process.execPath, 'disabled injected MCP keeps a valid transport')
+    }
+    assert.equal(resume.config['mcp_servers.external.enabled'], false, 'handoff export also disables native MCP servers')
+  } finally { runner.dispose() }
+}
+
 async function supplementalTitleStaysOnSelectedProvider(thirdParty = false): Promise<void> {
   const transport = new TitleTransport()
   const source = thirdParty ? { kind: 'third-party' as const, sourceId: 'kimi' } : { kind: 'local' as const, sourceId: 'bonsai' }
@@ -477,6 +494,7 @@ async function supplementalTitleStaysOnSelectedProvider(thirdParty = false): Pro
   }
 }
 
+await handoffExportDisablesInjectedAndNativeMcps()
 await traexTitleRequestFailureRemainsActionable()
 await traexEmptyTitleCanRetryWithoutNoise()
 await supplementalTitleStaysOnSelectedProvider(true)

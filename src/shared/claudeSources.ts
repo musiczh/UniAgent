@@ -13,7 +13,7 @@ export const CLAUDE_SOURCE_PRESETS = {
 export type ClaudeSourcePreset = keyof typeof CLAUDE_SOURCE_PRESETS
 
 /** Kimi Code authenticates with x-api-key/ANTHROPIC_API_KEY; DeepSeek and MiMo accept a Bearer token. */
-export function claudeSourceUsesAuthToken(preset: ClaudeSourcePreset): boolean {
+export function claudeSourceUsesAuthToken(preset: ClaudeSourcePreset | 'ferry'): boolean {
   return preset !== 'kimi-code'
 }
 

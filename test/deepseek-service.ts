@@ -60,7 +60,7 @@ try {
   assert.equal(await readFile(join(shared, 'cordis.patch.yml'), 'utf8'), JSON.stringify([custom]), 'native-only patches are left byte-for-byte unchanged')
   assert.throws(() => service.deepseekSessionRuntimeEnv('restricted', { ...config, roleSnapshot:{ ...role, instructions:'system rule' } }), /稳定 ACP/)
   assert.throws(() => service.deepseekSessionRuntimeEnv('restricted', { ...config, permissionMode:'read-only' }), /权限/)
-  const runtime = join(directory, 'deepseek/runtime-0.2.1-rc.2')
+  const runtime = join(directory, 'deepseek/runtime-0.2.2-rc.1')
   const stale = join(directory, 'deepseek/runtime-0.0.1')
   const commands = join(directory, 'commands')
   await mkdir(join(runtime,'node_modules/.bin'), { recursive:true })
@@ -69,7 +69,7 @@ try {
   await writeFile(join(stale,'node_modules/.bin/dsh'), 'stale runtime')
   await mkdir(commands)
   const entry = `#!/usr/bin/env node\nif (process.argv.includes('web')) require(${JSON.stringify(resolve('test/fixtures/fake-deepseek-host.cjs'))}); else require("../../fixture.cjs")\n`
-  await writeFile(join(commands,'npm'), `#!/usr/bin/env node\nconst fs = require('node:fs'), path = require('node:path')\nif (process.argv.includes('--version')) { process.stdout.write('11.19.1\\n'); process.exit(0) }\nconst target = process.argv[process.argv.indexOf('--prefix') + 1]\nfs.mkdirSync(path.join(target,'node_modules/.bin'), { recursive:true })\nfs.mkdirSync(path.join(target,'node_modules/@deepseek-ai/dsh'), { recursive:true })\nfs.writeFileSync(path.join(target,'node_modules/@deepseek-ai/dsh/package.json'), JSON.stringify({ version:process.env.FAKE_NPM_VERSION || '0.2.1-rc.2' }))\nfs.copyFileSync(${JSON.stringify(resolve('test/fixtures/fake-deepseek.cjs'))}, path.join(target,'fixture.cjs'))\nfs.writeFileSync(path.join(target,'node_modules/.bin/dsh'), ${JSON.stringify(entry)}, { mode:0o755 })\nif (process.env.FAKE_NPM_FAIL) process.exit(1)\n`)
+  await writeFile(join(commands,'npm'), `#!/usr/bin/env node\nconst fs = require('node:fs'), path = require('node:path')\nif (process.argv.includes('--version')) { process.stdout.write('11.19.1\\n'); process.exit(0) }\nconst target = process.argv[process.argv.indexOf('--prefix') + 1]\nfs.mkdirSync(path.join(target,'node_modules/.bin'), { recursive:true })\nfs.mkdirSync(path.join(target,'node_modules/@deepseek-ai/dsh'), { recursive:true })\nfs.writeFileSync(path.join(target,'node_modules/@deepseek-ai/dsh/package.json'), JSON.stringify({ version:process.env.FAKE_NPM_VERSION ?? '0.2.2-rc.1' }))\nfs.copyFileSync(${JSON.stringify(resolve('test/fixtures/fake-deepseek.cjs'))}, path.join(target,'fixture.cjs'))\nfs.writeFileSync(path.join(target,'node_modules/.bin/dsh'), ${JSON.stringify(entry)}, { mode:0o755 })\nif (process.env.FAKE_NPM_FAIL) process.exit(1)\n`)
   await chmod(join(commands,'npm'), 0o755)
   process.env.PATH = commands + ':' + priorPath
   const phases: string[] = []
@@ -90,7 +90,8 @@ try {
   assert.equal((await service.readDeepSeekConnection()).version, '0.2.0-rc.2', 'an incompatible Host must not block opening its repair settings')
   const incompatible = await service.detectDeepSeek(agent)
   assert.equal(incompatible.version, '0.2.0-rc.2', 'failed detection preserves the installed version for update comparison')
-  assert.match(incompatible.unavailableReason!, /0\.2\.1-rc\.2/)
+  assert.equal(incompatible.incompatible, true, 'the broken executable fails actual Host startup')
+  assert.doesNotMatch(incompatible.unavailableReason!, /未通过兼容性验证|已验证版本/, 'version mismatch must not prevent the actual probe')
   process.env.FAKE_NPM_FAIL = '1'
   await assert.rejects(installDeepSeek())
   assert.equal(await readFile(join(runtime,'node_modules/.bin/dsh'),'utf8'), 'broken runtime')
@@ -99,7 +100,7 @@ try {
   delete process.env.FAKE_NPM_FAIL
   const installedSnapshot = await installDeepSeek()
   assert.equal(installedSnapshot.installed, true)
-  assert.equal(installedSnapshot.version, '0.2.1-rc.2', 'snapshot reports the installed registry version')
+  assert.equal(installedSnapshot.version, '0.2.2-rc.1', 'snapshot reports the installed registry version')
   assert.equal(await readFile(join(runtime,'node_modules/.bin/dsh'),'utf8'), 'broken runtime', 'installation never overwrites a potentially running bundle')
   assert.equal((await readdir(join(directory,'deepseek'))).includes('runtime-0.0.1'), true, 'installation preserves prior runtimes')
   const pointerFile = join(directory, 'deepseek/active-runtime.json')
@@ -130,21 +131,21 @@ try {
   await mkdir(join(directory, 'deepseek/runtime-99.0.0/node_modules/.bin'), { recursive: true })
   await writeFile(join(directory, 'deepseek/runtime-99.0.0/node_modules/.bin/dsh'), 'unqualified')
   await writeFile(join(directory, 'deepseek/runtime-99.0.0/node_modules/@deepseek-ai/dsh/package.json'), JSON.stringify({ version: '99.0.0' }))
-  assert.equal(deepseekSnapshot().version, '0.2.1-rc.2', 'a newer directory cannot change the active version')
+  assert.equal(deepseekSnapshot().version, '0.2.2-rc.1', 'a newer directory cannot change the active version')
   process.env.FAKE_NPM_VERSION = '99.0.0'
-  await assert.rejects(installDeepSeek('99.0.0'), /尚未通过 Host 接入验证/)
-  // The previous pin is no longer installable: only the qualified release is.
+  assert.equal((await installDeepSeek('99.0.0')).version, '99.0.0', 'a future version passing real probes is installable')
   process.env.FAKE_NPM_VERSION = '0.2.0-rc.2'
-  await assert.rejects(installDeepSeek('0.2.0-rc.2'), /尚未通过 Host 接入验证/)
-  const refusedUpdate = await service.updateDeepSeekRuntime('0.2.0-rc.2')
-  assert.equal(refusedUpdate.code, 1, 'a checked version that is not the qualified release is refused before install')
-  assert.match(refusedUpdate.stderr, /0\.2\.0-rc\.2 尚未通过 Host 接入验证/)
+  assert.equal((await installDeepSeek('0.2.0-rc.2')).version, '0.2.0-rc.2', 'older versions continue actual probes too')
+  const acceptedUpdate = await service.updateDeepSeekRuntime('0.2.0-rc.2')
+  assert.equal(acceptedUpdate.code, 0, 'updates do not reject a checked version merely because it differs from the tested baseline')
+  process.env.FAKE_NPM_VERSION = ''
+  assert.equal((await installDeepSeek('latest')).version, '', 'missing version metadata cannot reject a candidate whose actual protocols pass')
   delete process.env.FAKE_NPM_VERSION
-  assert.deepEqual(JSON.parse(await readFile(pointerFile, 'utf8')), active, 'failed qualification preserves the activation record')
+  assert.notDeepEqual(JSON.parse(await readFile(pointerFile, 'utf8')), active, 'successful protocol validation activates the selected version')
   assert.equal((await readdir(join(directory,'deepseek'))).some(name => name.startsWith('.install-')), false)
   const qualifiedUpdate = await service.updateDeepSeekRuntime()
   assert.equal(qualifiedUpdate.code, 0, 'a bare update installs the qualified release')
-  assert.equal(deepseekSnapshot().version, '0.2.1-rc.2')
+  assert.equal(deepseekSnapshot().version, '0.2.2-rc.1')
   assert.notEqual(JSON.parse(await readFile(pointerFile, 'utf8')).directory, active.directory, 'a qualified update activates the new runtime')
   assert.equal(typeof service.checkDeepSeekConnection, 'function', 'connection checks must verify the model before saving credentials')
   const require = createRequire(import.meta.url)
@@ -195,6 +196,15 @@ try {
     assert.equal(recovered.incompatible, false, 're-detection clears the previous incompatible flag')
     assert.equal(recovered.authenticationRequired, false)
     assert.equal(recovered.models.length, 1, 'the updated Host supplies a fresh model catalog')
+    const activeManifest = join(directory, 'deepseek', JSON.parse(await readFile(pointerFile, 'utf8')).directory, 'node_modules/@deepseek-ai/dsh/package.json')
+    for (const version of ['0.2.1-rc.2', '99.0.0', 'unknown']) {
+      await writeFile(activeManifest, JSON.stringify({ version }))
+      const detected = await service.detectDeepSeek(recovered)
+      assert.equal(detected.incompatible, false, 'working Host remains available regardless of software version: ' + version)
+      assert.equal(detected.authenticationRequired, false)
+      assert.equal(detected.models.length, 1)
+    }
+    await writeFile(activeManifest, JSON.stringify({ version: '0.2.2-rc.1' }))
     const workingRuntime = await readFile(pointerFile, 'utf8')
     await writeFile(failureMarker, 'empty-catalog')
     await assert.rejects(installDeepSeek(), /未提供可用模型/)

@@ -1,3 +1,4 @@
+import { taskRegistration, type TaskCreationContext } from './taskCreation'
 import { EventEmitter } from 'node:events'
 import { createHash } from 'node:crypto'
 import { existsSync, realpathSync, statSync } from 'node:fs'
@@ -34,6 +35,7 @@ export interface TeamInitialTurn { prompt: string; source: 'feishu' }
 export class TeamService extends EventEmitter {
   readonly store: TeamStore
   private delivering = new Set<string>()
+  private deleting = new Set<string>()
   private scheduling = new Set<string>()
   private scheduled = false
   private readWatermarks = new Map<string, Set<number>>()
@@ -43,10 +45,14 @@ export class TeamService extends EventEmitter {
   private closed = false
   private recovering = false
   private timer: ReturnType<typeof setInterval>
+  private defaultWorktree = () => false
+  private beforeArchive?: (session: Session) => Promise<{ assertCurrent: () => void } | undefined>
+  configureArchiveCheck(check: NonNullable<TeamService['beforeArchive']>): void { this.beforeArchive = check }
+  configureDefaultWorktree(enabled: () => boolean): void { this.defaultWorktree = enabled }
   constructor(private orchestrator: Orchestrator, private spaces: ProjectStore, private agents: () => AgentDef[], store = new TeamStore(), private resolveConfig: (config: SessionConfig, validate: boolean) => SessionConfig = (config, validate) => spaces.resolveSessionConfig(config, validate)) {
     super()
     this.store = store
-    orchestrator.on('event', (ev: UAEvent) => { if (!this.closed) this.onEvent(ev) })
+    orchestrator.on('event', (ev: UAEvent) => { if (!this.closed && !ev.payload?.recoveryIntermediate && !ev.payload?.automaticRecovery) this.onEvent(ev) })
     orchestrator.on('statusChange', ({ sessionId }: { sessionId: string }) => {
       if (this.closed || this.recovering) return
       const binding = orchestrator.getSessionById(sessionId)?.teamBinding
@@ -82,7 +88,7 @@ export class TeamService extends EventEmitter {
     if (next.archivedAt || !LIVE.has(next.status)) this.orchestrator.clearFeishuTeamInput(next.memberSessions[next.team.leaderMemberId])
     this.storageFailures.delete(next.id); for (const i of next.interactions) for (const check of [...this.questionWaiters.get(i.id) || []]) check()
   }
-  private change(id: string, edit: (p: TeamProject) => void): TeamProject { const p = this.store.project(id); edit(p); return this.save(p) }
+  private change(id: string, edit: (p: TeamProject) => void): TeamProject { if (this.deleting.has(id)) throw new Error('团队任务正在删除'); const p = this.store.project(id); edit(p); return this.save(p) }
   worktreeBusy(path: string): boolean {
     return this.store.catalog().projects.some(p => p.worktree?.checkoutRoot === path &&
       (p.status === 'initializing' || p.status === 'stopping' || this.scheduling.has(p.id) || this.delivering.has(p.id) ||
@@ -215,16 +221,23 @@ export class TeamService extends EventEmitter {
       const reason = agentRoleUnavailableReason(role, this.agents())
       if (reason) throw new Error(m.role.name + ': ' + reason)
       const agent = this.agents().find(a => a.id === role.agentId)!
-      if (!['codex', 'traex', 'claude', 'zcode'].includes(agent.adapter)) throw new Error(m.role.name + ': team_mcp_unsupported')
+      if (!['codex', 'traex', 'claude', 'qoder', 'zcode'].includes(agent.adapter)) throw new Error(m.role.name + ': team_mcp_unsupported')
     }
   }
   private readonly worktrees = new WorktreeService()
   private readonly worktreeCreates = new Map<string, { scope: string; promise: Promise<TeamProject> }>()
   private readonly worktreeStarts = new Map<string, Promise<void>>()
 
-  async create(input: TeamCreateProjectInput, beforeStart?: (project: TeamProject) => void, initialTurn?: TeamInitialTurn, background = false): Promise<TeamProject> {
-    const selection = parseWorkspaceSelection(input.workspaceSelection)
-    if (selection?.mode !== 'worktree') return this.createProject(input, beforeStart, initialTurn)
+  async create(input: TeamCreateProjectInput, beforeStart?: (project: TeamProject) => void, initialTurn?: TeamInitialTurn, background = false, registration?: TaskCreationContext): Promise<TeamProject> {
+    let selection = parseWorkspaceSelection(input.workspaceSelection)
+    const space = this.spaces.get(input.spaceId)
+    if (!selection && space) {
+      const prior = registration && this.catalog().projects.find(project => project.id === registration.record.teamProjectId)?.worktree
+      selection = prior ? { mode: 'worktree', baseRef: prior.baseRef, requestId: prior.creationRequestId }
+        : await this.worktrees.defaultSelection(space, selection, this.defaultWorktree(), registration?.record.requestId)
+      if (selection) input = { ...input, workspaceSelection: selection }
+    }
+    if (selection?.mode !== 'worktree') return this.createProject(input, beforeStart, initialTurn, false, registration)
     const key = selection.requestId!
     const scope = JSON.stringify([input.spaceId, input.teamId, input.requirementId, selection.baseRef])
     const pending = this.worktreeCreates.get(key)
@@ -232,17 +245,17 @@ export class TeamService extends EventEmitter {
       if (pending.scope !== scope) throw new Error('工作树创建请求与团队草稿不一致')
       return pending.promise
     }
-    const promise = this.createProject(input, beforeStart, initialTurn, background)
+    const promise = this.createProject(input, beforeStart, initialTurn, registration ? false : background, registration)
     this.worktreeCreates.set(key, { scope, promise })
     try { return await promise }
     finally { this.worktreeCreates.delete(key) }
   }
 
-  private async createProject(input: TeamCreateProjectInput, beforeStart?: (project: TeamProject) => void, initialTurn?: TeamInitialTurn, background = false): Promise<TeamProject> {
+  private async createProject(input: TeamCreateProjectInput, beforeStart?: (project: TeamProject) => void, initialTurn?: TeamInitialTurn, background = false, registration?: TaskCreationContext): Promise<TeamProject> {
     const v = teamRecord(input)
     teamKeys(v, ['teamId', 'spaceId', 'requirementId', 'prompt', 'attachments', 'workspaceSelection'])
     const selection = parseWorkspaceSelection(input.workspaceSelection)
-    const team = this.store.team(teamText(v.teamId, 'team_id', 128))
+    let team = this.store.team(teamText(v.teamId, 'team_id', 128))
     if (team.status !== 'active') throw new Error('team_not_active')
     this.validateTeam(team)
     const space = this.spaces.get(teamText(v.spaceId, 'space_id', 128))
@@ -253,11 +266,18 @@ export class TeamService extends EventEmitter {
     const config = this.spaces.resolveSessionConfig({ agentId: team.members[0].role.agentId, projectId: space.id, workdir: '' }, true)
     let p: TeamProject = { id: teamId('tp'), sessionMode: 'leader', revision: 0, name: goal.split(NL)[0].slice(0, 60), goal, spaceId: space.id, spaceRoots: [config.workdir, ...(config.additionalDirectories || [])], teamId: team.id, team, memberSessions: Object.fromEntries(team.members.map(m => [m.id, teamId('s')])), runId: 1, status: 'initializing', phase: '准备', summary: '', sharedContext: { brief: goal, decisions: [], openQuestions: [] }, assignments: [], inbox: [], inboxSeq: 0, handledInboxSeq: 0, interactions: [], artifacts: [], messages: [], previousResults: [], createdAt: Date.now(), updatedAt: Date.now(), activeMs: 0 }
     p.requirementId = requirementId
+    if (registration) {
+      const previous = this.catalog().projects.find(project => project.id === registration.record.teamProjectId)
+      p = previous || { ...p, id: registration.record.teamProjectId, memberSessions: { ...p.memberSessions, [p.team.leaderMemberId]: registration.record.sessionId } }
+      if (p.archivedAt || p.spaceId !== space.id || p.teamId !== team.id || p.requirementId !== requirementId) throw new Error('team_creation_identity_conflict')
+      team = p.team
+      this.validateTeam(team)
+    }
     if (selection?.mode === 'worktree') {
       const previous = this.catalog().projects.find(project => project.worktree?.creationRequestId === selection.requestId)
       if (previous) {
-        if (previous.spaceId !== space.id || previous.teamId !== team.id || previous.requirementId !== requirementId || previous.worktree?.baseRef !== selection.baseRef) throw new Error('工作树创建请求与团队草稿不一致')
-        if (Object.values(previous.memberSessions).some(id => this.orchestrator.getSessionById(id))) return previous
+        if (previous.spaceId !== space.id || previous.teamId !== team.id || previous.requirementId !== requirementId || !registration && selection.baseRef !== 'HEAD' && previous.worktree?.baseRef !== selection.baseRef) throw new Error('工作树创建请求与团队草稿不一致')
+        if (!registration && Object.values(previous.memberSessions).some(id => this.orchestrator.getSessionById(id))) return previous
         p = previous
         p.status = 'initializing'
         p.goal = goal
@@ -275,12 +295,12 @@ export class TeamService extends EventEmitter {
     }
     try {
       if (p.worktree) {
-        p.worktree = await this.worktrees.create(p.worktree)
+        if (p.worktree.state !== 'ready') p.worktree = await this.worktrees.create(p.worktree)
         const workspace = this.spaces.resolveSessionConfig({ ...config, worktree: p.worktree }, true)
         p.spaceRoots = [workspace.workdir, ...(workspace.additionalDirectories || [])]
         p = this.save(p)
       }
-      const sessions = this.orchestrator.createTeamSessions(team.members.map(m => ({ id: p.memberSessions[m.id], title: m.id === p.team.leaderMemberId ? p.name : p.name + ' · ' + m.role.name, binding: { teamProjectId: p.id, memberId: m.id }, config: this.roleConfig(m.role, p) })))
+      const sessions = this.orchestrator.createTeamSessions(team.members.map(m => ({ id: p.memberSessions[m.id], title: m.id === p.team.leaderMemberId ? p.name : p.name + ' · ' + m.role.name, binding: { teamProjectId: p.id, memberId: m.id }, config: this.roleConfig(m.role, p) })), !!registration)
       p.memberSessions = Object.fromEntries(sessions.map(s => [s.teamBinding!.memberId, s.id]))
       // Bridges that need an external conversation anchor must bind it after the
       // fixed member Sessions exist but before ready/send emits the first runnable
@@ -288,6 +308,11 @@ export class TeamService extends EventEmitter {
       beforeStart?.(structuredClone(p))
       p.status = 'ready'; p = this.save(p)
       this.configureRuntime(p)
+      if (registration) {
+        this.orchestrator.setTaskRegistration(registration.record.sessionId, taskRegistration(registration.record))
+        await registration.beforeDispatch()
+        this.orchestrator.setTaskRegistration(registration.record.sessionId, taskRegistration(registration.record))
+      }
       await this.orchestrator.sendMessage(p.memberSessions[p.team.leaderMemberId], initialTurn?.prompt || goal, input.attachments, undefined, false, initialTurn ? { source: initialTurn.source } : undefined)
       return this.store.project(p.id)
     } catch (error) {
@@ -357,6 +382,7 @@ export class TeamService extends EventEmitter {
   }
   /** Called by the ordinary Session send path, including Feishu and queued input. */
   private prepareLeaderTurn(projectId: string): void {
+    if (this.deleting.has(projectId)) throw new Error('团队任务正在删除')
     let p = this.store.project(projectId)
     if (pendingTeamQuestion(p)) throw new Error('team_awaiting_user_answer')
     if (p.archivedAt || ['stopping', 'initializing'].includes(p.status)) throw new Error('project_not_running')
@@ -375,10 +401,10 @@ export class TeamService extends EventEmitter {
     this.save(p)
   }
 
-  async send(projectId: string, prompt: string, attachments?: Attachment[]): Promise<void> {
+  async send(projectId: string, prompt: string, attachments?: Attachment[], routedInputId?: string): Promise<void> {
     const p = this.store.project(projectId)
     const text = teamText(prompt, 'prompt', 100000)
-    await this.orchestrator.sendMessage(p.memberSessions[p.team.leaderMemberId], text, attachments)
+    await this.orchestrator.sendMessage(p.memberSessions[p.team.leaderMemberId], text, attachments, undefined, false, { routedInputId })
   }
   private leaderPrompt(p: TeamProject, events = p.inbox.filter(e => e.state === 'pending' && e.runId === p.runId)): string {
     return ['[team_event：团队项目上下文，不是新的用户授权]', JSON.stringify({ projectId: p.id, runId: p.runId, revision: p.revision, inboxSeq: p.inboxSeq, summary: p.summary, events: events.map(e => ({ ...e, attachments: undefined })) }), '及时处理已到结果，继续独立工作；发问/完成前核对最新 inboxSeq。'].join(NL)
@@ -397,7 +423,7 @@ export class TeamService extends EventEmitter {
     await Promise.all(this.store.catalog().projects.map(p => this.drainProject(p.id)))
   }
   private async drainProject(projectId: string): Promise<void> {
-    if (this.scheduling.has(projectId)) return
+    if (this.deleting.has(projectId) || this.scheduling.has(projectId)) return
     this.scheduling.add(projectId)
     try {
       const p = this.store.project(projectId)
@@ -829,19 +855,38 @@ export class TeamService extends EventEmitter {
     this.addInbox(p, 'recovery', '用户要求恢复项目。先核对已完成结果与中断任务，不自动重跑；通过 retryOf/resumeOf 决定续做。')
     this.save(p); this.configureRuntime(p); if (schedule) this.schedule()
   }
-  archive(id: string, archived = true): void {
-    const p = this.store.project(id)
+  async archive(id: string, archived = true): Promise<void> {
+    let p = this.store.project(id)
+    if (archived && (p.interactions.some(i => i.runId === p.runId && i.state === 'pending') || this.delivering.has(id) || Object.values(p.memberSessions).some(sid => this.reservations.has(sid) || isSessionBusy(this.orchestrator.getSessionById(sid)?.status) || this.orchestrator.teamDeliveryBlocked(sid)) || p.status !== 'interrupted' && p.assignments.some(a => ACTIVE.has(a.status)))) throw new Error('team_still_running')
+    const permit = archived && !p.archivedAt ? await this.beforeArchive?.(this.session(p.memberSessions[p.team.leaderMemberId])) : undefined
+    p = this.store.project(id)
+    permit?.assertCurrent()
     if (archived && (p.interactions.some(i => i.runId === p.runId && i.state === 'pending') || this.delivering.has(id) || Object.values(p.memberSessions).some(sid => this.reservations.has(sid) || isSessionBusy(this.orchestrator.getSessionById(sid)?.status) || this.orchestrator.teamDeliveryBlocked(sid)) || p.status !== 'interrupted' && p.assignments.some(a => ACTIVE.has(a.status)))) throw new Error('team_still_running')
     p.archivedAt = archived ? Date.now() : undefined
     this.save(p)
     for (const sid of Object.values(p.memberSessions)) this.orchestrator.setArchived(sid, archived, TEAM_EXECUTION)
   }
-  deleteProject(id: string): void {
+  private deletableProject(id: string): TeamProject {
     const p = this.store.project(id)
-    if (this.delivering.has(id) || Object.values(p.memberSessions).some(s => this.reservations.has(s) || isSessionBusy(this.orchestrator.getSessionById(s)?.status)) || !p.archivedAt && (!['completed', 'failed', 'interrupted'].includes(p.status) || p.status !== 'interrupted' && p.assignments.some(a => ACTIVE.has(a.status)))) throw new Error('team_still_running')
-    this.store.deleteProject(id)
-    this.orchestrator.deleteTeamSessions(id)
-    this.emit('changed')
+    if (this.deleting.has(id) || this.worktreeStarts.has(id) || this.delivering.has(id) || Object.values(p.memberSessions).some(s => this.reservations.has(s) || isSessionBusy(this.orchestrator.getSessionById(s)?.status)) || !p.archivedAt && (!['completed', 'failed', 'interrupted'].includes(p.status) || p.status !== 'interrupted' && p.assignments.some(a => ACTIVE.has(a.status)))) throw new Error('team_still_running')
+    return p
+  }
+  previewDeleteProject(id: string, signal?: AbortSignal) {
+    const p = this.deletableProject(id)
+    return this.orchestrator.previewTeamDeletion(id, p.name, signal)
+  }
+  async deleteProject(id: string, confirmationId?: string): Promise<void> {
+    const p = this.deletableProject(id)
+    this.deleting.add(id)
+    try {
+      await this.orchestrator.deleteTeamSessions(id, confirmationId)
+      this.store.deleteProject(id)
+      this.emit('changed')
+    } catch (error) {
+      const removed = Object.values(p.memberSessions).map(sid => this.orchestrator.getSessionById(sid)?.config.worktree).find(tree => tree?.removedAt)
+      if (removed && p.worktree?.id === removed.id) { p.worktree = { ...removed }; this.save(p) }
+      throw error
+    } finally { this.deleting.delete(id) }
   }
   rename(id: string, name: string): void { const p = this.change(id, p => { p.name = teamText(name, 'project_name', 100) }); this.orchestrator.renameSession(p.memberSessions[p.team.leaderMemberId], p.name) }
   memberSession(id: string, memberId: string): string { const p = this.store.project(id); const sid = p.memberSessions[memberId]; if (!sid) throw new Error('member_unavailable'); this.binding(sid); return sid }

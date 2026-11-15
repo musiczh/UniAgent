@@ -56,6 +56,37 @@ export async function run() {
   const doc = () => editor.state.doc.toJSON()
   const exported = () => serializeEditorMarkdown(editor.state.doc)
   try {
+    const side = document.createElement('div')
+    side.className = 'side-composer'
+    document.body.append(side)
+    const fallback = document.createElement('textarea')
+    fallback.className = 'markdown-editor-fallback'
+    host.append(fallback)
+    try {
+      for (const placeholder of ['继续对话…（/ 唤起 Skill·MCP，⌘⏎ 发送）', '运行中…输入后按 ⌘⏎ 加入等待队列，本轮结束自动发送']) {
+        control.setOptions(false, placeholder)
+        fallback.placeholder = placeholder
+        equal(editor.view.dom.dataset.placeholder, placeholder, 'idle and running hints retain their text')
+        const mainHint = getComputedStyle(editor.view.dom, '::before')
+        const fontFamily = mainHint.fontFamily
+        equal(mainHint.fontSize, '13px', 'main session hint uses the side chat hint size')
+        equal(getComputedStyle(fallback, '::placeholder').fontSize, '13px', 'loading fallback uses the same hint size')
+        equal(getComputedStyle(fallback, '::placeholder').fontFamily, fontFamily, 'fallback hint retains the editor font')
+        equal(getComputedStyle(editor.view.dom).fontSize, '15px', 'main editor text keeps its existing size')
+        equal(getComputedStyle(fallback).fontSize, '15px', 'fallback text keeps its existing size')
+        side.append(host)
+        equal(getComputedStyle(editor.view.dom, '::before').fontSize, '13px', 'side chat hint keeps its existing size')
+        equal(getComputedStyle(editor.view.dom, '::before').fontFamily, fontFamily, 'both hints use the same font')
+        equal(getComputedStyle(fallback, '::placeholder').fontSize, '13px', 'side chat fallback hint keeps its existing size')
+        equal(getComputedStyle(editor.view.dom).fontSize, '13px', 'side chat text keeps its existing size')
+        document.body.append(host)
+      }
+      await reset('输入正文')
+      equal(editor.view.dom.dataset.empty, 'false', 'nonempty input hides the hint')
+      equal(getComputedStyle(editor.view.dom, '::before').content, 'none', 'hint is not rendered over typed text')
+    } finally { document.body.append(host); fallback.remove(); side.remove() }
+    results.push('main and side chat hint typography, loading fallback and unchanged text sizes')
+
     await reset()
     type('1. ')
     check(editor.isActive('orderedList'), 'number + space must create an ordered list')

@@ -135,6 +135,7 @@ export function ClockIcon({
 }
 
 export type UiIconName =
+  | 'router'
   | 'back'
   | 'history'
   | 'automations'
@@ -170,10 +171,14 @@ export type UiIconName =
   | 'chevrons-right'
   | 'external-link'
   | 'globe'
+  | 'calendar'
   | 'swap-horizontal'
   | 'dispatch'
   | 'flag'
   | 'message-square'
+  | 'panel-right'
+  | 'annotation'
+  | 'more-horizontal'
   | 'file-diff'
   | 'fork'
   | 'zap'
@@ -215,6 +220,8 @@ export function UiIcon({
 }): JSX.Element {
   const paths: Record<UiIconName, JSX.Element> = {
     globe: <><circle cx="12" cy="12" r="9" /><ellipse cx="12" cy="12" rx="4" ry="9" /><path d="M3 12h18" /></>,
+    calendar: <><rect x="4" y="5.5" width="16" height="14" rx="2.5" /><path d="M8 3.5v4M16 3.5v4M4 10h16" /></>,
+    router: <><path d="M4 4h6v6H4zM14 14h6v6h-6zM17 4v5M17 9H9M7 10v7h7"/></>,
     back: <><path d="m15 18-6-6 6-6" /></>,
     history: <><path d="M4 12a8 8 0 1 0 2.3-5.7L4 8.5" /><path d="M4 4v4.5h4.5" /><path d="M12 8v4l2.8 1.8" /></>,
     automations: <><circle cx="12" cy="13" r="8" /><path d="M12 9v4l3 2" /><path d="M9 3h6" /></>,
@@ -255,6 +262,9 @@ export function UiIcon({
     dispatch: <><circle cx="5" cy="5" r="2" /><circle cx="5" cy="19" r="2" /><path d="M5 7v10M5 12h8a5 5 0 0 0 5-5V4m-3 3 3-3 3 3" /></>,
     'flag': <><path d="M5 21V3M5 4h6l2 3h7v10h-7l-2-3H5" /></>,
     'message-square': <><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" /></>,
+    'panel-right': <><rect x="3" y="4" width="18" height="16" rx="2.5" /><path d="M15 4v16" /><rect x="15.6" y="4.6" width="4.8" height="14.8" rx="1.4" fill="currentColor" fillOpacity=".16" stroke="none" /></>,
+    annotation: <><path d="M4 3h16v13H9l-5 5V3Z" /><path d="M8 7h8M8 11h6" /></>,
+    'more-horizontal': <><circle cx="5" cy="12" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /></>,
     'file-diff': <><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z" /><path d="M14 3v6h6M8 13h3M9.5 11.5v3M14 17h3" /></>,
     fork: <><circle cx="6" cy="6" r="2.5" /><circle cx="18" cy="6" r="2.5" /><circle cx="12" cy="18" r="2.5" /><path d="M6 8.5a9 9 0 0 0 6 7M18 8.5a9 9 0 0 1-6 7" /></>,
     zap: <><path d="M13 2 4 14h8l-1 8 9-12h-8z" /></>,

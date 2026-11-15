@@ -4,6 +4,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
+import { build } from 'esbuild'
 import { inspectRestartTarget } from '../src/main/appRestartTarget'
 import { APP_NAME, APP_BUNDLE_ID } from '../src/shared/distribution'
 
@@ -30,7 +33,13 @@ try {
   await assert.rejects(inspectRestartTarget(bundle), /外部链接/)
   await rm(executable)
   await copyFile('/usr/bin/true', executable)
-  await writeFile(join(contents, 'Resources/app.asar'), 'fixture asar version one')
+  const require = createRequire(import.meta.url)
+  const builder = createRequire(require.resolve('electron-builder'))
+  const asar = createRequire(builder.resolve('app-builder-lib'))('@electron/asar')
+  const archiveSource = join(dir, 'archive-source')
+  await mkdir(archiveSource)
+  await writeFile(join(archiveSource, 'index.js'), 'fixture asar version one')
+  await asar.createPackage(archiveSource, join(contents, 'Resources/app.asar'))
   const sign = () => exec('/usr/bin/codesign', ['--force', '--sign', '-', '--timestamp=none', bundle])
   await sign()
   const first = await inspectRestartTarget(bundle)
@@ -38,6 +47,15 @@ try {
   assert.match(first.sha256, /^[a-f0-9]{64}$/)
   assert.equal(first.executable, await realpath(executable))
   assert.deepEqual(await inspectRestartTarget(bundle), first)
+  const targetModule = join(dir, 'inspect-target.mjs')
+  await build({ entryPoints: ['src/main/appRestartTarget.ts'], bundle: true, platform: 'node', format: 'esm', packages: 'external', outfile: targetModule })
+  const { stdout } = await exec(require('electron'), ['--input-type=module', '-e', `
+    import { readFile } from 'node:fs/promises';
+    import { inspectRestartTarget } from ${JSON.stringify(pathToFileURL(targetModule).href)};
+    if (await readFile(${JSON.stringify(join(contents, 'Resources/app.asar/index.js'))}, 'utf8') !== 'fixture asar version one') throw new Error('invalid ASAR fixture');
+    console.log(JSON.stringify(await inspectRestartTarget(${JSON.stringify(bundle)})));
+  `], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', NODE_OPTIONS: '' }, timeout: 30000 })
+  assert.deepEqual(JSON.parse(stdout), first, 'Electron must hash the complete ASAR archive with the same fingerprint as Node')
   await writeFile(join(contents, 'Resources/app.asar'), 'fixture asar version two')
   await assert.rejects(inspectRestartTarget(bundle), /codesign|sealed|modified/i)
   await sign()

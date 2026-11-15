@@ -41,11 +41,12 @@ try {
   await settled
   assert.equal(session.status, 'error', 'a rejected role initialization must not acknowledge success or drain the next message')
   assert.deepEqual((orchestrator as any).queues.get(session.id).map((item: DurableQueueItem) => ({ id: item.id, state: item.state })), [
-    { id: 'active', state: 'pending' }, { id: 'next', state: 'pending' }
+    { id: 'next', state: 'pending' }
   ])
+  assert.deepEqual(store.load()[0].pendingQueue?.map(item => item.id), ['next'], 'a rejected input must not return to the durable queue')
   assert.equal((orchestrator as any).activeQueueItems.has(session.id), false)
   assert.equal((orchestrator as any).deferredDispatches.has(session.id), false)
-  console.log('Claude role orchestrator: native rejection leaves both queued messages retryable and stops dispatch')
+  console.log('Claude role orchestrator: native rejection removes the failed input, preserves the untouched next message and stops dispatch')
 } finally {
   orchestrator.disposeAll()
   await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })

@@ -4,11 +4,33 @@ import { Worker } from 'node:worker_threads'
 const code = `
 const { parentPort } = require('node:worker_threads')
 const { createHash } = require('node:crypto')
+const { gzipSync, gunzipSync } = require('node:zlib')
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 parentPort.on('message', ({ id, action, value }) => {
   try {
     let result
-    if (action === 'hash') result = hash(value)
+    if (action === 'pack') {
+      const documents = {}, bodies = {}
+      for (const [id, doc] of Object.entries(value.documents)) {
+        const { content, ...metadata } = doc
+        if (typeof content !== 'string' || hash(content) !== metadata.contentHash) throw new Error('需求正文校验失败')
+        documents[id] = metadata; bodies[metadata.contentHash] = content
+      }
+      const revision = hash(documents)
+      const text = JSON.stringify({ formatVersion: 2, revision, documents, bodies, operations: value.operations })
+      if (Buffer.byteLength(text) > 32000000) throw new Error('需求内容超过存储预算，请归档历史资料')
+      result = { revision, text: gzipSync(text).toString('base64') }
+    } else if (action === 'unpack') {
+      const packed = JSON.parse(gunzipSync(Buffer.from(value.text, 'base64'), { maxOutputLength: 32000000 }).toString())
+      if (packed.formatVersion !== 2 || packed.revision !== value.revision || hash(packed.documents) !== value.revision) throw new Error('需求修订损坏')
+      for (const doc of Object.values(packed.documents)) {
+        const content = packed.bodies[doc.contentHash]
+        if (typeof content !== 'string' || hash(content) !== doc.contentHash) throw new Error('需求正文校验失败')
+        doc.content = content
+      }
+      delete packed.bodies
+      result = packed
+    } else if (action === 'hash') result = hash(value)
     else if (action === 'encode') {
       const revision = hash(value.documents)
       const text = JSON.stringify({ formatVersion: 2, revision, documents: value.documents, operations: value.operations })
@@ -26,7 +48,7 @@ let worker: Worker | undefined
 let sequence = 0
 const pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>()
 
-export function requirementCodec<T = any>(action: 'hash' | 'encode' | 'decode', value: unknown): Promise<T> {
+export function requirementCodec<T = any>(action: 'hash' | 'encode' | 'decode' | 'pack' | 'unpack', value: unknown): Promise<T> {
   if (!worker) {
     const next = new Worker(code, { eval: true })
     worker = next

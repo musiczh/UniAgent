@@ -46,6 +46,7 @@ import * as newTaskPanelContracts from '../src/renderer/components/NewTaskPanel.
 import {
   displayedGoalTimeSeconds,
   GoalStatusBar,
+  GoalUsageRecord,
   goalStatusLabel
 } from '../src/renderer/components/GoalStatusBar.tsx'
 import { PlanModeBadge } from '../src/renderer/components/PlanModeBadge.tsx'
@@ -798,6 +799,9 @@ async function persistentGoalAndPlanModeContract(): Promise<void> {
     updatedAt: 2
   }
   const goalMarkup = renderToStaticMarkup(createElement(GoalStatusBar, { goal }))
+  const qoderGoalMarkup = renderToStaticMarkup(createElement(GoalUsageRecord, { now: 0, live: false, provider: 'qoder', goal: { ...goal, tokensAvailable: false, creditsUsed: 1.5 } }))
+  assert.match(qoderGoalMarkup, /未提供 Token 计数/)
+  assert.match(qoderGoalMarkup, /1\.500 Credits/)
   assert.match(goalMarkup, /class="goal-status-bar conversation-column"/)
   assert.match(goalMarkup, /role="button"/)
   assert.match(goalMarkup, /tabindex="0"/)

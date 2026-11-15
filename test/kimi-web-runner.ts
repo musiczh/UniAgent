@@ -77,6 +77,41 @@ assert.equal(usage.length, 1, 'one usage footer per native turn, not one per mod
 assert.equal(usage[0].payload.usage.inputTokens, 33)
 assert.equal(usage[0].payload.usage.outputTokens, 6)
 assert.equal(usage[0].payload.usage.contextTokens, 20, 'context occupancy is the last model input, not cumulative billing')
+const goalChanges: any[] = []
+runner.on('goalChanged', (goal: any) => goalChanges.push(goal))
+runner.acceptGoal({ objective: 'native goal', status: 'active', tokensUsed: 0, wallClockMs: 0, turnsUsed: 0, budget: { tokenBudget: 100, turnBudget: 4 } })
+await runner.recover({ epoch: 'goal', as_of_seq: 1, transcript: [
+  { kind: 'marker', marker: 'goal', markerId: 'goal-complete', payload: { agentId: 'main', snapshot: {
+    goalId: 'goal', objective: 'native goal', status: 'complete', tokensUsed: 20, turnsUsed: 2, wallClockMs: 500, budget: { tokenBudget: 100, turnBudget: 4 }
+  } } }
+], pending_approvals: [], pending_questions: [] })
+await runner.onFrame({ type: 'goal', agent_id: 'main', goal: { objective: 'native goal', status: 'active', tokens_used: 0, turns_used: 0, wall_clock_ms: 0 } })
+await runner.onFrame({ type: 'goal', agent_id: 'main', goal: undefined })
+assert.equal(runner.goal.status, 'complete', 'coalesced lightweight frames cannot replace a confirmed transcript completion')
+assert.equal(runner.goal.tokenBudget, 100, 'the complete native marker retains budget metadata')
+assert.equal(runner.goal.roundLimit.roundsStarted, 2)
+assert.equal(runner.goal.timeUsedSeconds, 0.5)
+assert.ok(goalChanges.some(goal => goal?.status === 'complete'))
+runner.goal = undefined
+const completeGoal = { goalId: 'native-complete', objective: 'completed in one batch', status: 'complete', tokensUsed: 25, turnsUsed: 1, wallClockMs: 250,
+  budget: { tokenBudget: null, turnBudget: null } }
+await runner.recover({ epoch: 'batch', as_of_seq: 3, transcript: [
+  { kind: 'marker', marker: 'goal', markerId: 'complete', payload: { agentId: 'main', snapshot: { ...completeGoal, status: 'active', tokensUsed: 0 } } }
+], pending_approvals: [], pending_questions: [] })
+await runner.recover({ epoch: 'batch', as_of_seq: 4, transcript: [
+  { kind: 'marker', marker: 'goal', markerId: 'complete', payload: { agentId: 'main', snapshot: completeGoal } },
+  { kind: 'marker', marker: 'goal', markerId: 'cleared', payload: { agentId: 'main', snapshot: null } }
+], pending_approvals: [], pending_questions: [] })
+assert.equal(runner.goal.status, 'complete', 'native transcript completion survives a coalesced state feed that only shows automatic clear')
+assert.equal(runner.goal.tokensUsed, 25)
+assert.equal(runner.goal.roundLimit.roundsStarted, 1)
+const compactMarkers = [
+  { kind: 'marker', marker: 'compaction', markerId: 'compact-start', payload: { agentId: 'main', phase: 'started' } },
+  { kind: 'marker', marker: 'compaction', markerId: 'compact-done', payload: { agentId: 'main', phase: 'completed' } }
+]
+await runner.recover({ epoch: 'batch', as_of_seq: 5, transcript: compactMarkers, pending_approvals: [], pending_questions: [] })
+await runner.recover({ epoch: 'batch', as_of_seq: 5, transcript: compactMarkers, pending_approvals: [], pending_questions: [] })
+assert.deepEqual(events.filter((event: any) => event.type === 'context_compaction').map((event: any) => event.state), ['running', 'success'], 'native compaction markers restore progress and completion without replay duplicates')
 await assert.rejects(runner.setGoal({ objective: 'test', tokenBudget: 20 }), /goal_budget_unsupported/)
 assert.deepEqual(projectKimiWebUsage({ inputOther: 10, inputCacheRead: 3, inputCacheCreation: 2, output: 5 }), { inputTokens: 15, outputTokens: 5, cachedInputTokens: 3 })
 assert.deepEqual(await buildKimiWebContent('literal $HOME'), [{ type: 'text', text: 'literal $HOME' }])
@@ -116,3 +151,24 @@ try {
   assert.equal(new SessionStore(join(directory, 'sessions.json')).load()[0].config.kimiDataHome, join(directory, 'native-home'), 'storage identity must survive a cold load, independent of default HOME')
 } finally { await rm(directory, { recursive: true, force: true }) }
 console.log('Kimi Web runner: applied profile, policy rejection, typed question, plan decision mapping and steer receipt passed')
+
+const flat: any = new KimiWebRunner('flat-goal', { n: 0 }, agent, config)
+flat.runtime = { usesTurnsProtocol: true }
+flat.running = true
+const goalFeed = (goal: any) => flat.onFrame({ type: 'goal', session_id: 'native', agent_id: 'main', goal, payload: {} })
+await goalFeed({ objective: 'native objective', status: 'active', turns_used: 1, tokens_used: 5, wall_clock_ms: 100 })
+await goalFeed(undefined)
+assert.equal(flat.goal, undefined)
+const terminal = (outcome: string, agentId = 'main') => flat.onFrame({ type: 'item.ended', agent_id: agentId, payload: {},
+  item: { name: 'UpdateGoal', status: 'ended', outcome, input: { status: 'complete' } } })
+await terminal('failed')
+assert.equal(flat.goal, undefined, 'a requested completion with a failed native result cannot complete the goal')
+await terminal('completed', 'foreign')
+assert.equal(flat.goal, undefined, 'another native agent cannot settle this goal')
+await terminal('completed')
+assert.equal(flat.goal.status, 'complete', 'a successful native terminal result survives the preceding automatic clear')
+assert.equal(flat.goal.objective, 'native objective')
+assert.equal(flat.goal.autonomous, false)
+flat.acceptGoal(null)
+assert.equal(flat.goal.status, 'complete', 'a later empty native snapshot cannot erase confirmed completion')
+console.log('Kimi turns goal: authoritative completion, failed result and native agent isolation passed')

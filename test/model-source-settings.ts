@@ -77,7 +77,7 @@ const result = await renderEventStream([], 'idle', 'model-source-settings', {
     return result;
   })()`
 })
-assert.deepEqual(result.clientTabs, ['Claude Code', 'Codex'])
+assert.deepEqual(result.clientTabs, ['Claude Code', 'Codex', 'Qoder'])
 assert.deepEqual(result.claudeProviders, ['Kimi', 'DeepSeek', '小米 MiMo'], 'Claude 页必须列出小米 MiMo')
 assert.equal(result.mimoIcon, true, '小米 MiMo 使用内嵌官方图标')
 assert.match(result.claudeCopy, /Claude Code 添加 Kimi、DeepSeek、小米 MiMo 模型/, '厂商说明由实际来源列表生成')

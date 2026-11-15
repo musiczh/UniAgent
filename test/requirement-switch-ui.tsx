@@ -6,7 +6,7 @@ import { RequirementSettings } from '../src/renderer/components/RequirementSetti
 import { SessionList } from '../src/renderer/components/SessionList'
 import { SettingsPanel } from '../src/renderer/components/SettingsPanel'
 import { NewTaskPanel } from '../src/renderer/components/NewTaskPanel'
-import { RequirementPicker } from '../src/renderer/components/RequirementPicker'
+import { ProjectPicker } from '../src/renderer/components/ProjectPicker'
 import { ViewDropdown } from '../src/renderer/components/ViewDropdown'
 import { ToggleSwitch } from '../src/renderer/components/Icons'
 import type { Requirement } from '../src/shared/requirementTypes'
@@ -30,7 +30,8 @@ dispatcher.current = {
   useMemo(value: () => unknown) { return value() },
   useCallback(value: unknown) { return value },
   useEffect() {},
-  useLayoutEffect() {}
+  useLayoutEffect() {},
+  useSyncExternalStore(_subscribe: unknown, getSnapshot: () => unknown) { return getSnapshot() }
 }
 
 function elements(node: React.ReactNode): React.ReactElement<any>[] {
@@ -130,8 +131,8 @@ try {
       quickCreateSeed: { requirementId: requirement.id }, requirementsEnabled
     }))
   }
-  assert.equal(renderNewTask().some(e => e.type === RequirementPicker), false, 'new tasks hide requirement selection by default, even with a requirement seed')
-  assert.equal(renderNewTask(true).find(e => e.type === RequirementPicker)?.props.value, requirement.id, 'explicit enable restores seeded requirement selection')
+  assert.equal(renderNewTask().find(e => e.type === ProjectPicker)?.props.requirements, undefined, 'combined picker offers spaces only while requirements are disabled')
+  assert.equal(renderNewTask(true).find(e => e.type === ProjectPicker)?.props.requirementId, requirement.id, 'combined picker retains an explicitly enabled requirement seed')
 } finally {
   dispatcher.current = previous
   if (previousStorage) Object.defineProperty(globalThis, 'localStorage', previousStorage)

@@ -78,8 +78,8 @@ export function diffInventories(source: Inventory, target: Inventory): PublicCap
 export function buildPlan(input: {
   id: string
   scanId: string
-  source: 'codex' | 'traex'
-  target: 'codex' | 'traex'
+  source: 'codex' | 'traex' | 'qoder'
+  target: 'codex' | 'traex' | 'qoder'
   sourceRevision: string
   targetRevision: string
   mode: CapabilitySyncMode

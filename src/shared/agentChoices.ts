@@ -5,7 +5,7 @@ export function supportsModelImages(agent: AgentDef | undefined, modelId?: strin
   const advertised = agent.models.find(model => model.id === (modelId || agent.defaultModel))?.imageInput
   // Host modelCatalog omits modalities; session/prompt performs authoritative image admission.
   if (agent.adapter === 'deepseek' && agent.capabilities.protocol === 'web') return advertised !== false
-  return !['kimi', 'grok', 'deepseek', 'zcode'].includes(agent.adapter) || advertised === true
+  return !['kimi', 'grok', 'deepseek', 'zcode', 'qoder', 'nika'].includes(agent.adapter) || advertised === true
 }
 
 export function resolveAgentModel(agent: AgentDef | undefined, ...choices: (string | undefined)[]): ModelDef | undefined {
@@ -30,9 +30,20 @@ export function resolveAgentPermission(agent: AgentDef | undefined, ...choices: 
     || agent?.capabilities.permissionModes[0]?.id
 }
 
+/** Missing fixed defaults mean following this agent's last accepted choices. */
+export function withLastAgentChoices(pref?: AgentPref): AgentPref {
+  return {
+    ...pref,
+    defaultModel: pref?.defaultModel || pref?.model,
+    defaultEffort: pref?.defaultEffort || pref?.effort,
+    defaultThinking: pref?.defaultThinking || pref?.defaultEffort || pref?.kimiThinking || pref?.zcodeThinking
+  }
+}
+
 /** Fill omitted values without overriding explicit protocol presets. */
 export function withAgentDefaults(agent: AgentDef | undefined, config: SessionConfig, pref?: AgentPref): SessionConfig {
   if (!agent) return config
+  pref = withLastAgentChoices(pref)
   const model = config.model ? agent.models.find(model => model.id === config.model) : resolveAgentModel(agent, pref?.defaultModel)
   const modelId = config.model || model?.id
   const modelSource = config.model ? config.modelSource : model?.modelSource || config.modelSource
@@ -45,6 +56,10 @@ export function withAgentDefaults(agent: AgentDef | undefined, config: SessionCo
     const selection = zcodeModelSelection || model.zcodeSelection
     if (!zcodeModelSelection || reasoningLevel) zcodeModelSelection = { ...selection, ...(reasoningLevel ? { options: { ...selection.options, reasoningLevel } } : {}) }
   }
-  if (modelId === config.model && modelSource === config.modelSource && effort === config.effort && kimiThinking === config.kimiThinking && zcodeModelSelection === config.zcodeModelSelection) return config
-  return { ...config, model: modelId, modelSource, effort, kimiThinking, zcodeModelSelection }
+  const qoderContextWindow = agent.adapter === 'qoder' ? config.qoderContextWindow ?? (model?.qoderContextWindows?.includes(pref?.qoderContextWindow || 0) ? pref?.qoderContextWindow : undefined) : config.qoderContextWindow
+  const qoderThinkingDisabled = agent.adapter === 'qoder' ? config.qoderThinkingDisabled ?? (model?.qoderThinkingDisabled ? pref?.qoderThinkingDisabled : undefined) : config.qoderThinkingDisabled
+  if (qoderContextWindow !== undefined && agent.adapter === 'qoder' && !model?.qoderContextWindows?.includes(qoderContextWindow)) throw new Error('Qoder 模型未声明该上下文窗口')
+  if (qoderThinkingDisabled && agent.adapter === 'qoder' && !model?.qoderThinkingDisabled) throw new Error('Qoder 模型未声明关闭思考能力')
+  if (modelId === config.model && modelSource === config.modelSource && effort === config.effort && kimiThinking === config.kimiThinking && zcodeModelSelection === config.zcodeModelSelection && qoderContextWindow === config.qoderContextWindow && qoderThinkingDisabled === config.qoderThinkingDisabled) return config
+  return { ...config, model: modelId, modelSource, effort, kimiThinking, zcodeModelSelection, qoderContextWindow, qoderThinkingDisabled }
 }

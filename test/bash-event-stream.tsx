@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict'
-import { createElement } from 'react'
-import { renderOpenChains } from './regression/open-chain'
-import { EventStream, groupChainEvents } from '../src/renderer/components/EventStream.tsx'
+import { renderEventStream } from './regression/render-event-stream.mjs'
+import { groupChainEvents } from '../src/renderer/components/EventStream.tsx'
 import type { UAEvent } from '../src/shared/types.ts'
 
 const command = (seq: number, id: string): UAEvent => ({
@@ -25,28 +24,29 @@ const grouped = groupChainEvents([first, fileChange, second, latest, trailingToo
 assert.deepEqual(grouped.map((entry) => entry.kind), ['commands', 'event', 'event'])
 assert.equal(grouped[0].kind === 'commands' ? grouped[0].events.length : 0, 3)
 
-const markup = renderOpenChains(createElement(EventStream, {
-  sessionId: 'bash-session',
-  status: 'running',
-  events: [
+const inspect = `(async()=>{
+  for(let pass=0;pass<8;pass++){
+    const buttons=[...document.querySelectorAll('.process-step-meta[aria-expanded=false],.steps-fold-row[aria-expanded=false]')];
+    if(!buttons.length)return document.body.innerHTML;
+    buttons.forEach(button=>button.click());
+    await new Promise(resolve=>setTimeout(resolve,30));
+  }
+  throw new Error('process disclosures did not settle');
+})()`
+const markup = await renderEventStream([
     { sessionId: 'bash-session', seq: 0, ts: 1_000, type: 'user_message', payload: { text: 'run' } },
     first, fileChange, second, latest, trailingTool,
-  ],
-}))
+  ], 'running', 'bash-session', { inspect })
 
 assert.match(markup, /step-call-row" type="button" aria-expanded="false"/, 'Bash call details stay collapsed by default')
 assert.match(markup, /step-call-name">Bash<\/span>[\s\S]*step-call-count">×2 次/, 'adjacent Bash calls summarize repeated executions')
 assert.match(markup, /step-call-disclosure\" data-collapse-state=\"closed\" aria-hidden=\"true\"/, 'collapsed Bash details are hidden from the accessible tree')
 
 const running = { ...command(6, 'running'), state: 'running' as const }
-const runningMarkup = renderOpenChains(createElement(EventStream, {
-  sessionId: 'bash-session',
-  status: 'running',
-  events: [
+const runningMarkup = await renderEventStream([
     { sessionId: 'bash-session', seq: 0, ts: 1_000, type: 'user_message', payload: { text: 'run' } },
     first, running,
-  ],
-}))
+  ], 'running', 'bash-session', { inspect })
 assert.match(runningMarkup, /step-call-count">×2 次/, 'Bash call status includes completed and running commands')
 assert.match(runningMarkup, /step-call-status">[\s\S]*运行中/, 'the call row exposes running status')
 

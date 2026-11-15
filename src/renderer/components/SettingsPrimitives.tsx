@@ -56,7 +56,8 @@ export function SetSelect({
   ariaLabel,
   onChange,
   children,
-  leading
+  leading,
+  className = ''
 }: {
   value: string
   disabled?: boolean
@@ -64,9 +65,10 @@ export function SetSelect({
   onChange: (value: string) => void
   children: ReactNode
   leading?: ReactNode
+  className?: string
 }): JSX.Element {
   return (
-    <span className={`set-select ${disabled ? 'is-disabled' : ''}`} style={{ position: 'relative' }}>
+    <span className={`set-select ${disabled ? 'is-disabled' : ''} ${className}`} style={{ position: 'relative' }}>
       {leading}
       <select
         aria-label={ariaLabel}

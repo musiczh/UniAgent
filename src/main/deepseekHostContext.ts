@@ -3,6 +3,8 @@ import { mkdir, writeFile, rename } from 'node:fs/promises'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { DeepSeekHostClient, DeepSeekHostError } from './deepseekHostClient.ts'
+import { deepseekHostTitlePlugin } from './taskTitleDeepSeek.ts'
+import { ROUTER_SYSTEM_PROMPT } from '../shared/router'
 
 export interface DeepSeekMcpServer {
   name: string
@@ -43,6 +45,13 @@ export async function apply(ctx, config) {
         for (const fiber of previous?.fibers || []) await fiber.dispose()
         const fibers = []
         try {
+          if (binding.routerPrompt) {
+            const policy = agent.ctx.plugin({ name: 'uniagent-router-policy', inject: ['systemPrompt'], apply(scoped) {
+              scoped.systemPrompt.section({ name: 'uniagent-router', text: binding.routerPrompt, order: 10210, interpolate: false })
+            } })
+            fibers.push(policy)
+            await policy
+          }
           for (const server of binding.servers) {
             const fiber = agent.ctx.plugin(mcp, server)
             fibers.push(fiber)
@@ -70,9 +79,11 @@ export async function prepareDeepSeekHostContext(home: string): Promise<string> 
   const directory = join(home, 'uniagent-context')
   await mkdir(directory, { recursive: true, mode: 0o700 })
   const plugin = join(directory, 'plugin.mjs'), patch = join(directory, 'patch.json')
+  const title = join(directory, 'title.mjs')
   await atomicWrite(plugin, deepseekHostContextPlugin)
+  await atomicWrite(title, deepseekHostTitlePlugin)
   await atomicWrite(patch, JSON.stringify([{ insert: [{ id: 'uniagent-session-context', name: pathToFileURL(plugin).href,
-    config: { directory } }] }]))
+    config: { directory } }, { id: 'uniagent-title', name: pathToFileURL(title).href }] }]))
   return patch
 }
 
@@ -90,7 +101,8 @@ export async function bindDeepSeekHostContext(client: DeepSeekHostClient, native
     cwd, failOnStartupError: true, toolCallTimeoutMs: 600_000 }))
   const file = join(context.home, 'uniagent-context', createHash('sha256').update(nativeId).digest('hex') + '.json')
   signal?.throwIfAborted()
-  await atomicWrite(file, JSON.stringify({ nativeId, sessionId, servers }))
+  await atomicWrite(file, JSON.stringify({ nativeId, sessionId, servers,
+    ...(servers.some(server => server.serverName === 'uniagent-router') ? { routerPrompt: ROUTER_SYSTEM_PROMPT } : {}) }))
   signal?.throwIfAborted()
   const response = await client.call<any>('commands/execute', { agentId: nativeId, line: '/' + command, submittedAttachments: [] }, signal)
   if (response?.result?.kind !== 'success') throw new DeepSeekHostError('session-context-unavailable')

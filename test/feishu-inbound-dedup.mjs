@@ -94,8 +94,8 @@ await build({
                 messageResource: { get: async (request) => {
                   transport.downloads = [...(transport.downloads || []), request];
                   return {
-                    headers: { 'content-type': 'image/png' },
-                    writeFile: (path) => writeFile(path, Buffer.from('image bytes'))
+                    headers: { 'content-type': request.params.type === 'file' ? 'application/pdf' : 'image/png' },
+                    writeFile: (path) => writeFile(path, Buffer.from(request.params.type === 'file' ? '%PDF-fixture' : 'image bytes'))
                   };
                 } },
                 messageReaction: {
@@ -1375,6 +1375,60 @@ test('a standalone Feishu image reaches a newly-created Agent session as an atta
   assert.equal(await readFile(created.attachments[0].path, 'utf8'), 'image bytes')
 })
 
+test('a standalone Feishu file reaches a newly-created Agent session through its topic card', async t => {
+  let created
+  const bridge = makeBridge(new FeishuThreadStore(join(directory, 'file-topic-state')), () => [agent], (config, text, attachments) => {
+    created = { text, attachments }
+    return { id: 'session-file-topic', title: text, config }
+  })
+  t.after(() => bridge.dispose())
+  await bridge.start()
+  await emit({ ...message('om-file-topic'), message: { ...message('om-file-topic').message,
+    message_type: 'file', content: JSON.stringify({ file_key: 'file-topic', file_name: '82610235434.pdf' }) } })
+  const offer = transport.replies.find(reply => reply?.path?.message_id === 'om-file-topic')
+  assert.ok(offer, 'a file-only message must offer session configuration')
+  const start = JSON.parse(offer.data.content).body.elements.find(element => element.behaviors?.[0]?.value?.act === 'startTopic')
+  await transport.cardHandler({ action: { value: start.behaviors[0].value } })
+  for (let i = 0; i < 200 && !created; i++) await new Promise(resolve => setTimeout(resolve, 5))
+  assert.ok(created, 'the file must survive the topic card selection')
+  assert.equal(created.attachments[0].kind, 'file')
+  assert.equal(created.attachments[0].name, '82610235434.pdf')
+  assert.equal(await readFile(created.attachments[0].path, 'utf8'), '%PDF-fixture')
+})
+
+test('topic cards and session creation follow the Agent last choices when fixed defaults are cleared', async () => {
+  const agent = {
+    id: 'codex', name: 'Codex', adapter: 'codex', lifecycle: { availability: 'available' },
+    capabilities: { permissionModes: [{ id: 'read-only' }], modelSelect: true, reasoningEffort: true },
+    defaultModel: 'native', models: [
+      { id: 'native', label: 'Native', efforts: ['low', 'high'], defaultEffort: 'low' },
+      { id: 'last', label: 'Last', efforts: ['low', 'high'], defaultEffort: 'low' }
+    ]
+  }
+  let created
+  const bridge = new FeishuBridge({
+    orchestrator: {
+      createSession: config => { created = config; return { id: 'last-choice-session', title: 'Fixture', config } },
+      getSessionById: () => undefined, listSessions: () => []
+    },
+    threadStore: new FeishuThreadStore(join(directory, 'last-choice-state')),
+    getAgents: () => [agent], getAgentPref: () => ({ model: 'last', effort: 'high' }),
+    getSettings: () => ({ enabled: true, appId: 'cli_1234567890abcdef', appSecret: 'secret' }),
+    onStatus: () => {}
+  })
+  await bridge.start()
+  await emit(message('om-last-choice'))
+  const offer = transport.replies.find(reply => reply?.path?.message_id === 'om-last-choice')
+  const elements = JSON.parse(offer.data.content).body.elements
+  assert.equal(elements.find(element => element.name === 'model').initial_option, 'last')
+  assert.equal(elements.find(element => element.name === 'effort').initial_option, 'high')
+  const start = elements.find(element => element.behaviors?.[0]?.value?.act === 'startTopic')
+  await transport.cardHandler({ action: { value: start.behaviors[0].value } })
+  for (let i = 0; i < 200 && !created; i++) await new Promise(resolve => setTimeout(resolve, 5))
+  assert.equal(created.model, 'last')
+  assert.equal(created.effort, 'high')
+})
+
 // 统一 — the config card must (1) never create a session with a model that belongs
 // to a DIFFERENT agent — each select is standalone, so switching Agent fires
 // `agentChange` which resets 模型/推理强度 to the new agent's default — and (2) lock
@@ -2467,16 +2521,16 @@ const assistantFixture = async (t, name) => {
   const bridge = new FeishuBridge({
     orchestrator: {
       getSessionById: id => sessions.get(id), listSessions: () => [...sessions.values()],
-      forceSend: async (sessionId, text) => { sent.push({ sessionId, text }) }
+      forceSend: async (sessionId, text, attachments) => { sent.push({ sessionId, text, attachments }) }
     },
     threadStore: store, getAgents: () => [agent],
     getSettings: () => ({ enabled: true, appId: 'cli_assistant', appSecret: 'fixture' }),
     onStatus() {},
-    createAssistantSession: async (text, _attachments, bind, assertCurrent) => {
+    createAssistantSession: async (text, attachments, bind, assertCurrent) => {
       await new Promise(setImmediate)
       assertCurrent()
       const session = newSession()
-      created.push({ sessionId: session.id, text })
+      created.push({ sessionId: session.id, text, attachments })
       bind(session)
       return session
     },
@@ -2501,6 +2555,75 @@ const assistantFixture = async (t, name) => {
   })
   return { bridge, store, stateDir, sessions, newSession, created, sent, direct, threaded, commands, input }
 }
+
+test('assistant receives mixed text, images and PDF files on creation and standalone files on continuation', async t => {
+  const { created, sent, input } = await assistantFixture(t, 'assistant-inbound-files')
+  await emit(input('mixed-file', '', { message_type: 'post', content: JSON.stringify({ content: [
+    [{ tag: 'text', text: '帮我总结一下我的体检报告' }],
+    [{ tag: 'file', file_key: 'report-file', file_name: '82610235434.pdf' }, { tag: 'file', file_key: 'report-file', file_name: '82610235434.pdf' }],
+    [{ tag: 'img', image_key: 'report-image' }]
+  ] }) }))
+  assert.equal(created.length, 1)
+  assertFeishuPrompt(created[0].text, '帮我总结一下我的体检报告')
+  assert.deepEqual(created[0].attachments.map(({ kind, name }) => ({ kind, name })), [
+    { kind: 'image', name: 'feishu-image-1.png' }, { kind: 'file', name: '82610235434.pdf' }
+  ], 'duplicate file keys download only once')
+  assert.equal(await readFile(created[0].attachments[1].path, 'utf8'), '%PDF-fixture')
+  assert.equal(transport.downloads.at(-1).params.type, 'file')
+  await emit(input('standalone-file', '', { message_type: 'file', content: JSON.stringify({ file_key: 'follow-up-file', file_name: '../../follow-up.pdf' }) }))
+  assert.equal(sent.length, 1, 'a file-only follow-up must reach the existing assistant')
+  assert.equal(sent[0].sessionId, created[0].sessionId)
+  assert.equal(sent[0].attachments[0].name, 'follow-up.pdf')
+  assert.equal(await readFile(sent[0].attachments[0].path, 'utf8'), '%PDF-fixture')
+  await emit(input('invalid-file', '', { message_type: 'file', content: JSON.stringify({ file_name: 'missing-key.pdf' }) }))
+  assert.equal(sent.length, 1, 'an invalid resource without a file key must not start a turn')
+})
+
+test('assistant receives top-level files from a real Feishu post envelope without losing its text', async t => {
+  const { created, sent, input } = await assistantFixture(t, 'assistant-post-files')
+  const files = [
+    { file_key: 'post-report', file_name: 'report.pdf', is_folder: false },
+    { file_key: 'post-report', file_name: 'report.pdf', is_folder: false },
+    { file_key: 'post-folder', file_name: 'folder', is_folder: true },
+    { file_name: 'missing-key.pdf' }, null
+  ]
+  const content = [[{ tag: 'text', text: '帮我总结一下我的体检报告', style: [] }]]
+  await emit(input('post-files-first', '', { message_type: 'post', content: JSON.stringify({ title: '', content, content_v2: content, files }) }))
+  assert.equal(created.length, 1)
+  assertFeishuPrompt(created[0].text, '帮我总结一下我的体检报告')
+  assert.equal(created[0].attachments.length, 1, 'top-level files are deduplicated and malformed entries and folders are excluded')
+  assert.equal(created[0].attachments[0].name, 'report.pdf')
+  assert.equal(await readFile(created[0].attachments[0].path, 'utf8'), '%PDF-fixture')
+  await emit(input('post-files-only', '', { message_type: 'post', content: JSON.stringify({ content: [], files }) }))
+  assert.equal(sent.length, 1, 'a rich-text message containing only top-level files must reach the existing session')
+  assert.equal(sent[0].attachments[0].name, 'report.pdf')
+})
+
+test('failed, empty and oversized file downloads never send an attachment-free assistant turn and remain retryable', async t => {
+  const { bridge, store, created, sent, input } = await assistantFixture(t, 'assistant-file-failure')
+  await emit(input('file-failure-start', 'hello'))
+  const download = bridge.client.im.v1.messageResource.get
+  const request = input('file-failure', 'read this', { message_type: 'post', content: JSON.stringify({ content: [
+    [{ tag: 'text', text: 'read this' }], [{ tag: 'file', file_key: 'failed-file', file_name: 'failed.pdf' }]
+  ] }) })
+  for (const get of [
+    async () => { throw new Error('download unavailable') },
+    async () => ({ headers: {}, writeFile: path => writeFile(path, '') }),
+    async () => ({ headers: { 'content-length': String(30 * 1024 * 1024 + 1) }, writeFile() { assert.fail('oversized content must not be written') } }),
+    async () => ({ headers: {}, writeFile: path => writeFile(path, Buffer.alloc(30 * 1024 * 1024 + 1)) })
+  ]) {
+    bridge.client.im.v1.messageResource.get = get
+    await assert.rejects(transport.handler(request), /download unavailable|为空|30 MB/)
+    assert.equal(sent.length, 0)
+    assert.equal(store.hasHandledInbound('file-failure'), false)
+  }
+  bridge.client.im.v1.messageResource.get = download
+  await emit(request)
+  await emit(request)
+  assert.equal(created.length, 1)
+  assert.equal(sent.length, 1, 'retry succeeds once with its original file')
+  assert.equal(sent[0].attachments[0].name, 'failed.pdf')
+})
 
 test('assistant resident badge follows persisted private bindings, not App notification links or other bots', async t => {
   const { bridge, store, sessions, stateDir, newSession, created, input } = await assistantFixture(t, 'assistant-resident-badge')
@@ -2587,8 +2710,9 @@ test('App session commands serialize with private inbound messages before moving
   const gate = new Promise(resolve => { release = resolve })
   const started = new Promise(resolve => { entered = resolve })
   const execute = bridge.deps.assistantCommand
-  bridge.deps.assistantCommand = async (...args) => { entered(); await gate; return execute(...args) }
-  const command = bridge.executeAssistantCommandFromApp(created[0].sessionId, 'new', 'app-command')
+  const selection = { agentId: 'codex', model: 'chosen', effort: 'low' }
+  bridge.deps.assistantCommand = async (...args) => { assert.deepEqual(args[3], selection, 'App creation choices reach the assistant command'); entered(); await gate; return execute(...args) }
+  const command = bridge.executeAssistantCommandFromApp(created[0].sessionId, 'new', 'app-command', selection)
   await started
   const message = emit(input('race-next', 'new input'))
   await new Promise(setImmediate)
@@ -2726,4 +2850,308 @@ test('assistant group mentions bind the existing topic or create an independent 
   assert.equal(switched.replyInThread, true)
   assert.equal(threaded.at(-1).path.message_id, 'om-assistant-top-level')
   assert.equal(await bridge.ensureThread(sessions.get(second)), undefined, 'an ended group session must not fall back to a private chat')
+})
+
+async function routingFixture(t, name, settings = {}) {
+  const store = new FeishuThreadStore(join(directory, 'routing-' + name))
+  const session = { id: 'routed-' + name, title: '飞书路由任务', status: 'running', config: { agentId: 'codex', model: 'native', effort: 'high', projectId: 'p' } }
+  const requests = new Map(), submits = [], resolutions = [], order = [], opened = [], sent = []
+  const bridge = makeBridge(store, () => [agent], () => { throw new Error('automatic routing must not create a second task') }, {
+    getSessionById: id => id === session.id ? session : undefined, getEvents: async () => [],
+    latestAgentMessageText: () => '', forceSend: async (...args) => sent.push(args)
+  })
+  let available = true
+  bridge.deps.getSettings = () => ({ enabled: true, appId: 'routing-bot', appSecret: 'fixture', botName: 'Fixture', autoRouteNewConversations: true, defaultProjectId: 'manual-default', ...settings })
+  bridge.deps.onOpenSession = id => opened.push(id)
+  const change = (id, patch) => { const prior = requests.get(id); const next = { ...prior, ...patch, version: prior.version + 1 }; requests.set(id, next); return next }
+  bridge.deps.router = {
+    status: () => ({ enabled: available, available, reason: '未启用' }),
+    request: async id => requests.get(id), requests: async () => [...requests.values()],
+    topic: async (botAppId, chatId, rootId, parentId, threadId) => [...requests.values()].find(row => row.feishu.botAppId === botAppId && row.feishu.chatId === chatId &&
+      (row.feishu.rootMessageId === rootId || row.feishu.rootMessageId === parentId || row.feishu.cardMessageId === parentId || threadId && row.feishu.threadId === threadId)),
+    submit: async input => { submits.push(input); const request = { ...input, config: {}, state: 'queued', delivery: 'pending', version: 1, createdAt: Date.now() }; requests.set(input.requestId, request); return request },
+    resolve: async input => { resolutions.push(input); return change(input.requestId, { state: 'queued', question: undefined }) },
+    cancel: async (id, version) => { assert.equal(requests.get(id).version, version); return change(id, { state: 'cancelled' }) },
+    retry: async (id, version) => { assert.equal(requests.get(id).version, version); return change(id, { state: 'queued' }) }
+  }
+  await bridge.start()
+  bridge.client.im.v1.message.patch = async input => { order.push(JSON.parse(input.data.content).header?.title?.content); return { code: 0 } }
+  t.after(async () => { transport.replyHook = undefined; await bridge.stop(); bridge.dispose() })
+  const callback = (request, act, overrides = {}) => bridge.onCardAction({ chatId: 'chat-1', messageId: request.feishu.cardMessageId, action: { value: { routeId: request.requestId, version: request.version, act } }, ...overrides })
+  return { bridge, store, session, requests, submits, resolutions, order, opened, sent, change, callback, availability: value => { available = value } }
+}
+
+test('automatic Feishu topics skip selectors, retain defaults/attachments and deduplicate inbound delivery', async t => {
+  const f = await routingFixture(t, 'automatic')
+  const input = message('om-route-automatic')
+  input.message.message_type = 'file'; input.message.content = JSON.stringify({ file_key: 'routing-file', file_name: 'spec.pdf' })
+  await emit(input); await emit(input)
+  assert.equal(f.submits.length, 1)
+  const request = f.submits[0]
+  assert.match(request.requestId, /^[a-f0-9-]{36}$/)
+  assert.equal(request.feishu.botAppId, 'routing-bot')
+  assert.equal(request.feishu.rootMessageId, input.message.message_id)
+  assert.deepEqual(request.scope, { kind: 'global' })
+  assert.equal(request.execution.projectId, undefined, 'the manual default space is not a routing scope')
+  assert.equal(request.execution.agentId, 'codex')
+  assert.equal(request.attachments[0].name, 'spec.pdf')
+  assertFeishuPrompt(request.prompt, '[文件]')
+  const offer = transport.replies.find(item => item.path.message_id === input.message.message_id)
+  assert.ok(!offer.data.content.includes('select_static'))
+  assert.equal(JSON.parse(offer.data.content).header.title.content, '路由中')
+  assert.equal(offer.data.uuid, request.requestId, 'the first route card uses the durable source identity')
+})
+
+test('Feishu route result and binding precede dispatch, and existing topic bindings remain intact', async t => {
+  const f = await routingFixture(t, 'barrier')
+  await emit(message('om-route-barrier'))
+  const input = f.submits[0]
+  let request = f.change(input.requestId, { state: 'committing', decision: { action: 'create_task_in_space', reason: '属于本空间' } })
+  await f.bridge.prepareRoutedSession(request, f.session)
+  f.order.push('dispatch')
+  assert.ok(f.order.indexOf('已自动归属') < f.order.indexOf('dispatch'))
+  assert.equal(f.store.bySession(f.session.id).rootMessageId, input.feishu.rootMessageId)
+  assert.equal(f.store.bySession(f.session.id).driver, 'feishu')
+  f.store.patch(f.session.id, { rootMessageId: 'original-root', threadId: 'original-thread' })
+  request = f.change(input.requestId, { decision: { action: 'reuse_task', reason: '继续同一目标' }, targetId: f.session.id })
+  await f.bridge.prepareRoutedSession(request, f.session)
+  assert.equal(f.store.bySession(f.session.id).rootMessageId, 'original-root')
+  assert.equal(f.order.at(-1), '已加入已有任务')
+  request = f.change(input.requestId, { state: 'bound', delivery: 'queued' })
+  await f.bridge.syncRouterRequests()
+  await emit({ ...message('om-route-followup'), message: { ...message('om-route-followup').message, root_id: input.feishu.rootMessageId } })
+  assert.equal(f.sent.length, 1)
+  assert.equal(f.sent[0][0], f.session.id, 'a routed follow-up continues the same task')
+  await f.callback(request, 'openRoutedTask')
+  assert.deepEqual(f.opened, [f.session.id])
+  assert.equal((await f.callback(request, 'cancelRoute', { chatId: 'other-chat' })).toast.type, 'error')
+  assert.equal((await f.callback({ ...request, version: 0 }, 'cancelRoute')).toast.type, 'error')
+  f.store.patch(f.session.id, { botAppId: 'other-bot' })
+  await assert.rejects(f.bridge.prepareRoutedSession(request, f.session), /其他聊天或机器人的话题/)
+})
+
+test('Router unavailability retains manual selection; topic cards can explicitly start automatic routing', async t => {
+  const f = await routingFixture(t, 'manual', { autoRouteNewConversations: false })
+  await emit(message('om-route-manual'))
+  let card = JSON.parse(transport.replies.find(item => item.path.message_id === 'om-route-manual').data.content)
+  const choice = card.body.elements.find(item => item.name === 'assignment')
+  assert.equal(choice.initial_option, 'manual')
+  const topicId = choice.behaviors[0].value.topicId
+  await f.bridge.onCardAction({ action: { value: { topicId, act: 'setAssignment' }, option: 'auto' } })
+  await f.bridge.onCardAction({ action: { value: { topicId, act: 'startTopic' } } })
+  await f.bridge.onCardAction({ action: { value: { topicId, act: 'startTopic' } } })
+  for (let i = 0; i < 100 && !f.submits.length; i++) await new Promise(setImmediate)
+  assert.equal(f.submits.length, 1)
+  f.availability(false)
+  await emit(message('om-route-unavailable'))
+  card = JSON.parse(transport.replies.find(item => item.path.message_id === 'om-route-unavailable').data.content)
+  assert.ok(JSON.stringify(card).includes('尚未启用'))
+  assert.deepEqual(card.body.elements.find(item => item.name === 'assignment').options.map(item => item.value), ['manual'])
+  assert.equal(f.submits.length, 1)
+})
+
+test('route clarification stays on the same request and can return to manual selection', async t => {
+  const f = await routingFixture(t, 'clarify')
+  await emit(message('om-route-clarify'))
+  const input = f.submits[0]
+  f.change(input.requestId, { state: 'needs_input', question: '哪个空间？' })
+  await f.bridge.syncRouterRequests()
+  const reply = message('om-route-answer'); reply.message.root_id = input.feishu.rootMessageId
+  await emit(reply); await emit(reply)
+  assert.equal(f.resolutions.length, 1)
+  assert.equal(f.resolutions[0].requestId, input.requestId)
+  assert.equal(f.resolutions[0].answer, 'hello')
+  const request = f.change(input.requestId, { state: 'needs_input', question: '请选择' })
+  await f.callback(request, 'manualRoute')
+  await f.bridge.routeChains.get(request.requestId)
+  assert.equal(f.requests.get(request.requestId).state, 'cancelled')
+  assert.ok(f.bridge.pendingTopics.has(request.requestId))
+  await f.bridge.syncRouterRequests()
+  assert.equal(f.order.at(-1), '🚀 新会话配置', 'status synchronization must retain the manual card')
+})
+
+test('failed route forms and concurrent retry clicks continue the original request', async t => {
+  const f = await routingFixture(t, 'failed-supplement')
+  await emit(message('om-route-failed-supplement'))
+  const input = f.submits[0]
+  let request = f.change(input.requestId, { state: 'failed', error: '暂时不可用' })
+  await f.callback(request, 'supplementRoute'); await f.bridge.routeChains.get(request.requestId)
+  assert.equal(f.bridge.routeSupplementForms.get(request.requestId), request.version)
+  const submit = answer => f.callback(request, 'submitRouteSupplement', { action: {
+    value: { routeId: request.requestId, version: request.version, act: 'submitRouteSupplement' }, form_value: { routeAnswer: answer }
+  } })
+  assert.equal((await submit('   ')).toast.type, 'error')
+  assert.equal(f.resolutions.length, 0)
+  await submit('补充目标为 UniAgent 项目'); await f.bridge.routeChains.get(request.requestId)
+  assert.equal(f.resolutions[0].requestId, request.requestId)
+  assert.equal(f.resolutions[0].expectedVersion, request.version)
+  assert.equal(f.resolutions[0].action, 'retry')
+  assert.equal(f.resolutions[0].answer, '补充目标为 UniAgent 项目')
+  assert.equal(f.submits.length, 1)
+  request = f.change(input.requestId, { state: 'failed' })
+  await Promise.all([f.callback(request, 'retryRoute'), f.callback(request, 'retryRoute')])
+  await f.bridge.routeChains.get(request.requestId)
+  assert.equal(f.requests.get(request.requestId).version, request.version + 1)
+  assert.equal(f.submits.length, 1)
+})
+
+test('route clarification forms submit one stable candidate or Other and reject invalid choices', async t => {
+  const f = await routingFixture(t, 'clarification-choice')
+  await emit(message('om-route-clarification-choice'))
+  const input = f.submits[0]
+  let request = f.change(input.requestId, { state: 'needs_input', question: '请选择归属', decision: { action: 'clarify', clarificationOptions: [{ objectId: 'space', label: '空间直属' }] } })
+  const submit = form_value => f.callback(request, 'submitRouteSupplement', { action: {
+    value: { routeId: request.requestId, version: request.version, act: 'submitRouteSupplement' }, form_value
+  } })
+  for (const form of [{ routeAnswer: '没有选择' }, { routeChoice: ['space','__other__'], routeAnswer: '多选' }, { routeChoice: 'forged', routeAnswer: '伪造' }, { routeChoice: '__other__', routeAnswer: '  ' }]) {
+    assert.equal((await submit(form)).toast.type, 'error')
+  }
+  assert.equal(f.resolutions.length, 0)
+  await Promise.all([submit({ routeChoice: 'space', routeAnswer: '忽略未选中的自填' }), submit({ routeChoice: 'space' })])
+  await f.bridge.routeChains.get(request.requestId)
+  assert.equal(f.resolutions.length, 1)
+  assert.deepEqual(f.resolutions[0], { requestId: request.requestId, expectedVersion: request.version, action: 'answer', answer: '空间直属' })
+  assert.equal((await submit({ routeChoice: '__other__', routeAnswer: '旧卡' })).toast.type, 'error')
+  request = f.change(input.requestId, { state: 'needs_input', question: '请填写', decision: { action: 'clarify', clarificationOptions: [] } })
+  await submit({ routeChoice: '__other__', routeAnswer: '  用户自填归属  ' }); await f.bridge.routeChains.get(request.requestId)
+  assert.deepEqual(f.resolutions[1], { requestId: request.requestId, expectedVersion: request.version, action: 'answer', answer: '用户自填归属' })
+  assert.equal(f.submits.length, 1, 'answers continue the original route')
+})
+
+test('failed topic replies append text and attachments to the original route', async t => {
+  const f = await routingFixture(t, 'failed-reply')
+  await emit(message('om-route-failed-reply'))
+  const input = f.submits[0], request = f.change(input.requestId, { state: 'failed' })
+  const reply = message('om-route-failed-answer'); reply.message.root_id = input.feishu.rootMessageId
+  await emit(reply)
+  assert.equal(f.resolutions.length, 1); assert.equal(f.resolutions[0].requestId, request.requestId)
+  assert.equal(f.resolutions[0].action, 'retry'); assert.equal(f.resolutions[0].sourceId, reply.message.message_id)
+  f.change(input.requestId, { state: 'failed' })
+  const image = message('om-route-failed-image'); image.message.root_id = input.feishu.rootMessageId
+  image.message.message_type = 'image'; image.message.content = JSON.stringify({ image_key: 'img_route_supplement' })
+  const attachment = { kind: 'image', path: '/fixture/supplement.png', name: 'supplement.png' }
+  f.bridge.downloadAttachments = async () => [attachment]
+  await emit(image)
+  assert.deepEqual(f.resolutions[1].attachments, [attachment]); assert.equal(f.resolutions[1].requestId, request.requestId)
+  assert.equal(f.submits.length, 1)
+})
+
+test('delivery verification releases its route chain before crossing the display barrier', async t => {
+  const f = await routingFixture(t, 'verify-barrier')
+  await emit(message('om-route-verify-barrier'))
+  const input = f.submits[0], request = f.change(input.requestId, { state: 'bound', targetId: f.session.id, delivery: 'unknown' })
+  let completed = false
+  f.bridge.deps.router.resolve = async resolution => {
+    assert.equal(resolution.action, 'verify')
+    await f.bridge.prepareRoutedSession(request, f.session)
+    completed = true
+    return f.change(request.requestId, { delivery: 'queued' })
+  }
+  assert.equal((await f.callback(request, 'retryRoute')).toast.type, 'error')
+  assert.equal((await f.callback(request, 'verifyRoute')).toast.type, 'info')
+  for (let i = 0; i < 100 && !completed; i++) await new Promise(resolve => setTimeout(resolve, 5))
+  assert.equal(completed, true, 'Controller verification must not deadlock against the Feishu display barrier')
+  assert.equal(f.submits.length, 1)
+})
+
+test('an ambiguous route topic asks for a card reply instead of creating a new request', async t => {
+  const f = await routingFixture(t, 'ambiguous-topic')
+  await emit(message('om-route-ambiguous-topic'))
+  f.bridge.deps.router.topic = async () => { throw Error('router_topic_ambiguous') }
+  const reply = message('om-route-ambiguous-reply'); reply.message.root_id = f.submits[0].feishu.rootMessageId
+  await emit(reply)
+  assert.match(transport.replies.at(-1).data.content, /回复对应的结果卡片/)
+  assert.equal(f.submits.length, 1)
+})
+
+test('route card update failures retry the same persisted request without a second submission', async t => {
+  const f = await routingFixture(t, 'retry')
+  const patch = f.bridge.client.im.v1.message.patch
+  let fail = true
+  f.bridge.client.im.v1.message.patch = async input => { if (fail) { fail = false; throw new Error('route patch failed') } return patch(input) }
+  const input = message('om-route-retry')
+  await assert.rejects(transport.handler(input), /route patch failed/)
+  await emit(input)
+  assert.equal(f.submits.length, 1)
+  const request = f.submits[0]
+  f.change(request.requestId, { state: 'bound', targetId: f.session.id, delivery: 'unknown' })
+  await f.bridge.syncRouterRequests()
+  assert.ok(f.order.includes('归属已确定，投递待确认'))
+  assert.equal(f.submits.length, 1, 'unknown delivery is never resubmitted')
+  await f.bridge.stop(); await f.bridge.start()
+  f.bridge.client.im.v1.message.patch = patch
+  await f.bridge.syncRouterRequests()
+  assert.equal(f.submits.length, 1, 'connection recovery only reconciles the persisted request')
+})
+
+test('an expired historical route card does not block other topic updates', async t => {
+  const f = await routingFixture(t, 'independent-updates')
+  await emit(message('om-route-old-card')); await emit(message('om-route-current-card'))
+  const first = f.submits[0], second = f.submits[1]
+  f.change(first.requestId, { state: 'needs_input', question: 'old', feishu: { ...first.feishu, cardMessageId: 'expired' } })
+  f.change(second.requestId, { state: 'needs_input', question: 'current', feishu: { ...second.feishu, cardMessageId: 'current' } })
+  const updated = []
+  f.bridge.client.im.v1.message.patch = async input => {
+    if (input.path.message_id === 'expired') throw Error('historical card expired')
+    updated.push(input.path.message_id); return { code: 0 }
+  }
+  await assert.rejects(f.bridge.syncRouterRequests(), /historical card expired/)
+  assert.ok(updated.includes('current'), 'each topic has an independent delivery result')
+})
+
+test('an officially expired route card is replaced in the same topic without changing the request or resubmitting', async t => {
+  const f = await routingFixture(t, 'expired-replacement')
+  await emit(message('om-route-expired-replacement'))
+  const input = f.submits[0], request = f.change(input.requestId, { state: 'failed' }), oldCard = request.feishu.cardMessageId
+  f.bridge.deps.router.replaceCard = async (id, expected, cardMessageId) => {
+    assert.equal(id, request.requestId); assert.equal(expected, oldCard)
+    const next = { ...f.requests.get(id), feishu: { ...request.feishu, cardMessageId } }; f.requests.set(id, next); return next
+  }
+  f.bridge.client.im.v1.message.patch = async input => input.path.message_id === oldCard ? { code: 230031, msg: 'expired' } : { code: 0 }
+  const before = transport.replies.length
+  transport.replyHook = async request => { transport.replies.push(request); return { code: 0, data: { message_id: 'replacement-route-card', thread_id: 'thread-1' } } }
+  await f.bridge.syncRouterRequests()
+  const latest = f.requests.get(request.requestId)
+  assert.notEqual(latest.feishu.cardMessageId, oldCard)
+  assert.equal(latest.version, request.version)
+  assert.equal(f.submits.length, 1)
+  assert.equal(transport.replies.length, before + 1)
+  assert.equal(transport.replies.at(-1).path.message_id, request.feishu.rootMessageId)
+  assert.ok(transport.replies.at(-1).data.uuid)
+  assert.equal((await f.callback({ ...request, feishu: { ...request.feishu, cardMessageId: oldCard } }, 'retryRoute')).toast.type, 'error', 'superseded cards cannot replay a request')
+  await f.bridge.syncRouterRequests()
+  assert.equal(transport.replies.length, before + 1)
+})
+
+test('group auto-routing requires an explicit mention and preserves the topic origin', async t => {
+  const f = await routingFixture(t, 'group')
+  const ignored = message('om-route-group-ignored'); ignored.message.chat_type = 'group'
+  await emit(ignored); assert.equal(f.submits.length, 0)
+  const input = message('om-route-group-mentioned'); input.message.chat_type = 'group'; input.message.mentions = [{ id: { open_id: 'bot' } }]
+  await emit(input)
+  assert.equal(f.submits.length, 1)
+  assert.equal(f.submits[0].feishu.rootMessageId, input.message.message_id)
+})
+
+test('a fast routed turn uses the existing progress and approval cards after the route result', async t => {
+  const f = await routingFixture(t, 'fast-turn')
+  await emit(message('om-route-fast-turn'))
+  const input = f.submits[0], request = f.change(input.requestId, { state: 'committing', decision: { action: 'create_task_in_space', reason: 'new task' } })
+  const reply = f.bridge.client.im.v1.message.reply
+  f.bridge.client.im.v1.message.reply = async input => { f.order.push('session-message'); return reply(input) }
+  await f.bridge.prepareRoutedSession(request, f.session)
+  const event = (type, seq, payload = {}, state = 'running') => ({ sessionId: f.session.id, type, seq, payload, state, ts: Date.now() })
+  const started = event('turn_started', 1)
+  f.bridge.handleEvent(started)
+  f.bridge.handleEvent(event('approval_request', 2, { kind: 'command', requestId: 'fast-approval', method: 'command', params: { command: 'echo hi' } }, 'pending'))
+  await f.bridge.pushChains.get(f.session.id)
+  for (let i = 0; i < 100 && !f.bridge.progressCards.get(f.session.id)?.messageId; i++) await new Promise(setImmediate)
+  assert.ok(f.bridge.progressCards.get(f.session.id)?.messageId, 'the normal Session progress card is sent')
+  assert.ok(f.bridge.requestCards.has(f.session.id + '/fast-approval'), 'the normal approval card is sent')
+  assert.ok(f.order.indexOf('已自动归属') < f.order.indexOf('session-message'))
+  let replays = 0
+  f.bridge.deps.orchestrator.getEvents = async () => { replays++; return [started] }
+  f.change(input.requestId, { state: 'bound', targetId: f.session.id, delivery: 'accepted' })
+  await f.bridge.syncRouterRequests()
+  assert.equal(replays, 0, 'a live bound notification cannot replay already-collected turn events')
 })

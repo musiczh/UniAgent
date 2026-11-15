@@ -72,7 +72,7 @@ assert.match(wakeHtml, /<\/button><div class="team-waiting-summary">.*?<details 
 assert.ok(wakeHtml.includes('第 1 次交付') && wakeHtml.includes('交付材料 · 1 份'), 'the card retains report materials and review status')
 assert.ok(wakeHtml.includes('data-member-session-id="designer-session"'), 'delivery card keeps the member Session jump target')
 assert.equal((wakeHtml.match(/class="turn-response/g) || []).length, 1, 'internal team wake-up continues the same user task')
-assert.equal((wakeHtml.match(/class="card system-notice usage/g) || []).length, 1, 'internal Leader wake-ups produce one usage card for the completed user task')
+assert.equal((wakeHtml.match(/class="message-usage"/g) || []).length, 1, 'internal Leader wake-ups produce one usage action for the completed user task')
 assert.ok(wakeHtml.indexOf('team-waiting-entry') < wakeHtml.indexOf('输入 333') && wakeHtml.includes('输出 33'), 'the final footer sums native turn usage after the member delivery')
 assert.ok(!wakeHtml.includes('补充信息') && !wakeHtml.includes('[team_event：'), 'wake-up reply is not hidden as supplemental information and raw protocol stays hidden')
 
@@ -112,7 +112,7 @@ assert.ok(waitingHtml.includes('1 位待返回') && waitingHtml.includes('设计
 assert.ok(waitingHtml.includes('data-member-session-id="designer-session"'), 'waiting member row keeps the detail Session jump target')
 assert.match(waitingHtml, /class="sa-ic sa-ic-plain"[^>]*style="width:24px;height:24px"/, 'waiting member avatar uses the smaller transparent glyph instead of the tinted plate')
 assert.ok(!waitingHtml.includes('team-waiting-summary') && !waitingHtml.includes('team-waiting-details'), 'running members keep their compact row until a delivery arrives')
-assert.ok(!waitingHtml.includes('card system-notice usage'), 'waiting for members must not display a native turn usage footer')
+assert.ok(!waitingHtml.includes('message-usage'), 'waiting for members must not display a native turn usage action')
 
 const waitingWithHooks: any[] = [
   { sessionId: 'leader-session', seq: 1, ts: 100, type: 'user_message', payload: { text: '先让组员处理设计稿' } },
@@ -130,12 +130,12 @@ const hooksHtml = renderOpenChains(<TeamSessionProvider project={waitingProject 
 const waitPosition = hooksHtml.indexOf('team-waiting-members-step')
 assert.equal((hooksHtml.match(/data-step-id=/g) || []).length, 1, 'late Stop hooks must not create a new execution step')
 assert.doesNotMatch(hooksHtml, /hook-batch|hook-row|本轮 Hook/, 'Hooks stay hidden while the team is waiting for members')
-assert.ok(!hooksHtml.slice(waitPosition).includes('data-step-id=') && !hooksHtml.includes('card system-notice usage'), 'the waiting node remains the last step without a usage footer')
+assert.ok(!hooksHtml.slice(waitPosition).includes('data-step-id=') && !hooksHtml.includes('message-usage'), 'the waiting node remains the last step without a usage action')
 
 const continuingHtml = renderToStaticMarkup(<TeamSessionProvider project={wakeProject} sessions={[{ id: 'leader-session', status: 'running' }, { id: 'designer-session', status: 'idle' }] as any} onOpenMember={() => {}}>
   <SessionConversation events={teamSessionEvents(wakeProject as any, 'leader-session', wakeEvents)} status="running" sessionId="leader-session" />
 </TeamSessionProvider>)
-assert.ok(!continuingHtml.includes('card system-notice usage'), 'Leader continuation keeps all native turn usage hidden until the user task finishes')
+assert.ok(!continuingHtml.includes('message-usage'), 'Leader continuation keeps all native turn usage hidden until the user task finishes')
 console.log('PASS team waiting card, hidden running Hooks and completed task usage aggregation')
 
 // Queue waits are per native turn: a Leader wake-up continues the same visual

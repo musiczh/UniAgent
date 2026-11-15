@@ -12,7 +12,18 @@ import {
 
 export function useSessionAttention(sessionId: string | null): void {
   useEffect(() => {
-    void window.uniagent.setBadgeVisibleSession(sessionId).catch(error => console.warn('[session-badge]', error))
+    const isReading = (): boolean => document.visibilityState !== 'hidden' && document.hasFocus()
+    const report = (): void => {
+      void window.uniagent.setBadgeVisibleSession(sessionId).catch(error => console.warn('[session-badge]', error))
+    }
+    const read = (): void => { if (isReading()) report() }
+    report()
+    window.addEventListener('focus', read)
+    document.addEventListener('visibilitychange', read)
+    return () => {
+      window.removeEventListener('focus', read)
+      document.removeEventListener('visibilitychange', read)
+    }
   }, [sessionId])
 }
 

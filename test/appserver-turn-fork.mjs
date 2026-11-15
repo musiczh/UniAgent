@@ -549,6 +549,46 @@ try {
     )
   }
 
+  // Media returned by tools must never become megabytes of input_text in a fork.
+  for (const adapter of ['codex', 'traex']) {
+    const { runner, transport } = makeRunner(AppServerRunner, 'media-parent', undefined, adapter)
+    transport.handler = async (method) => {
+      if (method === 'thread/resume') return { thread: { id: 'media-parent' } }
+      if (method === 'turn/start') return { turn: { id: 'media-turn' } }
+      if (method === 'thread/fork') return { thread: { id: 'media-side' } }
+      return {}
+    }
+    await runner.startTurn('Keep the latest task context')
+    const binary = 'QkFTRTY0'.repeat(150_000)
+    const result = { content: [
+      { type: 'image', mimeType: 'image/png', data: binary },
+      { type: 'audio', mimeType: 'audio/wav', data: binary },
+      { type: 'resource', resource: { uri: 'file:///fixture.bin', mimeType: 'application/octet-stream', blob: binary } },
+      { type: 'text', text: 'Screenshot shows the current page' },
+      { type: 'text', text: JSON.stringify({ content: [{ type: 'image', data: binary }] }) }
+    ] }
+    const completed = (id, value) => runner.onNotification('item/completed', {
+      threadId: 'media-parent', turnId: 'media-turn',
+      item: { type: 'mcpToolCall', id, server: 'browser', tool: 'snapshot', status: 'completed', result: value }
+    })
+    completed('media', result)
+    await runner.forkSideSnapshot([])
+    const snapshot = transport.calls.find(call => call.method === 'thread/inject_items').params.items.at(-1).content[0].text
+    assert.ok(snapshot.length <= 16_000, 'one image-bearing tool result must fit the supplemental snapshot budget')
+    assert.doesNotMatch(snapshot, /QkFTRTY0/, 'structured and stringified media must not be replayed as text tokens')
+    assert.match(snapshot, /Screenshot shows the current page/)
+    assert.match(snapshot, /fixture.bin/, 'retain resource identity without its binary body')
+    assert.equal(result.content[0].data, binary, 'snapshot filtering must not mutate the original tool result')
+    for (let index = 0; index < 100; index++) completed(`log-${index}`, { content: [{ type: 'text', text: `result-${index}: ` + '工具日志。'.repeat(2000) + ` END-${index}` }] })
+    await runner.forkSideSnapshot([])
+    const bounded = transport.calls.filter(call => call.method === 'thread/inject_items').at(-1).params.items.at(-1).content[0].text
+    assert.ok(bounded.length <= 16_000, 'many large text results must share one total budget')
+    assert.match(bounded, /Keep the latest task context/)
+    assert.match(bounded, /END-99/, 'prefer recent results and preserve the tail of long output')
+    assert.match(bounded, /omitted/i, 'tell the model that the supplemental snapshot is incomplete')
+    runner.dispose()
+  }
+
   // --- 6. a live parent owns the fork; the side process only resumes it ---
   for (const adapter of ['codex', 'traex']) {
     const { runner: main, events: mainEvents, transport: mainTransport } = makeRunner(

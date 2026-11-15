@@ -6,7 +6,9 @@ import { join } from 'node:path'
 import { readdir } from 'node:fs/promises'
 import { KimiWebRuntime, projectKimiWebGoal } from '../src/main/kimiWebRuntime.ts'
 import { KimiWebRunner } from '../src/main/kimiWebRunner.ts'
-import { forkKimiWebSession, listKimiWebSessions } from '../src/main/kimiHistory.ts'
+import { forkKimiWebSession, listKimiWebSessions, loadKimiSubAgentEvents } from '../src/main/kimiHistory.ts'
+import { KimiWebError } from '../src/main/kimiWebTransport.ts'
+import { kimiWebTranscriptEvents } from '../src/main/kimiWebEventProjection.ts'
 import { probeKimiWeb } from '../src/main/kimiWebContract.ts'
 import { acquireKimiWebService, closeKimiWebServices } from '../src/main/kimiWebService.ts'
 import { inspectACPProcess, signalACPProcess, type ProcessIdentity } from '../src/main/acp/acpProcessLifecycle.ts'
@@ -59,17 +61,26 @@ let runner: KimiWebRunner | undefined
 let sibling: KimiWebRuntime | undefined
 let stoppedService: ProcessIdentity | undefined
 async function ownedService(): Promise<ProcessIdentity> {
+  const observations: Array<{ pid: number; present: boolean; ppid?: number; uid?: number }> = []
   for (const file of await readdir(join(source, 'server/instances'))) {
     const record = JSON.parse(readFileSync(join(source, 'server/instances', file), 'utf8'))
     const inspected = await inspectACPProcess(record.pid)
-    if (inspected.ok && inspected.process?.ppid === process.pid && inspected.process.uid === process.getuid?.()) return inspected.process
+    if (!inspected.ok) throw new Error('fault injection process inspection failed', { cause: inspected.error })
+    observations.push({ pid: record.pid, present: !!inspected.process, ppid: inspected.process?.ppid, uid: inspected.process?.uid })
+    if (inspected.process?.ppid === process.pid && inspected.process.uid === process.getuid?.()) return inspected.process
   }
-  throw new Error('fault injection requires the isolated service started by this test')
+  throw new Error('fault injection requires the isolated service started by this test: ' + JSON.stringify({ parentPid: process.pid, uid: process.getuid?.(), observations }))
 }
 const saved = { HOME: process.env.HOME, KIMI_CODE_HOME: process.env.KIMI_CODE_HOME, UNIAGENT_USER_DATA: process.env.UNIAGENT_USER_DATA }
 let released = 0
 const frames: any[] = []
 const snapshots: any[] = []
+const runtimeFrames: any[] = []
+const nativeHistory: Record<string, any> = {}
+// Cold transcript is rebuilt from native wire records, not the in-memory
+// object. Compare every rendered event identity/state/content; live-only step
+// timing and finishReason are not persisted by the official implementation.
+const historyEvents = (items: any[]) => kimiWebTranscriptEvents(items).map(({ ts, ...event }) => event)
 const until = async <T>(read: () => Promise<T>, predicate: (value: T) => boolean, label: string): Promise<T> => {
   const deadline = Date.now() + 15_000
   for (;;) {
@@ -103,15 +114,22 @@ try {
   await until(async () => requests, n => n > 0, 'model request')
   const tools = lastRequest.tools.map((tool: any) => tool.function.name)
   assert.ok(tools.includes('Read') && tools.includes('Write'))
+  if (runtime.usesTurnsProtocol) await until(async () => frames, list => list.some(frame => frame.type === 'item.delta' && frame.field === 'text' && frame.delta.length > 0), 'live text delta before interruption')
   const steering = await runtime.steer('Native steer marker')
   assert.equal(steering.steered, true)
-  await until(async () => frames, list => list.some(frame => frame.type === 'prompt.steered'), 'steer event')
+  await until(async () => frames, list => list.some(frame => frame.type === 'prompt.steered'
+    || frame.type === 'transcript.ops' && frame.payload.ops.some((op: any) => op.op === 'prompt.upsert' && op.prompt.steeredAt)
+    || ['item.started', 'item.ended'].includes(frame.type) && frame.item?.type === 'user_message' && frame.item.text === 'Native steer marker'), 'persisted steer event')
   assert.equal((await runtime.controlGoal('pause'))?.status, 'paused')
   assert.equal((await runtime.controlGoal('resume'))?.status, 'active')
   assert.equal(await runtime.controlGoal('cancel'), null)
   await until(async () => { if ((await runtime!.status()).busy) await runtime!.abortSession(); return runtime!.status() }, state => !state.busy, 'Goal cancellation finishes')
-  assert.ok(frames.some(frame => frame.type === 'assistant.delta'))
-  assert.ok(frames.some(frame => frame.type === 'turn.ended' && frame.payload.reason === 'cancelled'))
+  assert.ok(frames.some(frame => frame.type === 'assistant.delta' || frame.type === 'transcript.ops' && frame.payload.ops.some((op: any) =>
+    op.op === 'append' && op.text.length > 0 || op.op === 'frame.upsert' && op.frame.kind === 'text' && op.frame.role === 'assistant' && op.frame.text.length > 0)
+    || frame.type === 'item.delta' && frame.field === 'text' && frame.delta.length > 0
+    || frame.type === 'item.started' && frame.item?.type === 'assistant_message' && frame.item.text.length > 0))
+  assert.ok(frames.some(frame => frame.type === 'turn.ended' && frame.payload.reason === 'cancelled')
+    || snapshots.some(snapshot => snapshot.transcript?.some((turn: any) => turn.kind === 'turn' && turn.state === 'cancelled')))
   mode = 'approval'
   await runtime.submitPrompt('Request denied write')
   const approvalRows = await until(() => runtime!.pendingApprovals(), value => value.items.length > 0, 'approval')
@@ -174,7 +192,6 @@ try {
   await until(async () => events, list => list.some(event => event.type === 'turn_completed' && event.state === 'cancelled'), 'runner interrupt')
   const goalChanges: any[] = []
   runner.on('goalChanged', goal => goalChanges.push(goal))
-  const runtimeFrames: any[] = []
   const nativeHandler = (runner as any).onFrame.bind(runner)
   ;(runner as any).onFrame = async (frame: any) => { runtimeFrames.push(frame); return nativeHandler(frame) }
   mode = 'complete'
@@ -183,10 +200,20 @@ try {
   await until(async () => runner!.isRunning(), running => !running, 'native completion terminal')
   assert.equal(await (runner as any).runtime.getGoal(), null, 'official completion clears current endpoint')
   assert.equal((await runner.getGoal())?.status, 'complete', 'host retains the native terminal snapshot')
-  const updates = runtimeFrames.filter(frame => frame.type === 'goal.updated')
-  const completeAt = updates.findIndex(frame => frame.payload.snapshot?.status === 'complete')
-  assert.ok(completeAt >= 0 && updates.slice(completeAt + 1).some(frame => frame.payload.snapshot === null), 'native emits completion followed by automatic clear')
+  const updates = runtimeFrames.flatMap(frame => frame.type === 'goal.updated' ? [frame.payload.snapshot]
+    : frame.type === 'goal' ? [frame.goal] : frame.type === 'transcript.ops' ? frame.payload.ops
+      .filter((op: any) => op.op === 'marker.upsert' && op.item.marker === 'goal').map((op: any) => op.item.payload.snapshot) : [])
+  const completeAt = updates.findIndex(goal => goal?.status === 'complete')
+  if ((runner as any).runtime.usesTurnsProtocol) {
+    assert.ok(updates.some(goal => goal === null || goal === undefined), 'native clears its coalesced goal feed')
+    assert.ok(runtimeFrames.some(frame => frame.type === 'item.ended' && frame.item?.name === 'UpdateGoal' && frame.item.outcome === 'completed' && frame.item.input?.status === 'complete'), 'successful native terminal tool result confirms completion after the goal feed clears')
+  } else assert.ok(completeAt >= 0 && updates.slice(completeAt + 1).some(goal => goal === null || goal === undefined), 'native emits completion followed by automatic clear')
   assert.equal(await runner.updateGoal({ action: 'clear' }), undefined, 'explicit clear removes terminal history even when native current goal is absent')
+  mode = 'done'
+  const compactionEvents = events.length
+  await (runner as any).runtime.compact()
+  await until(async () => events.slice(compactionEvents), list => list.some(row => row.type === 'context_compaction' && row.state === 'success'), 'native transcript compaction completion')
+  assert.ok((await (runner as any).runtime.transcript()).items.some((row: any) => row.kind === 'turn' && row.prompt?.includes('ordinary web runner')), 'compaction retains the original native user history')
   await runner.disposeAndWait(); runner = undefined
   mode = 'done'
   const ordinaryConfig = { agentId: 'kimi' as const, workdir, model: 'local', permissionMode: 'full-access' as const }
@@ -207,6 +234,8 @@ try {
   await until(() => runtime!.getSubagentTask(child.agent_id), task => task.status === 'cancelled', 'owned task cancellation')
   const parentId = runtime.nativeSessionId
   await runtime.closeAndWait(); runtime = undefined
+  const coldRead = await loadKimiSubAgentEvents(parentId, child.agent_id, options.bin, workdir, options.env, { nativeTaskId: child.id, parentNativeSessionId: parentId })
+  assert.ok(coldRead.some(row => row.type === 'agent_message'), 'cold child history uses the installed protocol without subscribing to the parent')
   runtime = await KimiWebRuntime.start({ ...options, sessionId: 'dirs-a', config: ordinaryConfig, nativeSessionId: parentId })
   const cold = await runtime.getSubagentTranscript(child.agent_id, { nativeTaskId: child.id, parentNativeSessionId: parentId })
   assert.ok(cold.some(row => row.type === 'agent_message'), 'owned child transcript survives web restart without activating child')
@@ -216,20 +245,24 @@ try {
   await until(() => runtime!.status(), status => !status.busy, 'recovery fixture completed turn')
   const durableId = runtime.nativeSessionId
   const durableTranscript = (await runtime.transcript()).items
+  nativeHistory.durable = durableTranscript
   assert.ok(durableTranscript.length > 0)
   const originalConfig = readFileSync(join(source, 'config.toml'), 'utf8'), requestsBeforeRecovery = requests
   const service = await acquireKimiWebService({ bin: options.bin, cwd: workdir, env: options.env, timeoutMs: 20_000 })
   stoppedService = await ownedService()
   Object.defineProperty(service.transport, 'timeoutMs', { value: 250 })
   assert.ok(signalACPProcess(stoppedService, await inspectACPProcess(stoppedService.pid), 'SIGSTOP'))
-  await assert.rejects(runtime.snapshot(), /request_aborted/)
+  await assert.rejects(runtime.snapshot(), (error: any) => error instanceof KimiWebError && error.recovered && error.kind === (service.transport.transcriptProtocol ? 'stream_timeout' : 'request_aborted'))
   const gone = await inspectACPProcess(stoppedService.pid)
   assert.ok(gone.ok && !gone.process, 'automatic recovery must finish stopping the old native service')
   await runtime.closeAndWait(); runtime = undefined
   assert.equal((await probeKimiWeb(options.bin, workdir, options.env)).status, 'ready', 'replacement must pass actual REST and WebSocket protocol checks')
   runtime = await KimiWebRuntime.start({ ...options, sessionId: 'recovery-durable', nativeSessionId: durableId, config: ordinaryConfig })
   assert.equal(runtime.nativeSessionId, durableId)
-  assert.deepEqual((await runtime.transcript()).items, durableTranscript, 'the actual native transcript must survive service replacement')
+  const restoredTranscript = (await runtime.transcript()).items
+  nativeHistory.restored = restoredTranscript
+  assert.deepEqual(historyEvents(restoredTranscript), historyEvents(durableTranscript), 'all native user/reply/tool event identities, states and content survive service replacement')
+  assert.equal(Math.floor(Date.parse(restoredTranscript[0].startedAt) / 1000), Math.floor(Date.parse(durableTranscript[0].startedAt) / 1000), 'native history retains the displayed start time')
   assert.equal(readFileSync(join(source, 'config.toml'), 'utf8'), originalConfig)
   assert.equal(requests, requestsBeforeRecovery, 'service recovery must not send another model request')
   mode = 'hold'
@@ -240,14 +273,19 @@ try {
   Object.defineProperty(activeService.transport, 'timeoutMs', { value: 250 })
   stoppedService = await ownedService()
   assert.ok(signalACPProcess(stoppedService, await inspectACPProcess(stoppedService.pid), 'SIGSTOP'))
-  await assert.rejects(runtime.snapshot(), /request_aborted/)
+  await assert.rejects(runtime.snapshot(), (error: any) => error instanceof KimiWebError && error.recovered && error.kind === (activeService.transport.transcriptProtocol ? 'stream_timeout' : 'request_aborted'))
   await runtime.closeAndWait(); runtime = undefined
   mode = 'done'
   runtime = await KimiWebRuntime.start({ ...options, sessionId: 'recovery-durable', nativeSessionId: durableId, config: ordinaryConfig })
   assert.equal(runtime.nativeSessionId, durableId)
   const recoveredTurns = (await runtime.transcript()).items
+  nativeHistory.interrupted = recoveredTurns
   const recoveredHistory = JSON.stringify(recoveredTurns)
-  for (const turn of durableTranscript) assert.deepEqual(recoveredTurns.find(row => row.turnId === turn.turnId), turn, 'completed native history must remain unchanged when an active turn is interrupted')
+  for (const turn of durableTranscript.filter(row => row.kind === 'turn')) {
+    const recovered = recoveredTurns.find(row => row.kind === 'turn' && row.turnId === turn.turnId)
+    assert.ok(recovered, 'every completed native turn survives interrupted-turn recovery')
+    assert.deepEqual(historyEvents([recovered]), historyEvents([turn]), 'completed native history must remain unchanged when an active turn is interrupted')
+  }
   const resumedStatus = await runtime.status(), resumedPrompts = await runtime.prompts()
   assert.equal(resumedStatus.busy, false)
   assert.equal(resumedPrompts.active, null)
@@ -258,8 +296,11 @@ try {
   await activeService.release()
   await runtime.closeAndWait(); runtime = undefined; await service.release()
   console.log('Native Kimi recovery: isolated unresponsive service replaced, protocol healthy, transcript/config preserved and no model request replay')
-  console.log(JSON.stringify({ verified: ['official live OpenAPI/AsyncAPI', 'loopback bearer auth', 'unsupported directory configuration rejected', 'native goal create/get/pause/resume/cancel', 'native completion snapshot retained after automatic clear', 'active turn queued steer', 'manual approval rejection', 'native question answer', 'native history resume', 'owned child exit', 'owned subagent registry/detail/cancel/cold transcript'], requests, eventTypes: [...new Set(frames.map(frame => frame.type))] }))
+  console.log(JSON.stringify({ verified: ['official live OpenAPI/AsyncAPI', 'loopback bearer auth', 'unsupported directory configuration rejected', 'native goal create/get/pause/resume/cancel', 'native completion snapshot retained after automatic clear', 'native compaction progress/completion and retained transcript history', 'active turn queued steer', 'manual approval rejection', 'native question answer', 'native history resume', 'owned child exit', 'owned subagent registry/detail/cancel/cold transcript'], requests, eventTypes: [...new Set(frames.map(frame => frame.type))] }))
 } finally {
+  mkdirSync('out/agent-qualification', { recursive: true })
+  writeFileSync('out/agent-qualification/kimi-new-protocol-evidence.json', JSON.stringify({ mode, requests, lastRequest,
+    frames, snapshots: snapshots.slice(-10), runtimeFrames, nativeHistory }, null, 2), { mode: 0o600 })
   if (stoppedService) signalACPProcess(stoppedService, await inspectACPProcess(stoppedService.pid), 'SIGCONT')
   await runtime?.abortSession().catch(() => {})
   await runtime?.closeAndWait()

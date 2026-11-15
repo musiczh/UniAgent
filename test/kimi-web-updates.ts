@@ -2,19 +2,25 @@ import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createRequire } from 'node:module'
+import { createRequire, syncBuiltinESMExports } from 'node:module'
 import { probeKimiWeb } from '../src/main/kimiWebContract.ts'
 import { KimiWebServer } from '../src/main/kimiWebServer.ts'
 import { KimiWebError } from '../src/main/kimiWebTransport.ts'
 
 const require = createRequire(import.meta.url)
 const root = await mkdtemp(join(tmpdir(), 'uniagent-kimi-update-probe-'))
+const startServer = KimiWebServer.start
+let startupFailure: unknown
+KimiWebServer.start = async function (options) {
+  try { return await startServer.call(this, options) }
+  catch (error) { startupFailure = error; throw error }
+}
 try {
   for (const [name, options, expected, reason] of [
     ['compatible new version', { version: '2.3.0' }, 'ready'],
     ['compatible future major', { version: '3.0.0' }, 'ready'],
     ['configuration needed', { version: '2.3.0', auth: false }, 'needs-config'],
-    ['invalid version', { version: 'not-a-version' }, 'incompatible', 'version_unsupported'],
+    ['unrecognized software version', { version: 'not-a-version' }, 'ready'],
     ['missing API', { version: '2.3.0', missingApi: true }, 'incompatible', 'official_api_unsupported'],
     ['invalid events spec', { version: '2.3.0', invalidEvents: true }, 'incompatible', 'official_events_unsupported'],
     ['changed WS protocol', { version: '2.3.0', protocol: 3 }, 'incompatible', 'protocol_version'],
@@ -47,8 +53,10 @@ const wss = new WebSocketServer({server});
 wss.on('connection', socket => socket.send(JSON.stringify({type:'server_hello',payload:{protocol_version:options.protocol ?? 2}})));
 server.listen(0,'127.0.0.1',() => console.log('Kimi server: http://127.0.0.1:' + server.address().port + '/'));
 `, { mode: 0o700 })
+    startupFailure = undefined
     const result = await probeKimiWeb(bin, home, { HOME: home, KIMI_CODE_HOME: home })
-    assert.equal(result.status, expected, name + ': ' + result.reason)
+    const cause = startupFailure instanceof Error ? (startupFailure as Error & { cause?: unknown }).cause : undefined
+    assert.equal(result.status, expected, name + ': ' + result.reason + (cause ? '; ' + String(cause) : ''))
     if (expected === 'ready') {
       assert.deepEqual(result.contract?.models.map(model => model.id), ['alphabetically-first', 'local'], name + ': only concrete models are exposed')
       assert.equal(result.contract?.currentModelId, 'local', name + ': the native default is read from configuration instead of catalog order')
@@ -58,6 +66,23 @@ server.listen(0,'127.0.0.1',() => console.log('Kimi server: http://127.0.0.1:' +
   }
   const home = join(root, 'compatible new version')
   const bin = join(home, 'kimi')
+  const childProcess = require('node:child_process') as typeof import('node:child_process')
+  const execFile = childProcess.execFile
+  const inspectionFailure = new Error('fixture process inspection unavailable')
+  let injected = false
+  childProcess.execFile = function (file: string, ...args: any[]) {
+    if (file !== '/bin/ps' || !args[0]?.includes('-p') || injected) return Reflect.apply(execFile, childProcess, [file, ...args])
+    injected = true
+    const callback = args.pop()
+    return Reflect.apply(execFile, childProcess, [file, ...args, (_error: unknown, stdout: string, stderr: string) => callback(inspectionFailure, stdout, stderr)])
+  } as typeof execFile
+  syncBuiltinESMExports()
+  try {
+    await assert.rejects(KimiWebServer.start({ bin, cwd: home, env: { HOME: home, KIMI_CODE_HOME: home } }),
+      (error: unknown) => error instanceof KimiWebError && error.kind === 'server_source_unverified' && (error as KimiWebError & { cause?: unknown }).cause === inspectionFailure,
+      'startup identity checks reject an unavailable inspection and preserve its exact cause')
+    assert.equal(injected, true)
+  } finally { childProcess.execFile = execFile; syncBuiltinESMExports() }
   const close = KimiWebServer.prototype.closeAndWait
   KimiWebServer.prototype.closeAndWait = async function () {
     await close.call(this)
@@ -68,5 +93,5 @@ server.listen(0,'127.0.0.1',() => console.log('Kimi server: http://127.0.0.1:' +
   } finally { KimiWebServer.prototype.closeAndWait = close }
   assert.equal((await probeKimiWeb(bin, home, { HOME: home, KIMI_CODE_HOME: home })).status, 'ready',
     'a failed cleanup lease must not poison later probes for the same executable and home')
-} finally { await rm(root, { recursive: true, force: true }) }
+} finally { KimiWebServer.start = startServer; await rm(root, { recursive: true, force: true }) }
 console.log('Kimi update protocol gate: actual versions, authentication, API and WebSocket compatibility passed')

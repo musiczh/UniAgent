@@ -19,7 +19,7 @@ export function run(command, args, { cwd = root, capture = false } = {}) {
   const result = spawnSync(command, args, {
     cwd, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
     stdio: capture ? ['ignore', 'pipe', 'pipe'] : 'inherit',
-    env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_TRACE: '0', GIT_CURL_VERBOSE: '0' }
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_TRACE: '0', GIT_CURL_VERBOSE: undefined, GIT_TRACE_CURL: undefined }
   })
   if (result.error || result.status !== 0) throw new Error(`${command} ${args[0] || ''} failed (${result.status ?? result.error?.code})${capture ? ': ' + (result.stderr || '').slice(-1000) : ''}`)
   return result.stdout?.trim() || ''
@@ -36,7 +36,7 @@ async function payloadDigest(prepared) {
 }
 
 export function validateCompatibility(report, fingerprint, internal = true, now = Date.now()) {
-  const expected = ['codex', 'claude', 'grok', 'kimi', 'deepseek', 'mcode', 'zcode', ...(internal ? ['nika', 'traex'] : [])]
+  const expected = ['codex', 'claude', 'grok', 'kimi', 'deepseek', 'mcode', 'zcode', 'qoder', ...(internal ? ['nika', 'traex'] : [])]
   if (report?.sourceFingerprint !== fingerprint || !Number.isFinite(Date.parse(report.checkedAt)) ||
       now - Date.parse(report.checkedAt) > 24 * 60 * 60 * 1000 || Date.parse(report.checkedAt) > now + 60_000) throw new Error('Missing or stale Agent compatibility report for this source')
   for (const id of expected) {
@@ -45,6 +45,44 @@ export function validateCompatibility(report, fingerprint, internal = true, now 
         !/^https:\/\//.test(agent.latestSource || '') || !/^https:\/\//.test(agent.protocolSource || '') ||
         !Array.isArray(agent.checks) || !agent.checks.length || agent.checks.some(check => check.exitCode !== 0 || !check.command)) throw new Error(`Agent compatibility is incomplete: ${id}`)
   }
+}
+
+export function validateCompatibilityBaseline(report, baselines) {
+  for (const [id, versions] of Object.entries(baselines)) {
+    if (!Array.isArray(versions) || !versions.length || report.agents?.find(agent => agent.id === id)?.afterVersion !== versions.at(-1)) {
+      throw new Error(`Agent compatibility baseline is out of date: ${id}; run --sync-compatibility, commit and revalidate the final source`)
+    }
+  }
+}
+
+export async function promoteCompatibility(report, fingerprint, baselinePath, { internal = true, now = Date.now() } = {}) {
+  validateCompatibility(report, fingerprint, internal, now)
+  const baselines = await json(baselinePath), next = structuredClone(baselines)
+  const changed = []
+  for (const [id, versions] of Object.entries(baselines)) {
+    const version = report.agents.find(agent => agent.id === id)?.afterVersion
+    if (!Array.isArray(versions) || !versions.length || !versions.every(value => typeof value === 'string') ||
+        typeof version !== 'string' || !/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(version)) throw new Error(`Invalid tested Agent version: ${id}`)
+    if (versions.at(-1) !== version) {
+      next[id] = [...versions.filter(value => value !== version), version]
+      changed.push(id)
+    }
+  }
+  if (changed.length) await save(baselinePath, next)
+  return changed
+}
+
+export async function syncCompatibility(version) {
+  if (git(['status', '--porcelain', '--untracked-files=no'], { capture: true })) throw new Error('Commit source changes before syncing compatibility baselines')
+  const directory = await stateDirectory(version), temporary = await mkdtemp(join(directory, 'compatibility-source-'))
+  try {
+    const exported = await exportPublic({ destination: temporary, version })
+    const internal = (await readFile(join(root, 'src/shared/distribution.ts'), 'utf8')).includes('INTERNAL_DISTRIBUTION = true')
+    const changed = await promoteCompatibility(await json(join(directory, 'compatibility.json')), exported.fingerprint,
+      join(root, 'src/shared/agentCompatibility.json'), { internal })
+    console.log(JSON.stringify({ changed, next: changed.length ? 'Commit the baselines, then revalidate and rebuild the final source before release.' : 'Baselines already match the tested report.' }))
+    return changed
+  } finally { await rm(temporary, { recursive: true, force: true }) }
 }
 
 export async function verifyDmg(source, manifest, command = run) {
@@ -135,7 +173,9 @@ export async function checkReview(version, { ref = 'HEAD' } = {}) {
   })
   if (currentWebsite.sha256 !== prepared.webSha256) throw new Error('Website changed after maintainer review')
   const internal = read('src/shared/distribution.ts').toString().includes('INTERNAL_DISTRIBUTION = true')
-  validateCompatibility(await json(join(directory, 'compatibility.json')), prepared.fingerprint, internal)
+  const compatibility = await json(join(directory, 'compatibility.json'))
+  validateCompatibility(compatibility, prepared.fingerprint, internal)
+  validateCompatibilityBaseline(compatibility, JSON.parse(read('src/shared/agentCompatibility.json')))
   return prepared
 }
 
@@ -256,20 +296,27 @@ export async function verifyPublishedSite(prepared, request = fetch, wait = mill
   throw new Error('GitHub Pages has not served the reviewed website and matching update manifest; retry the same release')
 }
 
+export function findGithubRelease(tag, command = run) {
+  try { return JSON.parse(command('gh', ['api', `repos/${repository}/releases/tags/${tag}`], { capture: true })) }
+  catch (error) { if (!error.message.includes('404')) throw error }
+  // The tag endpoint returns published releases; authenticated listing includes drafts.
+  const pages = JSON.parse(command('gh', ['api', '--paginate', '--slurp', `repos/${repository}/releases?per_page=100`], { capture: true }))
+  return pages.flat().find(release => release.tag_name === tag)
+}
+
 export async function publishPublic(version, options = {}) {
   const prepared = await checkReview(version)
   const directory = await stateDirectory(version)
   await verifyDmg(prepared.source, prepared.manifest)
   const commit = await syncSource(prepared, directory, options)
   const tag = 'v' + version
-  let release
-  try { release = JSON.parse(run('gh', ['api', `repos/${repository}/releases/tags/${tag}`], { capture: true })) }
-  catch (error) { if (!error.message.includes('404')) throw error }
+  let release = findGithubRelease(tag)
   if (!release) {
     const notes = join(directory, 'release-notes.md')
-    await writeFile(notes, `${PUBLIC_APP_NAME} ${version}\n\n支持七种公开 Agent，包含会话、工具能力、飞书助手、评论、定时任务和本机用量。\n\n官网：${PUBLIC_SITE}\n\nSHA-256：${prepared.manifest.sha256}\n`)
+    await writeFile(notes, `${PUBLIC_APP_NAME} ${version}\n\n支持八种公开 Agent，包含会话、工具能力、飞书助手、评论、定时任务和本机用量。\n\n官网：${PUBLIC_SITE}\n\nSHA-256：${prepared.manifest.sha256}\n`)
     run('gh', ['release', 'create', tag, '--repo', repository, '--verify-tag', '--draft', '--title', `${PUBLIC_APP_NAME} v${version}`, '--notes-file', notes])
-    release = JSON.parse(run('gh', ['api', `repos/${repository}/releases/tags/${tag}`], { capture: true }))
+    release = findGithubRelease(tag)
+    if (!release) throw new Error('Created GitHub release is not visible yet; retry the same release')
   }
   const assets = [join(prepared.source, 'release', artifactName(version)), join(directory, 'SHA256SUMS'), join(prepared.site, 'latest.json')]
   for (const path of assets) {
@@ -296,18 +343,19 @@ export async function publishPublic(version, options = {}) {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const { values } = parseArgs({ options: {
-    prepare: { type: 'boolean' }, build: { type: 'boolean' }, publish: { type: 'boolean' }, 'check-review': { type: 'boolean' },
+    prepare: { type: 'boolean' }, build: { type: 'boolean' }, publish: { type: 'boolean' }, 'check-review': { type: 'boolean' }, 'sync-compatibility': { type: 'boolean' },
     'approve-web': { type: 'string' }, 'working-tree': { type: 'boolean' }, version: { type: 'string' },
     'source-ref': { type: 'string' }, 'replace-history': { type: 'boolean' }, backup: { type: 'string' }
   } })
   const version = values.version || (await json(join(root, 'package.json'))).version
   if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) throw new Error('Invalid release version')
   if (values.prepare) await preparePublic({ version, ref: values['source-ref'] || 'HEAD', workingTree: values['working-tree'], build: values.build })
+  else if (values['sync-compatibility']) await syncCompatibility(version)
   else if (values['approve-web']) {
     const directory = await stateDirectory(version), prepared = await json(join(directory, 'prepared.json'))
     if (values['approve-web'] !== prepared.webSha256) throw new Error('Approval must match the reviewed complete HTML')
     await save(join(directory, 'web-approval.json'), { version, webSha256: prepared.webSha256, approvedAt: new Date().toISOString() })
   } else if (values['check-review']) await checkReview(version)
   else if (values.publish) await publishPublic(version, { replaceHistory: values['replace-history'], backup: values.backup })
-  else throw new Error('Choose --prepare, --check-review, --approve-web SHA256, or --publish')
+  else throw new Error('Choose --prepare, --sync-compatibility, --check-review, --approve-web SHA256, or --publish')
 }

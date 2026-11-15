@@ -61,7 +61,7 @@ export interface ReviewJob {
 }
 export const ASSISTANT_IPC = {
   detail: 'assistant:detail', save: 'assistant:save', workspace: 'assistant:workspace', versions: 'assistant:versions', rollback: 'assistant:rollback',
-  command: 'assistant:command', changed: 'assistant:changed',
+  command: 'assistant:command', openAppConversation: 'assistant:openAppConversation', changed: 'assistant:changed',
   feishu: 'assistant:feishu', bindFeishu: 'assistant:bindFeishu', installFeishu: 'assistant:installFeishu', cancelFeishuInstall: 'assistant:cancelFeishuInstall', feishuChanged: 'assistant:feishuChanged', manageChanged: 'assistant:manageChanged',
   privateSessions: 'assistant:privateSessions', privateSessionsChanged: 'assistant:privateSessionsChanged'
 } as const

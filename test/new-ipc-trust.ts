@@ -9,6 +9,7 @@ test('new privileged IPC handlers reuse the main-frame trust guard', async () =>
   for (const channel of [
     'getNativeCapabilities', 'createNativeActionSession', 'runNativeAction',
     'compactSession',
+    'getSessionInfo', 'revealSessionInfoFile',
     'fsListDir', 'fsReadFile', 'fsReveal', 'fsOpenHtml', 'listAutomations', 'setAutomationStatus',
     'saveClipboardImage', 'copyImageToClipboard',
     'getAutomationDetail', 'updateAutomation', 'deleteAutomation',

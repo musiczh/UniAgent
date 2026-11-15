@@ -24,7 +24,7 @@ export class DeepSeekHostEvents {
 
   static for(client: DeepSeekHostClient): DeepSeekHostEvents {
     let hub = hubs.get(client)
-    if (!hub) { hub = new DeepSeekHostEvents(client); hubs.set(client, hub) }
+    if (!hub || hub.failure) { hub = new DeepSeekHostEvents(client); hubs.set(client, hub) }
     return hub
   }
   private constructor(private readonly client: DeepSeekHostClient) {

@@ -11,7 +11,7 @@ const home = mkdtempSync(join(tmpdir(), 'team-requirement-context-'))
 try {
   const store = new RequirementStore(home)
   const requirement = await store.create({ name: '团队需求' })
-  const read = () => store.context(requirement.id, 'leader', { action: 'bootstrap' })
+  const read = () => store.context(requirement.id, 'leader', { action: 'bootstrap' }, { background: true })
   const event: UAEvent = { sessionId: 'leader', seq: 1, ts: 1, type: 'user_message', payload: { text: '完整团队消息：用户目标', displayText: '处理团队消息' } }
   const events: UAEvent[] = [event]
   store.configureContext({ events: async () => events, requirementId: () => requirement.id, isTeam: id => id === 'leader' })

@@ -10,7 +10,8 @@ const result = await renderEventStream([], 'idle', 'agent-list-status-ui', {
       lifecycle: { availability: 'available', auth: 'authenticated', health: 'healthy', updateStatus: 'current', checkedAt: 1, ...lifecycle } });
     const agents = Object.keys(names).map(id => agent(id, id === 'kimi'
       ? { availability: 'unhealthy', health: 'unhealthy', detectionStatus: 'failed', detectionError: '连接失败' }
-      : id === 'offline' ? { availability: 'not-installed' } : id === 'codex' ? { updateStatus: 'available' } : {}));
+      : id === 'offline' ? { availability: 'not-installed' } : id === 'codex' ? { updateStatus: 'available' }
+      : id === 'mcode' ? { availability: 'needs-auth', auth: 'required' } : {}));
     window.opened = []; window.nikaOpened = 0; window.quotaQueries = [];
     window.zcodeService = 'zai-coding'; window.toggleCalls = [];
     const settings = { enabledAgentIds: Object.keys(names), sidebarShortcuts: [], autoCheckUpdate: false };
@@ -52,6 +53,7 @@ const result = await renderEventStream([], 'idle', 'agent-list-status-ui', {
         tone:meter.parentElement.classList.contains('danger') ? 'danger' : meter.parentElement.classList.contains('warn') ? 'warn' : 'ok' };
     });
     result.deepseekHint = row('DeepSeek Harness').querySelector('.settings-agent-console').title;
+    result.mcodeRow = row('MiniMax Code').textContent;
     result.balanceHasNoBar = !row('DeepSeek Harness').querySelector('[role="progressbar"]');
     result.noConsole = ['Nika','TraeX'].map(name => ({name, button:!!row(name).querySelector('.settings-agent-console'),text:row(name).querySelector('.settings-agent-quota').textContent}));
     result.pathHidden = ![...document.querySelectorAll('.settings-agent-row')].some(item => item.innerText.includes('/fixture/bin/'));
@@ -106,6 +108,7 @@ assert.match(result.meters[0].title, /周限额.*剩余 68%.*显示上次结果/
 assert.match(result.deepseekHint, /余额 ¥12.34/, '余额放入控制台悬停说明')
 assert.equal(result.balanceHasNoBar, true, '只有余额时不编造百分比')
 assert.ok(result.kimiRow.includes('检测失败'), '检测失败保留状态与重试入口')
+assert.ok(result.mcodeRow.includes('待登录'), '明确缺少认证的 Agent 显示待登录')
 assert.equal(result.pathHidden, true, '列表不再展示本机目录')
 assert.deepEqual(result.quotaQueries.sort(), ['claude','codex','critical','deepseek','full','grok','traex','warn','zcode'], '控制台回退不能阻止原生查询；未安装、异常和不支持查询的 Agent 不查询')
 for (const layout of result.layouts) {

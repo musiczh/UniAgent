@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type MutableRefObject } from 'react'
 import type { AgentDef, PermissionMode } from '@shared/types'
 import { ASSISTANT_DOCUMENTS, ASSISTANT_LIMITS, type AssistantDetail, type AssistantDocument, type AssistantDocumentType, type AssistantInput, type DocumentRevision } from '@shared/assistant'
 import { SetGroup, SetRow, SetSelect } from './SettingsPrimitives'
-import { resolveAgentModel, resolveAgentPermission } from '@shared/agentChoices'
+import { resolveAgentModel, resolveAgentPermission, withLastAgentChoices } from '@shared/agentChoices'
 import { useAgentPreferences } from '../hooks'
 import { ToggleSwitch, UiIcon } from './Icons'
 import './assistant.css'
@@ -43,7 +43,7 @@ export function AssistantSettings({ agents, navigationGuard }: { agents: AgentDe
   const patch = (values: Partial<AssistantInput>) => setConfig(current => ({ ...current!, ...values }))
   const changeDefault = (defaultAgentId: string, defaultModel?: string) => {
     const agent = agents.find(a => a.id === defaultAgentId)
-    const model = resolveAgentModel(agent, defaultModel, prefs?.lastByAgent[defaultAgentId]?.defaultModel)
+    const model = resolveAgentModel(agent, defaultModel, withLastAgentChoices(prefs?.lastByAgent[defaultAgentId]).defaultModel)
     const defaultPermissionMode = resolveAgentPermission(agent, config.defaultPermissionMode, 'ask')
     patch({ defaultAgentId, defaultModel: model?.id, defaultPermissionMode })
   }
@@ -53,7 +53,7 @@ export function AssistantSettings({ agents, navigationGuard }: { agents: AgentDe
       const agent = agents.find(a => a.id === config.defaultAgentId)
       const reviewAgent = agents.find(a => a.id === config.reviewRuntime?.agentId)
       const resolved = { ...config,
-        defaultModel: resolveAgentModel(agent, config.defaultModel, prefs?.lastByAgent[config.defaultAgentId]?.defaultModel)?.id,
+        defaultModel: resolveAgentModel(agent, config.defaultModel, withLastAgentChoices(prefs?.lastByAgent[config.defaultAgentId]).defaultModel)?.id,
         defaultPermissionMode: resolveAgentPermission(agent, config.defaultPermissionMode, 'ask'),
         ...(config.reviewRuntime ? { reviewRuntime: { ...config.reviewRuntime, model: resolveAgentModel(reviewAgent, config.reviewRuntime.model)?.id } } : {}) }
       load(await window.uniagent.savePersonalAssistant(resolved, detail.documents.filter(d => d.content !== drafts[d.type]).map(d => ({ type: d.type, content: drafts[d.type], expectedRevision: d.revision }))))
@@ -65,7 +65,7 @@ export function AssistantSettings({ agents, navigationGuard }: { agents: AgentDe
   const selectors = (agentId: string, model: string | undefined, onChange: (agentId: string, model?: string) => void, review = false) => {
     const pool = review ? agents : agents.filter(a => a.capabilities.startupSystemPrompt)
     const agent = agents.find(a => a.id === agentId)
-    const selectedModel = resolveAgentModel(agent, model, review ? undefined : prefs?.lastByAgent[agentId]?.defaultModel)
+    const selectedModel = resolveAgentModel(agent, model, review ? undefined : withLastAgentChoices(prefs?.lastByAgent[agentId]).defaultModel)
     return <div className={'assistant-selectors' + (review ? '' : ' assistant-default-selectors')}><SetSelect value={agentId} ariaLabel={review ? '复盘 Agent' : '默认 Agent'} disabled={busy} onChange={id => onChange(id)}>
       {!pool.some(a => a.id === agentId) && <option value={agentId}>{agentId} · 不可用</option>}
       {pool.map(a => <option key={a.id} value={a.id} disabled={review && !['codex','claude'].includes(a.adapter)}>{a.name}{review && !['codex','claude'].includes(a.adapter) ? ' · 暂不支持工具限制' : ''}</option>)}

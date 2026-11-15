@@ -67,6 +67,19 @@ try {
   assert.deepEqual(metas(multiEpisode), ['1 秒 · 已结束', '第 6 位 · 已等待 6 秒'],
     '每段排队独立成节点：已结束节点保留段内时长，活跃节点单独计时')
 
+  const goalContinuation = render([
+    event(1, 1_000, 'goal_message', { text: '梳理服务端链路' }),
+    queueEvent(2, 2_000, 'queue-native-1', { state: 'waiting', startedAt: 2_000, waitedMs: 0, turnId: 'native-1' }),
+    queueEvent(3, 3_000, 'queue-native-1', { state: 'ready', waitedMs: 1_000, acquired: true, turnId: 'native-1' }),
+    event(4, 4_000, 'agent_message', { id: 'final-answer', phase: 'final_answer', text: '服务端链路已整理完成。' }),
+    queueEvent(5, 5_000, 'queue-native-2', { state: 'waiting', startedAt: 5_000, waitedMs: 0, position: 215, turnId: 'native-2' }),
+    queueEvent(6, 6_000, 'queue-native-2', { state: 'waiting', startedAt: 5_000, waitedMs: 0, position: 201, turnId: 'native-2' }),
+  ])
+  assert.deepEqual(metas(goalContinuation), ['1 秒 · 已结束', '第 202 位 · 已等待 5 秒'],
+    'Goal 续轮排队保留上一轮已结束节点，并展示本轮真实等待')
+  assert.ok(goalContinuation.lastIndexOf('process-queue') > goalContinuation.indexOf('服务端链路已整理完成。'),
+    '最终回复之后的原生续轮排队必须显示在回复下方')
+
   // 场景3 — 单段排队（无追加消息）节点仍留在原位并展示已结束时长。
   const singleEpisode = render([
     event(1, 1_000, 'user_message', { text: '开工' }),

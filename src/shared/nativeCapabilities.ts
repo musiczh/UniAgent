@@ -95,6 +95,9 @@ export interface GoalState {
   createdAt: number
   updatedAt: number
   continuation?: 'native'
+  creditsBudget?: number
+  creditsUsed?: number
+  tokensAvailable?: boolean
   autonomous?: boolean
   nativeActivation?: 'armed' | 'disarmed'
   roundLimit?: { maxRounds: number | null; roundsStarted: number }

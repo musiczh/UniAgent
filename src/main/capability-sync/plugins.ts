@@ -20,6 +20,7 @@ export interface PluginListEntry {
   marketplace: string
   version?: string
   enabled?: boolean
+  remote?: boolean
   scope?: 'user'
   sourcePath?: string
   repository?: string
@@ -90,7 +91,8 @@ export function parseCodexPluginList(text: string): PluginListEntry[] {
     if (value.installed === false || (value.name != null && value.name !== id.name) ||
         (value.marketplaceName != null && value.marketplaceName !== id.marketplace)) throw new Error('plugin_enumeration_failed')
     const source = sourceMetadata(value.source)
-    return { ...id, version: safeText(value.version) ? value.version : undefined, enabled: value.enabled !== false, ...source }
+    return { ...id, version: safeText(value.version) ? value.version : undefined, enabled: value.enabled !== false,
+      remote: record(value.source) && value.source.source === 'remote', ...source }
   }))
 }
 
@@ -239,7 +241,7 @@ async function componentCounts(root: string, manifest: Record<string, unknown>):
 }
 
 async function installedEntries(agentId: PluginAgentId, home: string, runner: PluginCommandRunner): Promise<PluginListEntry[]> {
-  const command = agentId === 'codex' ? ['codex', ['plugin', 'list', '--available', '--json']] as const
+  const command = agentId === 'codex' ? ['codex', ['plugin', 'list', '--json']] as const
     : agentId === 'traex' ? ['traecli', ['plugin', 'list']] as const
       : ['claude', ['plugin', 'list', '--available', '--json']] as const
   const { stdout } = await runner(command[0], [...command[1]], { home })
@@ -279,7 +281,7 @@ export async function discoverInstalledPlugins(
     output.push({ ...entry, displayName, version, repository, agentId, installedDir, manifestPath: manifestValue?.path,
       status: manifestValue ? 'available' : 'invalid', issueCode: manifestValue ? undefined : 'plugin_manifest_invalid',
       cachedVersions: versions.length, components,
-      fingerprint: hash([agentId, entry.pluginId, displayName || '', version || '', repository || '', components]) })
+      fingerprint: hash([agentId, entry.pluginId, displayName || '', version || '', repository || '', entry.enabled, components]) })
   }
   return output
 }

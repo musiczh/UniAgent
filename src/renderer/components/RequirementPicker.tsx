@@ -1,22 +1,35 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { Requirement } from '@shared/requirementTypes'
 import { useRequirements } from '../useRequirements'
 import { UiIcon } from './Icons'
+import type { Project } from '@shared/types'
 import { usePickerMenuPlacement } from './usePickerMenuPlacement'
 
-export function RequirementEditor({ requirement, onClose, onSaved }: {
-  requirement?: Requirement; onClose: () => void; onSaved: (r: Requirement) => void
+export function RequirementEditor({ requirement, initialProjectId, onClose, onSaved }: {
+  requirement?: Requirement; initialProjectId?: string; onClose: () => void; onSaved: (r: Requirement) => void
 }): JSX.Element {
   const [name, setName] = useState(requirement?.name || '')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [projects, setProjects] = useState<Project[]>([])
+  const [projectId, setProjectId] = useState(requirement?.projectId || initialProjectId || '')
+  useEffect(() => {
+    let live = true
+    void window.uniagent.listProjects().then(rows => {
+      if (!live) return
+      setProjects(rows)
+      setProjectId(current => current || rows.find(project => project.isDefault)?.id || rows[0]?.id || '')
+    }).catch(e => { if (live) setError(e instanceof Error ? e.message : String(e)) })
+    return () => { live = false }
+  }, [])
   const saving = useRef(false)
   async function save(): Promise<void> {
-    if (saving.current || !name.trim()) return
+    if (saving.current || !name.trim() || !projects.some(project => project.id === projectId)) return
     saving.current = true; setBusy(true); setError('')
     try {
-      const r = requirement ? await window.uniagent.updateRequirement(requirement.id, { name }) : await window.uniagent.createRequirement({ name })
+      const patch = { ...(name.trim() !== requirement?.name ? { name } : {}), projectId }
+      const r = requirement ? await window.uniagent.updateRequirement(requirement.id, patch) : await window.uniagent.createRequirement({ name, projectId })
       onSaved(r)
     } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
     finally { saving.current = false; setBusy(false) }
@@ -24,11 +37,12 @@ export function RequirementEditor({ requirement, onClose, onSaved }: {
   return createPortal(<div className="modal-overlay project-editor-overlay" role="dialog" aria-modal="true" aria-label={requirement ? '编辑需求' : '新建需求'}>
     <form className="project-editor" onSubmit={e => { e.preventDefault(); void save() }}>
       <div className="project-editor-head"><h2>{requirement ? '编辑需求' : '新建需求'}</h2><button type="button" disabled={busy} onClick={onClose} aria-label="关闭"><UiIcon name="close" size={18} /></button></div>
-      <label className="project-editor-field"><span>需求名称</span><span className="project-editor-input"><UiIcon name="file" size={16} /><input autoFocus maxLength={70} value={name} onChange={e => setName(e.target.value)} disabled={busy} placeholder="例如：需求空间功能" /></span></label>
-      <p className="requirement-hint">需求独立于空间，目录按需求命名。创建后自动生成 context.md，后续会话共享其中的背景、进展与产出。</p>
+      <label className="project-editor-field"><span>需求名称</span><span className="project-editor-input"><UiIcon name="file" size={16} /><input autoFocus maxLength={70} value={name} onChange={e => setName(e.target.value)} disabled={busy} placeholder="例如：需求项目功能" /></span></label>
+      <label className="project-editor-field"><span>主项目</span><select aria-label="需求主项目" value={projectId} disabled={busy} onChange={e => setProjectId(e.target.value)}><option value="" disabled>选择项目</option>{projectId && !projects.some(project => project.id === projectId) && <option value={projectId} disabled>原项目不可用，请重新选择</option>}{projects.map(project => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
+      <p className="requirement-hint">新任务使用需求的主项目；换绑不会移动已有会话，它们可以继续在不同项目执行。需求目录与共享上下文保持独立。</p>
       {requirement && <p className="requirement-hint">改名将同步重命名需求目录；有运行中会话时暂不可改名。</p>}
       {error && <p role="alert" className="requirement-error">{error}</p>}
-      <div className="project-editor-actions"><button type="button" disabled={busy} onClick={onClose}>取消</button><button className="is-primary" disabled={busy || !name.trim()}>{busy ? '保存中…' : requirement ? '保存' : '创建需求'}</button></div>
+      <div className="project-editor-actions"><button type="button" disabled={busy} onClick={onClose}>取消</button><button className="is-primary" disabled={busy || !name.trim() || !projects.some(project => project.id === projectId)}>{busy ? '保存中…' : requirement ? '保存' : '创建需求'}</button></div>
     </form>
   </div>, document.body)
 }

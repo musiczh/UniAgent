@@ -67,7 +67,7 @@ async function startManagedHost(activating = false): Promise<DeepSeekHostClient>
 export async function readDeepSeekConnection(): Promise<DeepSeekConnectionSnapshot> {
   await migrateDeepSeekConnection()
   const snapshot = deepseekSnapshot()
-  if (snapshot.installed && snapshot.version === DEEPSEEK_VERIFIED_VERSION && !installFlight && accountService) {
+  if (snapshot.installed && !installFlight && accountService) {
     // A broken Host must not hide the settings used to repair its installation.
     await accountService.refresh().catch(() => undefined)
   }
@@ -136,7 +136,7 @@ function installedRuntimeVersion(runtime: string): string {
   if (!existsSync(join(runtime, 'node_modules', '.bin', process.platform === 'win32' ? 'dsh.cmd' : 'dsh'))) return ''
   try {
     const manifest = JSON.parse(readFileSync(join(runtime, 'node_modules', DEEPSEEK_PACKAGE, 'package.json'), 'utf8'))
-    return typeof manifest?.version === 'string' && parseSemver(manifest.version) ? manifest.version : ''
+    return typeof manifest?.version === 'string' ? manifest.version.trim() : ''
   } catch { return '' }
 }
 function stored(): { baseUrl?: string; encryptedKey?: string; verifiedConnection?: string } {
@@ -328,9 +328,6 @@ export function installDeepSeek(version = DEEPSEEK_VERIFIED_VERSION): Promise<De
       await execFileP(nodeBin ? join(nodeBin, 'npm') : process.platform === 'win32' ? 'npm.cmd' : 'npm', ['install', '--prefix', staging, '--no-audit', '--no-fund', '--registry=https://registry.npmjs.org', `${DEEPSEEK_PACKAGE}@${version}`], { timeout:300_000, maxBuffer:2 * 1024 * 1024, signal, env })
       signal.throwIfAborted()
       setInstallPhase('verifying')
-      const resolved = installedRuntimeVersion(staging) || (parseSemver(version) ? version : '')
-      if (!resolved) throw new Error('无法确认已安装的 DeepSeek Harness 版本')
-      if (resolved !== DEEPSEEK_VERIFIED_VERSION) throw new Error(`DeepSeek ${resolved} 尚未通过 Host 接入验证（已验证版本 ${DEEPSEEK_VERIFIED_VERSION}），保留当前版本`)
       const directory = `installed-${randomUUID()}`
       const target = join(root, directory)
       const bin = join(staging, 'node_modules', '.bin', process.platform === 'win32' ? 'dsh.cmd' : 'dsh')
@@ -377,15 +374,10 @@ export function installDeepSeek(version = DEEPSEEK_VERIFIED_VERSION): Promise<De
   }).finally(() => { installFlight = undefined; installAbort = undefined; onboardingChanged() })
   return installFlight
 }
-/**
- * In-app update entry used by the agent lifecycle service. Only the qualified
- * release is installable: a registry "newer" pre-release has not passed the Host
- * contract gate, so it is refused instead of replacing a working runtime.
- */
+/** Updates still validate the candidate Host before replacing the active selection. */
 export async function updateDeepSeekRuntime(version?: string): Promise<{ code: number; stdout: string; stderr: string }> {
   try {
-    if (version && version !== DEEPSEEK_VERIFIED_VERSION) throw new Error(`DeepSeek ${version} 尚未通过 Host 接入验证（已验证版本 ${DEEPSEEK_VERIFIED_VERSION}），保留当前版本`)
-    await installDeepSeek(DEEPSEEK_VERIFIED_VERSION)
+    await installDeepSeek(version || 'latest')
     return { code: 0, stdout: '', stderr: '' }
   } catch (error) {
     return { code: 1, stdout: '', stderr: error instanceof Error ? error.message : String(error) }
@@ -404,7 +396,6 @@ export async function detectDeepSeek(agent: AgentDef): Promise<AgentDef> {
   if (!existsSync(bin)) return { ...agent, bin, installed: false }
   const version = installedRuntimeVersion(runtime)
   try {
-    if (version !== DEEPSEEK_VERIFIED_VERSION) throw new Error(`当前 DeepSeek Host 版本未通过兼容性验证，请在设置中安装已验证版本 ${DEEPSEEK_VERIFIED_VERSION}`)
     const snapshot = await readDeepSeekConnection()
     const authenticated = snapshot.hasKey || snapshot.account?.signedIn
     const client = await getDeepSeekHost()
@@ -419,7 +410,7 @@ export async function detectDeepSeek(agent: AgentDef): Promise<AgentDef> {
     return { ...agent, bin, installed: true, incompatible: false, version, authenticationRequired: !authenticated,
       unavailableReason: authenticated ? undefined : '请在设置 → Agent → DeepSeek Harness 填写 API Key 或通过浏览器登录',
       models: availableModels, defaultModel: accountModels[0]?.id || currentModelId,
-      capabilities: { ...agent.capabilities, ...capabilities, protocol: 'web', modelSelect: availableModels.length > 0, reasoningEffort: availableModels.some(model => model.efforts.length > 0) } }
+      capabilities: { ...agent.capabilities, ...capabilities, protocol: 'web', auxiliarySystemPrompt: true, modelSelect: availableModels.length > 0, reasoningEffort: availableModels.some(model => model.efforts.length > 0) } }
   } catch (error) {
     return { ...agent, bin, installed: true, version, incompatible: true, authenticationRequired: false, models: [], unavailableReason: error instanceof Error ? error.message : String(error) }
   }

@@ -10,7 +10,7 @@ import { detectZCodeEngine, zcodeRuntimeArgs } from './runtime'
 import { ZCodeConnection, ZCodeRpcError } from './connection'
 
 export const ZCODE_REPOSITORY = 'https://github.com/zai-org/ZCode.git'
-export const ZCODE_VERIFIED_REVISION = '3c5b227649371507ddc4eb46ac5133afe6db1cab'
+export const ZCODE_VERIFIED_REVISION = 'fec975905a2abd4c07e35c40d51fa097a2258ec9'
 export const ZCODE_BUNDLE_PATH = 'apps/zcode-cli/packages/cli/dist/zcode.cjs'
 export type ZCodeInstallProgress = (phase: ZCodeInstallationSnapshot['phase'], message: string) => void
 

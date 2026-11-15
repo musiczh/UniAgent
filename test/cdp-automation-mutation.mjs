@@ -325,7 +325,7 @@ try {
     "return { loading: !!document.querySelector('.automations-panel .panel-loading.auto-loading'), falseEmpty: empty.includes('未发现定时任务') };"
   )
   assert.deepEqual(automationReentry, { loading: true, falseEmpty: false })
-  await waitFor(evaluate, 'return [...document.querySelectorAll(\'.auto-item-clickable\')].some((row) => row.textContent?.includes(' + JSON.stringify(FIXTURE_NAME) + '))', 'local fixture row')
+  await waitFor(evaluate, 'return [...document.querySelectorAll(\'.auto-task-row\')].some((row) => row.textContent?.includes(' + JSON.stringify(FIXTURE_NAME) + '))', 'local fixture row')
 
   // #11: cached content stays visible while refreshing, and the slower prior
   // agent response cannot cross-write the currently selected agent.
@@ -357,7 +357,7 @@ try {
 
   await clickByText(evaluate, '.sidebar-nav-item', '定时任务')
   const opened = await evaluate(
-    'const row = [...document.querySelectorAll(\'.auto-item-clickable\')]' +
+    'const row = [...document.querySelectorAll(\'.auto-task-row\')]' +
     '.find((candidate) => candidate.textContent?.includes(' + JSON.stringify(FIXTURE_NAME) + '));' +
     'row?.click(); return Boolean(row);'
   )
@@ -382,20 +382,20 @@ try {
   const detailLayout = await evaluate(`
     const editor = document.querySelector('.auto-config')?.getBoundingClientRect();
     const savebar = document.querySelector('.auto-config-savebar')?.getBoundingClientRect();
-    const label = document.querySelector('.auto-config-section .auto-config-label')?.getBoundingClientRect();
+    const label = document.querySelector('.auto-main-form .auto-card-head')?.getBoundingClientRect();
     const name = document.querySelector('.auto-name-input')?.getBoundingClientRect();
     const prompt = document.querySelector('.auto-prompt-input');
     const style = prompt ? getComputedStyle(prompt) : null;
     const lineHeight = style ? parseFloat(style.lineHeight) : 0;
     const chrome = style ? parseFloat(style.paddingTop) + parseFloat(style.paddingBottom) + parseFloat(style.borderTopWidth) + parseFloat(style.borderBottomWidth) : 0;
     return {
-      groupedLayout: !!label && !!name && name.left > label.right,
+      groupedLayout: !!label && !!name && name.top >= label.bottom && !!document.querySelector('.auto-plan-preview'),
       fixedSavebar: !!editor && !!savebar && Math.abs(editor.bottom - savebar.bottom) < 0.51,
       tenLineMax: !!style && Math.abs(parseFloat(style.maxHeight) - (lineHeight * 10 + chrome)) < 0.51,
       overflowY: style?.overflowY,
       resize: style?.resize,
       hasDetailLoadingRule: [...document.styleSheets].some((sheet) => {
-        try { return [...sheet.cssRules].some((rule) => rule.selectorText === '.auto-detail-loading'); } catch { return false; }
+        try { return [...sheet.cssRules].some((rule) => rule.selectorText?.split(',').some((selector) => selector.trim() === '.auto-detail-loading')); } catch { return false; }
       }),
       hasLegacyDetailLoadingText: [...document.querySelectorAll('.subagent-empty')].some((node) => node.textContent?.includes('加载详情中'))
     };
@@ -411,6 +411,7 @@ try {
   })
 
   await setControl(evaluate, '.auto-name-input', UPDATED_NAME)
+  await clickByText(evaluate, '.auto-prompt-switch button', '编辑')
   await setControl(evaluate, '.auto-prompt-input', UPDATED_PROMPT)
   await setControl(evaluate, '.sched-time-picker', '14:35')
   await setControl(evaluate, 'select[aria-label="推理强度"]', 'high')
@@ -433,14 +434,14 @@ try {
   await access(siblingPath)
 
   await evaluate("document.querySelector('.auto-back')?.click(); return true;")
-  await waitFor(evaluate, 'return [...document.querySelectorAll(\'.auto-item-clickable\')].some((row) => row.textContent?.includes(' + JSON.stringify(UPDATED_NAME) + '))', 'updated row in list')
+  await waitFor(evaluate, 'return [...document.querySelectorAll(\'.auto-task-row\')].some((row) => row.textContent?.includes(' + JSON.stringify(UPDATED_NAME) + '))', 'updated row in list')
   await evaluate("window.__automationReloadMarker = 'persisted'")
   await cdp.send('Page.reload', { ignoreCache: false })
   await waitFor(evaluate, "return window.__automationReloadMarker !== 'persisted' && typeof window.uniagent?.e2eEnabled === 'function' && await window.uniagent.e2eEnabled()", 'reloaded preload surface')
   await clickByText(evaluate, '.sidebar-nav-item', '定时任务')
-  await waitFor(evaluate, 'return [...document.querySelectorAll(\'.auto-item-clickable\')].some((row) => row.textContent?.includes(' + JSON.stringify(UPDATED_NAME) + '))', 'persisted row after renderer reload')
+  await waitFor(evaluate, 'return [...document.querySelectorAll(\'.auto-task-row\')].some((row) => row.textContent?.includes(' + JSON.stringify(UPDATED_NAME) + '))', 'persisted row after renderer reload')
   await evaluate(
-    'const row = [...document.querySelectorAll(\'.auto-item-clickable\')]' +
+    'const row = [...document.querySelectorAll(\'.auto-task-row\')]' +
     '.find((candidate) => candidate.textContent?.includes(' + JSON.stringify(UPDATED_NAME) + '));' +
     'row?.click(); return Boolean(row);'
   )
@@ -465,7 +466,7 @@ try {
   await waitFor(evaluate, "return Boolean(document.querySelector('.auto-confirm'))", 'second delete confirmation')
   await evaluate("document.querySelector('.auto-del-confirm')?.click(); return true;")
   await waitFor(evaluate,
-    'return !document.querySelector(\'.auto-inline-editor\') && ![...document.querySelectorAll(\'.auto-item-clickable\')].some((row) => row.textContent?.includes(' + JSON.stringify(UPDATED_NAME) + '))',
+    'return !document.querySelector(\'.auto-inline-editor\') && ![...document.querySelectorAll(\'.auto-task-row\')].some((row) => row.textContent?.includes(' + JSON.stringify(UPDATED_NAME) + '))',
     'deleted task absent from list')
   await assert.rejects(access(automationDir), { code: 'ENOENT' })
 
@@ -475,7 +476,7 @@ try {
   await clickByText(evaluate, '.sidebar-nav-item', '定时任务')
   assert.equal(await waitFor(evaluate,
     'const panel = document.querySelector(\'.automations-panel\');' +
-    'const rows = [...(panel?.querySelectorAll(\'.auto-item-clickable\') || [])];' +
+    'const rows = [...(panel?.querySelectorAll(\'.auto-task-row\') || [])];' +
     'return rows.some((row) => row.textContent?.includes(\'E2E 每日日报\')) && !rows.some((row) => row.textContent?.includes(' + JSON.stringify(UPDATED_NAME) + '));',
     'deleted task absent after renderer reload'), true)
   assert.equal(await readFile(siblingPath, 'utf8').catch((error) => error.code), 'ENOENT')

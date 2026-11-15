@@ -44,6 +44,13 @@ try {
   // 需求 — the bound话题群 (notifyChatId/Name) survives sanitize on read and on a
   // shallow patch; clearing it (empty string) drops the binding → private-chat fallback.
   const store = writeSettings(directory)
+  assert.equal(store.get().feishu?.autoRouteNewConversations, false, 'existing configurations retain the selection card')
+  store.set({ feishu: { autoRouteNewConversations: true, defaultAgentId: 'codex', defaultModel: 'gpt', defaultEffort: 'high' } })
+  assert.equal(new AppSettingsStore(directory).get().feishu?.autoRouteNewConversations, true)
+  assert.equal(store.set({ feishu: { idleThresholdSec: 600 } }).feishu?.autoRouteNewConversations, true, 'unrelated patches preserve routing')
+  assert.equal(store.get().feishu?.defaultModel, 'gpt')
+  assert.equal(store.get().feishu?.defaultEffort, 'high')
+  assert.equal(store.set({ feishu: { autoRouteNewConversations: false } }).feishu?.autoRouteNewConversations, false)
   const bound = store.set({ feishu: { notifyChatId: 'oc_abc', notifyChatName: '发布通知群' } })
   assert.equal(bound.feishu?.notifyChatId, 'oc_abc', 'notifyChatId persists through a patch')
   assert.equal(bound.feishu?.notifyChatName, '发布通知群', 'notifyChatName persists through a patch')

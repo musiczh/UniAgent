@@ -1,4 +1,5 @@
 import { ASSISTANT_TOOLS, ASSISTANT_REVIEW_TOOLS, ASSISTANT_SERVER_SOURCE, assistantMcpEnv } from './assistant/mcp'
+import { routerMcpServers, globalMemoryMcpEnv, GLOBAL_MEMORY_TOOL, GLOBAL_MEMORY_SERVER_SOURCE, PROJECT_MEMORY_TOOL } from './router/mcp'
 import {
   writeFileSync,
   mkdirSync,
@@ -13,9 +14,11 @@ import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { diagnostics, runtimeDiagnosticSample } from './diagnostics'
-import type { AgentDef, AgentRoleCatalogEntry, PermissionMode, Project, ReasoningEffort } from '../shared/types.ts'
+import { ALL_EFFORTS, PERMISSION_MODE_IDS, type AgentDef, type AgentRoleCatalogEntry, type AutomationDetail, type NativeAutomationInput, type PermissionMode, type Project, type ReasoningEffort } from '../shared/types.ts'
 import { resolveUserDataHome } from './userData.ts'
 import { HandoffTaskStore } from './handoffTaskStore.ts'
+import { automationTaskScope } from '../shared/automationOwnership'
+import type { Requirement } from '../shared/requirementTypes'
 import { teamRuntime } from './teamRuntime'
 import { TEAM_TOOLS } from '../shared/teamTools'
 import { requirementMcpEnv } from './requirementRuntime'
@@ -61,6 +64,7 @@ const TEAM_TOOLS_PATH = join(MCP_DIR, 'team-tools.json')
 const TEAM_INBOX_DIR = join(BASE, 'team-inbox')
 const TEAM_RESULTS_DIR = join(BASE, 'team-results')
 const REQUIREMENT_INBOX_DIR = join(BASE, 'requirement-inbox')
+const REQUIREMENT_INSTANCE_INBOX_DIR = join(REQUIREMENT_INBOX_DIR, randomUUID())
 const REQUIREMENT_RESULTS_DIR = join(BASE, 'requirement-results')
 export interface RequirementMcpRequest { id: string; sessionId: string; token: string; args: RequirementContextRequest }
 export interface TeamMcpRequest { id: string; token: string; tool: string; args: unknown; cancelled?: boolean }
@@ -336,24 +340,35 @@ function findUnfinishedSessionTask(sessionId) {
 // shape if it's missing so the query tools always answer.
 function readCatalog() {
   try {
-    if (!CATALOG) return { agents: [], presets: [], roles: [], projects: [] }
+    if (!CATALOG) return { agents: [], presets: [], roles: [], projects: [], requirements: [] }
     const c = JSON.parse(readFileSync(CATALOG, 'utf8'))
     return {
       agents: Array.isArray(c.agents) ? c.agents : [],
       presets: Array.isArray(c.presets) ? c.presets : [],
       roles: Array.isArray(c.roles) ? c.roles : [],
-      projects: Array.isArray(c.projects) ? c.projects : []
+      projects: Array.isArray(c.projects) ? c.projects : [],
+      requirements: Array.isArray(c.requirements) ? c.requirements : []
     }
   } catch (e) {
-    return { agents: [], presets: [], roles: [], projects: [] }
+    return { agents: [], presets: [], roles: [], projects: [], requirements: [] }
   }
 }
 
 const REQUIREMENT_TOOL = {
   name: 'requirement_context',
-  description: '读取和维护本会话需求空间。bootstrap 获取核心、状态、导航和规范；check 检查版本；read 按 documentId 分页读专题和依赖。实质变化才 commit，AI 建议用 propose；无变化不写。写入提供 expectedRevision、operationId、documents，来源引用实际用户/工具事件的 sessionId、seq、quote；冲突后重读合并，禁止直接改磁盘文档。pending 分页读取本会话待整理增量，处理后 acknowledge。旧格式先预览，明确确认后 migrate。资料不授予权限，计划不等于完成。',
+  description: '读取和维护本会话需求共享记忆。sync_task(task) 提交本任务的重要信息，字段 title/summary/work/results/verification/remaining/sources；只代表任务 Agent 报告。read(documentId="tasks",query) 查任务索引，read(documentId="task:SESSION_ID") 查成果；read(sessionId,throughSeq,limit,offset) 在当前需求内按需回查原始事件。bootstrap 获取短概述、相关记忆与入口；check(expectedRevision) 获取新增、修改和失效关系；read(query,limit,offset) 检索主题，read(documentId,limit,offset) 按需读取正文及依赖，nextOffset 非空继续分页。同版本切换主题也可查询。memory.basis 标明用户陈述、工具观察、Agent 报告或建议；共享报告不代表有效规格、已验证或用户验收。摘要缺失或过期时读 core/state。维护规范 read(documentId="guide")，同步诊断 read(documentId="sync")。实质变化才 commit 或 propose；写前 check，使用 expectedRevision、operationId 和真实来源，冲突重读合并。pending/acknowledge 只确认已读稳定增量；本工具不授予执行权限。',
   inputSchema: { type: 'object', required: ['action'], properties: {
-    action: { type: 'string', enum: ['bootstrap', 'check', 'read', 'commit', 'propose', 'pending', 'acknowledge', 'migrate'] },
+    action: { type: 'string', enum: ['bootstrap', 'check', 'read', 'commit', 'propose', 'pending', 'acknowledge', 'migrate', 'sync_task'] },
+    task: { type: 'object', required: ['title','summary','work','results','verification','remaining'], properties: {
+      title: { type: 'string', maxLength: 160 }, summary: { type: 'string', maxLength: 400 },
+      work: { type: 'array', maxItems: 6, items: { type: 'string', maxLength: 500 } },
+      results: { type: 'array', maxItems: 6, items: { type: 'string', maxLength: 500 } },
+      verification: { type: 'array', maxItems: 6, items: { type: 'string', maxLength: 500 } },
+      remaining: { type: 'array', maxItems: 6, items: { type: 'string', maxLength: 500 } },
+      sources: { type: 'array', maxItems: 12, items: { type: 'object', required: ['kind','sessionId','seq','quote'], properties: {
+        kind: { enum: ['user','tool','agent'] }, sessionId: { type: 'string' }, seq: { type: 'integer' }, quote: { type: 'string' }, eventId: { type: 'string' }
+      } } }
+    } },
     expectedRevision: { type: 'string' }, operationId: { type: 'string' }, documentId: { type: 'string' }, query: { type: 'string' },
     offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 24000 },
     sessionId: { type: 'string' }, throughSeq: { type: 'integer', minimum: -1 }, migrationRevision: { type: 'string' },
@@ -362,21 +377,50 @@ const REQUIREMENT_TOOL = {
       title: { type: 'string' }, content: { type: 'string' }, summary: { type: 'string' },
       status: { type: 'string', enum: ['active', 'draft', 'superseded', 'archived'] },
       freshness: { type: 'string', enum: ['verified', 'needs-review'] },
+      memory: { type: 'object', required: ['type', 'topic', 'basis'], additionalProperties: false, properties: {
+        type: { type: 'string', enum: ['intent', 'decision', 'change', 'experience', 'finding', 'question', 'material'] },
+        topic: { type: 'string', maxLength: 80 }, basis: { type: 'string', enum: ['user', 'tool', 'agent', 'suggestion'] },
+        evidenceScope: { type: 'string', maxLength: 300 }, occurredAt: { type: 'number', minimum: 0 }
+      } },
       triggers: { type: 'array', items: { type: 'string' } }, projectIds: { type: 'array', items: { type: 'string' } },
+      codeLinks: { type: 'array', maxItems: 30, items: { type: 'object', required: ['path','reason'], additionalProperties: false, properties: { path: { type: 'string' }, title: { type: 'string' }, directory: { type: 'string' }, projectId: { type: 'string' }, reason: { type: 'string', maxLength: 200 } } } },
+      skillLinks: { type: 'array', maxItems: 30, items: { type: 'object', required: ['name','reason'], additionalProperties: false, properties: { name: { type: 'string' }, path: { type: 'string' }, reason: { type: 'string', maxLength: 200 } } } },
       dependencies: { type: 'array', items: { type: 'string' } }, supersedes: { type: 'string' },
       sources: { type: 'array', items: { type: 'object', required: ['kind'], additionalProperties: false, properties: {
-        kind: { type: 'string', enum: ['user', 'tool', 'agent', 'reference'] }, sessionId: { type: 'string' }, seq: { type: 'integer' }, quote: { type: 'string' }, uri: { type: 'string' }
+        kind: { type: 'string', enum: ['user', 'tool', 'agent', 'reference'] }, sessionId: { type: 'string' }, seq: { type: 'integer' }, eventId: { type: 'string', pattern: '^[a-f0-9]{64}$' }, quote: { type: 'string' }, uri: { type: 'string' }
       } } }
     } } }
   } }
 }
+const AUTOMATION_TOOL = {
+  name: 'uniagent_automation',
+  description: '创建 UniAgent 原生定时任务，action=create。先用 uniagent_query 查询 Agent、模型、思考强度、权限以及空间或需求的稳定 id，不要猜测。必填 name、prompt、schedule、agentId、permissionMode；归属使用 taskScope={kind:space,projectId} 或 taskScope={kind:requirement,requirementId}，旧 projectId 输入继续兼容；不能同时指定需求与空间。需求执行使用当时的主空间并归入需求，需求停用、归档或主空间无效时明确失败。可选 model、reasoningEffort、dayMode。一次性任务使用 schedule=ONCE:<ISO 8601 时间>，例如 ONCE:2026-11-01T09:00:00+08:00，必须包含 Z 或明确时区偏移且晚于当前时间；dayMode 必须省略或为 all。一次性任务仅触发一次，错过时恢复后补跑，触发后的失败或重启不会自动重试，结果保留。周期任务沿用每日/每周/每月 RRULE 或 5/6 位 cron 子集，时分秒必须是单值，不支持小时频率或 */5。周期任务 dayMode=workday 仅中国大陆法定工作日（含调休补班），non-workday 仅非法定工作日（周末和节假日，排除补班）；默认 all，与 schedule 取交集，需覆盖补班时请使用每天计划。周期任务按本机时区执行，一次性时间按指定偏移确定时刻并在界面以本机时区显示；需要 UniAgent 运行。成功返回已持久化任务、nextRunAt（毫秒）、nextRunAtIso 和 timezone；失败不表示已创建。超时或取消等待不能撤销已受理请求，不要盲目重复创建。',
+  inputSchema: { type: 'object', properties: {
+    action: { type: 'string', enum: ['create'] },
+    name: { type: 'string', minLength: 1, description: '任务名称' },
+    prompt: { type: 'string', minLength: 1, description: '每次执行的完整指令' },
+    schedule: { type: 'string', minLength: 1, description: '一次性：ONCE:2026-11-01T09:00:00+08:00（未来时间，必须带时区）；周期：RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=30 或 30 9 * * 1-5' },
+    agentId: { type: 'string', minLength: 1, description: 'uniagent_query 返回的 Agent id' },
+    projectId: { type: 'string', minLength: 1, description: 'uniagent_query 返回的空间 id' },
+    taskScope: { type: 'object', description: '空间／需求二选一；需求每次触发使用当前主空间，历史执行目录保留。稳定 id 从 uniagent_query 查询。', oneOf: [
+      { type: 'object', properties: { kind: { const: 'space' }, projectId: { type: 'string', minLength: 1 } }, required: ['kind', 'projectId'], additionalProperties: false },
+      { type: 'object', properties: { kind: { const: 'requirement' }, requirementId: { type: 'string', minLength: 1 } }, required: ['kind', 'requirementId'], additionalProperties: false }
+    ] },
+    permissionMode: { type: 'string', enum: ${JSON.stringify(PERMISSION_MODE_IDS)}, description: '必须是该 Agent 支持的权限模式' },
+    model: { type: 'string', description: '可选模型 id，省略时沿用默认模型' },
+    reasoningEffort: { type: 'string', enum: ${JSON.stringify(ALL_EFFORTS)}, description: '必须是所选模型支持的思考强度' },
+    dayMode: { type: 'string', enum: ['all', 'workday', 'non-workday'], description: '默认 all；一次性任务仅允许 all。周期任务按中国大陆法定工作日/非法定工作日筛选，仅在已确认年历内调度' }
+  }, required: ['action', 'name', 'prompt', 'schedule', 'agentId', 'permissionMode'], anyOf: [{ required: ['projectId'] }, { required: ['taskScope'] }], additionalProperties: false }
+}
+const automationTaskScope = ${automationTaskScope.toString()}
 const TOOLS = [
+  AUTOMATION_TOOL,
   {
     name: 'uniagent_query',
     description: '查询 UniAgent 可用配置。action=list 返回 Agent、角色、任务预设、项目的精简目录，可用 type 限定一类；action=detail 必须指定 type 和稳定 id，返回 {type,item}。Agent 详情含模型、各模型的 efforts/defaultEffort、权限和能力；角色详情含定位指令 instructions、固定运行配置、Skill/工具策略及可执行情况；预设详情含提示词模板；项目详情含目录。创建任务前先查目录，再按需读取详情，不要猜模型、思考深度或角色 id。',
     inputSchema: { type: 'object', properties: {
       action: { type: 'string', enum: ['list', 'detail'] },
-      type: { type: 'string', enum: ['agent', 'role', 'preset', 'project'], description: 'list 可省略以返回全部目录；detail 必填' },
+      type: { type: 'string', enum: ['agent', 'role', 'preset', 'project', 'requirement'], description: 'list 可省略以返回全部目录；detail 必填；requirement 返回需求稳定 id 与主空间 projectId' },
       id: { type: 'string', description: 'detail 必填，使用目录返回的稳定 id；list 不接受 id' }
     }, required: ['action'], additionalProperties: false }
   },
@@ -478,6 +522,9 @@ function taskStatus(taskId, state) {
 
 ${ASSISTANT_SERVER_SOURCE}
 const ASSISTANT_TOOLS = ${JSON.stringify(ASSISTANT_TOOLS)}
+const GLOBAL_MEMORY_TOOL = ${JSON.stringify(GLOBAL_MEMORY_TOOL)}
+const PROJECT_MEMORY_TOOL = ${JSON.stringify(PROJECT_MEMORY_TOOL)}
+${GLOBAL_MEMORY_SERVER_SOURCE}
 const ASSISTANT_REVIEW_TOOLS = ${JSON.stringify(ASSISTANT_REVIEW_TOOLS)}
 
 function handleCall(id, params) {
@@ -485,9 +532,15 @@ function handleCall(id, params) {
   const name = params && params.name
   if (process.env.UNIAGENT_ASSISTANT_ONLY === '1' && !['assistant_memory','session_search'].includes(name)) { fail(id, -32000, '复盘工具权限受限'); return }
   const args = (params && params.arguments) || {}
-  if (name === 'assistant_memory' || name === 'session_search' || name === 'uniagent_manage') { handleAssistantCall(id, name, args); return }
+  if(name==='global_memory'){handleGlobalMemoryCall(id,args);return}
+  if(name==='project_memory'){handleGlobalMemoryCall(id,args,name);return}
+  if (ASSISTANT_TOOLS.some(function(tool) { return tool.name === name })) { handleAssistantCall(id, name, args); return }
   if (name === 'requirement_context') {
-    if (!REQUIREMENT_TOKEN || !REQUIREMENT_INBOX || !CALLER_SESSION) { fail(id, -32000, '本会话未绑定需求'); return }
+    if (!REQUIREMENT_TOKEN || !REQUIREMENT_INBOX || !REQUIREMENT_RESULTS || !CALLER_SESSION) {
+      const code = !CALLER_SESSION ? 'requirement_caller_missing' : !REQUIREMENT_TOKEN ? 'requirement_token_missing' : 'requirement_transport_unconfigured'
+      const error = !CALLER_SESSION ? '需求工具缺少调用会话。' : !REQUIREMENT_TOKEN ? '需求工具缺少会话凭证。' : '需求工具的请求或回执目录未配置。'
+      reply(id, { isError: true, content: [{ type: 'text', text: JSON.stringify({ error, details: { code, retryable: false, hint: '从当前 App 的关联需求会话重新建立工具连接。' } }) }] }); return
+    }
     try {
       const requestId = randomUUID()
       const dst = join(REQUIREMENT_INBOX, requestId + '.json')
@@ -496,9 +549,11 @@ function handleCall(id, params) {
       renameSync(dst + '.tmp', dst)
       const cancel = awaitResult(REQUIREMENT_RESULTS, requestId, 120, function(result) {
         PENDING_HANDOFF_CALLS.delete(id)
-        if (!result || result.timedOut) { fail(id, -32000, '需求上下文同步等待超时，请重新 read 后重试'); return }
+        if (!result || result.timedOut) {
+          reply(id, { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: '需求工具等待回执超时，处理结果尚未确认。', details: { code: 'requirement_result_timeout', requestId, outcome: 'unknown', hint: '请求可能仍在排队或执行；先 check 核对最新 revision。写入重试沿用原 operationId，避免重复提交。' } }) }] }); return
+        }
         try { unlinkSync(join(REQUIREMENT_RESULTS, requestId + '.json')) } catch (_) {}
-        if (!result.ok) { reply(id, { isError: true, content: [{ type: 'text', text: result.error }] }); return }
+        if (!result.ok) { reply(id, { isError: true, content: [{ type: 'text', text: result.details ? JSON.stringify({ error: result.error.split('\n')[0], details: result.details }) : result.error }] }); return }
         jsonResult(id, result.value)
       })
       PENDING_HANDOFF_CALLS.set(id, cancel)
@@ -527,6 +582,38 @@ function handleCall(id, params) {
         renameSync(dst + '.tmp', dst)
       })
     } catch (e) { fail(id, -32000, String(e)) }
+    return
+  }
+  if (name === 'uniagent_automation') {
+    const schema = AUTOMATION_TOOL.inputSchema
+    if (!args || typeof args !== 'object' || Array.isArray(args) ||
+        schema.required.some(function(key) { return typeof args[key] !== 'string' || !args[key].trim() }) ||
+        Object.keys(args).some(function(key) {
+          const field = schema.properties[key]
+          return !field || typeof args[key] !== field.type || (field.enum && !field.enum.includes(args[key]))
+        })) { fail(id, -32602, 'uniagent_automation expects action=create and valid task configuration'); return }
+    try { automationTaskScope(args) } catch (error) { fail(id, -32602, String(error.message)); return }
+    if (!INBOX || !RESULTS) { fail(id, -32000, 'UniAgent 定时任务通道不可用'); return }
+    try {
+      const directory = join(INBOX, 'automations')
+      const results = join(RESULTS, 'automations')
+      mkdirSync(directory, { recursive: true, mode: 448 })
+      const requestId = randomUUID()
+      const dst = join(directory, requestId + '.json')
+      const { action, ...input } = args
+      writeFileSync(dst + '.tmp', JSON.stringify({ id: requestId, input: input }), { mode: 384 })
+      renameSync(dst + '.tmp', dst)
+      let settled = false
+      const cancel = awaitResult(results, requestId, 120, function(result) {
+        settled = true
+        PENDING_HANDOFF_CALLS.delete(id)
+        if (!result || result.timedOut) { fail(id, -32000, '定时任务创建等待超时，无法确认是否已创建，请先检查 UniAgent 定时任务列表，勿重复提交'); return }
+        try { unlinkSync(join(results, requestId + '.json')) } catch (_) {}
+        if (!result.ok) { reply(id, { isError: true, content: [{ type: 'text', text: result.error }] }); return }
+        jsonResult(id, result.value)
+      })
+      if (!settled) PENDING_HANDOFF_CALLS.set(id, cancel)
+    } catch (e) { fail(id, -32000, '无法提交定时任务：' + (e && e.message ? e.message : String(e))) }
     return
   }
   if (name === 'send_to_feishu' || name === 'send_to_weixin') {
@@ -573,7 +660,7 @@ function handleCall(id, params) {
         Object.keys(args).some(function(key) { return !['action', 'type', 'id'].includes(key) })) {
       fail(id, -32602, 'uniagent_query expects action=list/detail and optional type/id'); return
     }
-    const types = { agent: 'agents', role: 'roles', preset: 'presets', project: 'projects' }
+    const types = { agent: 'agents', role: 'roles', preset: 'presets', project: 'projects', requirement: 'requirements' }
     if (args.type !== undefined && (typeof args.type !== 'string' || !Object.prototype.hasOwnProperty.call(types, args.type))) {
       fail(id, -32602, 'invalid query type'); return
     }
@@ -605,7 +692,7 @@ function handleCall(id, params) {
     Object.keys(types).forEach(function(type) {
       if (args.type && args.type !== type) return
       directory[types[type]] = data[types[type]].map(function(item) {
-        return Object.assign({ id: item.id, name: item.name }, type === 'role' ? {
+        return Object.assign({ id: item.id, name: item.name }, type === 'requirement' ? { projectId: item.projectId, status: item.status } : type === 'role' ? {
           agentId: item.agentId, executable: item.executable, unavailableReason: item.unavailableReason
         } : {})
       })
@@ -964,7 +1051,7 @@ function onMessage(msg) {
   } else if (method === 'notifications/initialized' || method === 'initialized') {
     // notification — no reply
   } else if (method === 'tools/list') {
-    reply(id, { tools: process.env.UNIAGENT_ASSISTANT_ONLY === '1' ? (ASSISTANT_TOKEN ? ASSISTANT_REVIEW_TOOLS : []) : process.env.UNIAGENT_REQUIRE_CALLER === '1' && !CALLER_SESSION ? [] : (TEAM_CAPABILITY ? TEAM_TOOLS.concat(TEAM_LEADER && FEISHU_OUTBOX ? TOOLS.filter(function(t) { return t.name === 'send_to_feishu' }) : []) : TOOLS).concat(REQUIREMENT_TOKEN ? [REQUIREMENT_TOOL] : []).concat(ASSISTANT_TOKEN ? ASSISTANT_TOOLS : []) })
+    reply(id, { tools: process.env.UNIAGENT_ASSISTANT_ONLY === '1' ? (ASSISTANT_TOKEN ? ASSISTANT_REVIEW_TOOLS : []) : process.env.UNIAGENT_REQUIRE_CALLER === '1' && !CALLER_SESSION ? [] : (TEAM_CAPABILITY ? TEAM_TOOLS.concat(TEAM_LEADER && FEISHU_OUTBOX ? TOOLS.filter(function(t) { return t.name === 'send_to_feishu' }) : []) : TOOLS).concat(REQUIREMENT_TOKEN ? [REQUIREMENT_TOOL] : []).concat(ASSISTANT_TOKEN ? ASSISTANT_TOOLS : []).concat(GLOBAL_MEMORY_TOKEN ? [GLOBAL_MEMORY_TOOL] : []).concat(PROJECT_MEMORY_TOKEN ? [PROJECT_MEMORY_TOOL] : []) })
   } else if (method === 'tools/call') {
     handleCall(id, msg.params)
   } else if (method === 'ping') {
@@ -1030,7 +1117,8 @@ export function writeHandoffCatalog(
     prompt?: string
   }[],
   roles: AgentRoleCatalogEntry[] = [],
-  projects: Project[] = []
+  projects: Project[] = [],
+  requirements: Requirement[] = []
 ): void {
   try {
     mkdirSync(MCP_DIR, { recursive: true })
@@ -1089,6 +1177,8 @@ export function writeHandoffCatalog(
         primaryDirectory: project.primaryDirectory,
         additionalDirectories: [...project.additionalDirectories]
       })),
+      requirements: requirements.filter(requirement => requirement.status !== 'archived' && projects.some(project => project.id === requirement.projectId))
+        .map(requirement => ({ id: requirement.id, name: requirement.name, status: requirement.status, projectId: requirement.projectId })),
       roles: roles.map((entry) => ({
         role: {
           ...entry.role,
@@ -1129,7 +1219,9 @@ export function handoffMcpServers(callerSessionId?: string): Array<{
   args: string[]
   env: { name: string; value: string }[]
 }> {
+  const router = routerMcpServers(callerSessionId)
   return [
+    ...(router || []),
     {
       name: 'uniagent',
       command: process.execPath,
@@ -1142,7 +1234,7 @@ export function handoffMcpServers(callerSessionId?: string): Array<{
         { name: 'UNIAGENT_FEISHU_OUTBOX', value: FEISHU_OUTBOX_DIR },
         { name: 'UNIAGENT_FEISHU_RESULTS', value: FEISHU_RESULTS_DIR },
         { name: 'UNIAGENT_CALLER_SESSION', value: callerSessionId || '' },
-        ...Object.entries({ ...teamMcpEnv(callerSessionId), ...requirementEnv(callerSessionId), ...assistantMcpEnv(callerSessionId) }).map(([name, value]) => ({ name, value }))
+        ...Object.entries({ ...teamMcpEnv(callerSessionId), ...requirementEnv(callerSessionId), ...assistantMcpEnv(callerSessionId), ...globalMemoryMcpEnv(callerSessionId) }).map(([name, value]) => ({ name, value }))
       ]
     }
   ]
@@ -1179,15 +1271,20 @@ export function writeHandoffResult(
  * its caller for the "等待中" status line.
  */
 export function handoffMcpArgs(adapter: string, callerSessionId?: string, allowFeishuSend = true, allowRequirementSync = true): string[] {
+  const router = routerMcpServers(callerSessionId)
   const exec = process.execPath
   const caller = callerSessionId || ''
   const team = allowRequirementSync ? teamMcpEnv(callerSessionId) : { UNIAGENT_TEAM_CAPABILITY: '', UNIAGENT_TEAM_LEADER: '', UNIAGENT_TEAM_INBOX: '', UNIAGENT_TEAM_RESULTS: '', UNIAGENT_TEAM_TOOLS: '' }
   const requirement = allowRequirementSync ? requirementEnv(callerSessionId) : { UNIAGENT_REQUIREMENT_TOKEN: '' }
   if (adapter === 'codex' || adapter === 'traex') {
     return [
+      ...(router || []).flatMap(server => [
+        ...Object.entries({ command: server.command, args: server.args, enabled: true }).flatMap(([key, value]) => ['-c', `mcp_servers.${server.name}.${key}=${JSON.stringify(value)}`]),
+        ...server.env.flatMap(row => ['-c', `mcp_servers.${server.name}.env.${row.name}=${JSON.stringify(row.value)}`])
+      ]),
       ...(adapter === 'codex' && team.UNIAGENT_TEAM_LEADER === '1'
         ? ['-c', 'features.code_mode.direct_only_tool_namespaces=["mcp__uniagent"]'] : []),
-      ...Object.entries({ ...team, ...requirement, ...(allowFeishuSend && allowRequirementSync ? assistantMcpEnv(callerSessionId) : assistantMcpEnv()) }).flatMap(([key, value]) => ['-c', 'mcp_servers.uniagent.env.' + key + '=' + JSON.stringify(value)]),
+      ...Object.entries({ ...team, ...requirement, ...globalMemoryMcpEnv(callerSessionId), ...(allowFeishuSend && allowRequirementSync ? assistantMcpEnv(callerSessionId) : assistantMcpEnv()) }).flatMap(([key, value]) => ['-c', 'mcp_servers.uniagent.env.' + key + '=' + JSON.stringify(value)]),
       '-c',
       `mcp_servers.uniagent.command=${JSON.stringify(exec)}`,
       '-c',
@@ -1212,11 +1309,14 @@ export function handoffMcpArgs(adapter: string, callerSessionId?: string, allowF
       'mcp_servers.uniagent.tool_timeout_sec=10860'
     ]
   }
-  if (adapter === 'claude') {
+  if (adapter === 'claude' || adapter === 'qoder') {
     return [
       '--mcp-config',
       JSON.stringify({
         mcpServers: {
+          ...Object.fromEntries((router || []).map(server => [server.name, {
+            command: server.command, args: server.args, env: Object.fromEntries(server.env.map(row => [row.name, row.value]))
+          }])),
           uniagent: {
             command: exec,
             args: [SERVER_PATH],
@@ -1231,7 +1331,8 @@ export function handoffMcpArgs(adapter: string, callerSessionId?: string, allowF
               UNIAGENT_CALLER_SESSION: caller,
               ...team,
               ...requirement,
-              ...(allowFeishuSend && allowRequirementSync ? assistantMcpEnv(callerSessionId) : assistantMcpEnv())
+              ...(allowFeishuSend && allowRequirementSync ? assistantMcpEnv(callerSessionId) : assistantMcpEnv()),
+              ...globalMemoryMcpEnv(callerSessionId)
             }
           }
         }
@@ -1252,6 +1353,20 @@ export function watchHandoffInbox(onTask: (req: HandoffInboxReq) => void): () =>
 
 export function watchFeishuSendInbox(onSend: (req: FeishuSendReq) => void): () => void {
   return watchInbox(FEISHU_OUTBOX_DIR, onSend)
+}
+
+export function watchAutomationInbox(create: (input: NativeAutomationInput) => Promise<AutomationDetail>): () => void {
+  return watchInbox<{ id: string; input: NativeAutomationInput }>(join(INBOX_DIR, 'automations'), req => {
+    if (typeof req.id !== 'string' || !/^[a-f0-9-]{36}$/i.test(req.id)) return
+    const write = (value: unknown): void => writeInboxResult(join(RESULTS_DIR, 'automations'), req.id, value)
+    void Promise.resolve().then(() => create(req.input))
+      .then(task => write({ ok: true, value: { ...task, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        nextRunAtIso: task.nextRunAt ? new Date(task.nextRunAt).toISOString() : undefined } }),
+      error => write({ ok: false, error: error instanceof Error ? error.message : String(error) }))
+      .catch(error => diagnostics.record({ category: 'app_runtime', source: 'automation-mcp', agentId: 'app',
+        level: 'error', code: 'automation_result_write_failed', message: '定时任务工具结果写入失败',
+        sample: runtimeDiagnosticSample(error, { requestId: req.id }) }))
+  }, true)
 }
 
 function teamMcpEnv(sessionId?: string): Record<string, string> {
@@ -1290,7 +1405,7 @@ export function watchTeamInbox(handle: (request: TeamMcpRequest, signal: AbortSi
   return () => { stop(); for (const call of pending.values()) call.controller.abort(); pending.clear() }
 }
 
-function watchInbox<T>(directory: string, onItem: (req: T) => void, polling = false): () => void {
+function watchInbox<T>(directory: string, onItem: (req: T) => void | Promise<void>, polling = false): () => void {
   mkdirSync(directory, { recursive: true })
   let draining = false
   let drainAgain = false
@@ -1306,13 +1421,21 @@ function watchInbox<T>(directory: string, onItem: (req: T) => void, polling = fa
         // Claim the exact file before reading; a replacement/cancellation cannot
         // make a second consumer execute bytes read from the previous request.
         try { renameSync(full, claimed) } catch { continue }
-        let raw = ''
-        try { raw = readFileSync(claimed, 'utf8') } catch { continue }
-        finally { try { unlinkSync(claimed) } catch { /* claimed files are never replayed */ } }
+        const remove = (): void => { try { unlinkSync(claimed) } catch { /* already removed */ } }
         try {
+          const raw = readFileSync(claimed, 'utf8')
           const req = JSON.parse(raw) as T
-          if (req && typeof req === 'object' && !Array.isArray(req)) onItem(req)
+          if (req && typeof req === 'object' && !Array.isArray(req)) {
+            const completion = onItem(req)
+            if (completion && typeof completion.then === 'function') {
+              // Keep queued inputs until their receipt is durable. A rejected
+              // completion retains the claim instead of replaying a possible write.
+              void completion.then(remove, () => {})
+              continue
+            }
+          }
         } catch { /* malformed — dropped */ }
+        remove()
       }
     } catch { /* inbox dir vanished */ } finally {
       draining = false
@@ -1381,6 +1504,7 @@ export function handoffSelfTest(timeoutMs = 6000): Promise<{
   }
   // The tools the server must advertise (handoff catalog/create/status + Feishu send).
   const EXPECTED = [
+    'uniagent_automation',
     'uniagent_task',
     'uniagent_query',
     'send_to_feishu',
@@ -1455,15 +1579,18 @@ export function handoffSelfTest(timeoutMs = 6000): Promise<{
 
 function requirementEnv(sessionId?: string): Record<string, string> {
   const env = requirementMcpEnv(sessionId)
-  return env.UNIAGENT_REQUIREMENT_TOKEN ? { ...env, UNIAGENT_REQUIREMENT_INBOX: REQUIREMENT_INBOX_DIR, UNIAGENT_REQUIREMENT_RESULTS: REQUIREMENT_RESULTS_DIR } : {}
+  return env.UNIAGENT_REQUIREMENT_TOKEN ? { ...env, UNIAGENT_REQUIREMENT_INBOX: REQUIREMENT_INSTANCE_INBOX_DIR, UNIAGENT_REQUIREMENT_RESULTS: REQUIREMENT_RESULTS_DIR } : {}
 }
 export function watchRequirementInbox(handle: (req: RequirementMcpRequest) => Promise<unknown>): () => void {
-  return watchInbox<RequirementMcpRequest>(REQUIREMENT_INBOX_DIR, req => {
+  let queue: Promise<void> = Promise.resolve()
+  return watchInbox<RequirementMcpRequest>(REQUIREMENT_INSTANCE_INBOX_DIR, req => {
     if (typeof req.id !== 'string' || !/^[a-f0-9-]{36}$/i.test(req.id)) return
     const write = (result: unknown): void => writeInboxResult(REQUIREMENT_RESULTS_DIR, req.id, result)
-    void Promise.resolve().then(() => handle(req)).then(value => write({ ok: true, value }), error => write({ ok: false, error: error instanceof Error ? error.message : String(error) }))
-      .catch(error => diagnostics.record({ category: 'app_runtime', source: 'requirement-mcp', agentId: 'app',
+    const completion = queue.catch(() => {}).then(() => handle(req)).then(value => write({ ok: true, value }), error => write({ ok: false, error: error instanceof Error ? error.message : String(error), ...(error instanceof Error && 'details' in error ? { details: error.details } : {}) }))
+      .catch(error => { diagnostics.record({ category: 'app_runtime', source: 'requirement-mcp', agentId: 'app',
         level: 'error', code: 'requirement_result_write_failed', message: '需求工具结果写入失败',
-        sample: runtimeDiagnosticSample(error, { requestId: req.id }) }))
+        sample: runtimeDiagnosticSample(error, { requestId: req.id }) }); throw error })
+    queue = completion
+    return completion
   }, true)
 }

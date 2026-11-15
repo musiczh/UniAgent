@@ -1,7 +1,9 @@
-import { readFile, readdir, stat, open, writeFile, mkdir, appendFile, cp, rename, unlink } from 'node:fs/promises'
+import { listQoderHistory, loadQoderHistory } from './qoderHistory'
+import { qoderConfigRoot } from './qoderPaths'
+import { readFile, readdir, stat, open, writeFile, mkdir, appendFile, cp, rename, unlink, realpath } from 'node:fs/promises'
 import { createReadStream, existsSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, sep } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { createInterface } from 'node:readline'
 import type { AgentDef, HistoryForkPoint, SessionSummary, UAEvent, UASubAgent } from '../shared/types'
@@ -588,6 +590,10 @@ export async function listAgentHistory(agentId: string, agentBin?: string): Prom
   if (agentId === 'codex') return listCodexLike('codex', CODEX_DIR)
   if (agentId === 'traex') return listCodexLike('traex', TRAE_DIR)
   if (agentId === 'claude') return listClaude()
+  if (agentId === 'qoder') {
+    if (!agentBin) throw new Error('Qoder 历史需要已检测的可执行文件')
+    return listQoderHistory(agentBin)
+  }
   if (agentId === 'kimi') {
     if (!agentBin) throw new Error('Kimi 历史需要已检测的可执行文件')
     return listKimiSessions(agentBin)
@@ -604,21 +610,41 @@ export async function listAgentHistory(agentId: string, agentBin?: string): Prom
 }
 
 /** Find a codex/traex rollout file whose name ends with the session id suffix. */
-async function findRollout(baseDir: string, id: string): Promise<string | null> {
+async function findRollout(baseDir: string, id: string, strict = false): Promise<string | null> {
   for (const sub of ['sessions', 'archived_sessions']) {
     const root = join(baseDir, sub)
-    if (!existsSync(root)) continue
-    const hit = await walkFind(root, id)
+    if (!strict && !existsSync(root)) continue
+    const hit = await walkFind(root, id, strict)
     if (hit) return hit
   }
   return null
 }
 
 /** Resolve the exact file-backed native Session used by replay and occupancy checks. */
-export async function resolveNativeSessionFile(agentId: string, id: string): Promise<string | null> {
-  if (agentId === 'codex') return findRollout(CODEX_DIR, id)
-  if (agentId === 'traex') return findRollout(TRAE_DIR, id)
+export async function resolveNativeSessionFile(agentId: string, id: string, strict = false): Promise<string | null> {
+  if (!/^[a-zA-Z0-9_-]+$/.test(id)) return null
+  if (agentId === 'codex') return findRollout(CODEX_DIR, id, strict)
+  if (agentId === 'traex') return findRollout(TRAE_DIR, id, strict)
+  if (agentId === 'claude' || agentId === 'qoder') {
+    const projects = agentId === 'qoder' ? join(qoderConfigRoot('cn', homedir()), 'projects') : CLAUDE_PROJECTS
+    try {
+      for (const project of await readdir(projects)) {
+        const candidate = join(projects, project, id + '.jsonl')
+        try {
+          if ((await stat(candidate)).isFile()) return candidate
+        } catch (error) {
+          if (strict && !nativePathMissing(error)) throw error
+        }
+      }
+    } catch (error) {
+      if (strict && !nativePathMissing(error)) throw error
+    }
+  }
   return null
+}
+
+function nativePathMissing(error: unknown): boolean {
+  return ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code || '')
 }
 
 /** Repair UniAgent transplants before native resume rebuilds the model context. */
@@ -754,11 +780,12 @@ export async function rolloutGenerationEndTimestamp(
   return undefined
 }
 
-async function walkFind(dir: string, id: string): Promise<string | null> {
+async function walkFind(dir: string, id: string, strict = false): Promise<string | null> {
   let entries: string[] = []
   try {
     entries = await readdir(dir)
-  } catch {
+  } catch (error) {
+    if (strict && !nativePathMissing(error)) throw error
     return null
   }
   // archived_sessions is flat; sessions is YYYY/MM/DD nested. The rollout file
@@ -773,11 +800,11 @@ async function walkFind(dir: string, id: string): Promise<string | null> {
     try {
       const st = await stat(full)
       if (st.isDirectory()) {
-        const hit = await walkFind(full, id)
+        const hit = await walkFind(full, id, strict)
         if (hit) return hit
       }
-    } catch {
-      /* ignore */
+    } catch (error) {
+      if (strict && !nativePathMissing(error)) throw error
     }
   }
   return null
@@ -800,6 +827,10 @@ export async function loadSessionEvents(
     return loadDeepSeekHostHistory(id)
   }
   if (agentId === 'claude') return loadClaudeEvents(id, onProgress)
+  if (agentId === 'qoder') {
+    if (!agentBin) throw new Error('Qoder 历史需要已检测的可执行文件')
+    return loadQoderHistory(agentBin, id, cwd)
+  }
   if (agentId === 'kimi') {
     if (!agentBin) throw new Error('Kimi 历史需要已检测的可执行文件')
     return loadKimiSessionEvents(id, agentBin, cwd)
@@ -820,6 +851,16 @@ export async function loadSessionEvents(
   if (!file) return { events: [] }
   const replayText = await readCodexLikeReplayText(baseDir, file, undefined, new Set(), onProgress)
   return loadCodexLikeEvents(file, agentId, id, resolveNativeChildRolloutEnds, replayText, onProgress)
+}
+
+/** Read a managed, tool-free thread from its own home without importing or resuming it. */
+export async function loadManagedCodexSessionEvents(home: string, id: string): Promise<UAEvent[]> {
+  if (!/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error('整理会话 ID 无效')
+  const file = await findRollout(home, id, true)
+  if (!file) throw new Error('尚未找到整理会话的原始消息，请稍后重试')
+  if (!(await realpath(file)).startsWith((await realpath(home)) + sep)) throw new Error('整理会话记录超出所属目录')
+  const text = (await readHistoryFile(file, () => {})).toString('utf8')
+  return (await loadCodexLikeEvents(file, 'codex', id, async () => new Map(), text)).events
 }
 
 interface HistoryBasePointer {
@@ -2052,10 +2093,11 @@ export async function loadCodexLikeEvents(
   let currentTurnId: string | undefined
   let openTurnId: string | undefined
   let turnOpen = false
+  let nativeTurnIncomplete = false
   let transplanted = false
-  const closeOpenTurn = (): void => {
+  const closeOpenTurn = (state: UAEvent['state'] = 'success'): void => {
     if (!turnOpen) return
-    push('turn_completed', { threadId, turnId: openTurnId }, 'success')
+    push('turn_completed', { threadId, turnId: openTurnId }, state)
     turnOpen = false
     openTurnId = undefined
   }
@@ -2662,6 +2704,7 @@ export async function loadCodexLikeEvents(
     // records would incorrectly inherit the preceding turn's identity.
     if (o?.type === 'event_msg' && o?.payload?.type === 'task_started') {
       currentTurnId = normalizedTurnId
+      nativeTurnIncomplete = true
     } else if (normalizedTurnId) {
       currentTurnId = normalizedTurnId
     }
@@ -2696,6 +2739,7 @@ export async function loadCodexLikeEvents(
       flushTurnUsage()
       closeOpenTurn()
       currentTurnId = undefined
+      nativeTurnIncomplete = false
       transplanted = o.payload?.uniagent_transplant === true
       cwd = o.payload?.cwd || cwd
       const nativeId = o.payload?.id ?? o.payload?.session_id
@@ -3230,7 +3274,18 @@ export async function loadCodexLikeEvents(
         if (info?.model_context_window) contextWindow = info.model_context_window
         break
       }
+      case 'turn_aborted':
+        pendingGoalText = undefined
+        if (turnOpen ? currentTurnId === openTurnId : nativeTurnIncomplete) {
+          cancelPendingResponseTools()
+          flushTurnUsage()
+          push('system_notice', { kind: 'interrupted', text: '本轮已中断。' })
+          closeOpenTurn('cancelled')
+        }
+        nativeTurnIncomplete = false
+        break
       case 'task_complete':
+        nativeTurnIncomplete = false
         pendingGoalText = undefined
         // 需求22 — do NOT flush here. A single user turn can contain MULTIPLE
         // `task_complete` records (traex emits them for compaction/summary/review
@@ -3263,6 +3318,10 @@ export async function loadCodexLikeEvents(
   cancelPendingResponseTools()
   // Trailing turn (rollouts without a final task_complete).
   flushTurnUsage()
+  if (turnOpen && nativeTurnIncomplete && currentTurnId === openTurnId && !transplanted) {
+    push('system_notice', { kind: 'interrupted', text: '本轮已中断。' })
+    closeOpenTurn('cancelled')
+  }
   // 需求1/2/3 — close the last native turn at EOF so the final restored turn is
   // marked done (DoneTurn) and still exposes its turnId for review / 回退.
   closeOpenTurn()
@@ -3484,20 +3543,7 @@ async function loadClaudeEvents(
   id: string,
   onProgress?: HistoryProgressCallback
 ): Promise<{ events: UAEvent[]; cwd?: string; model?: string; effort?: string }> {
-  // Find the project jsonl containing this session id.
-  let file: string | null = null
-  try {
-    const projects = await readdir(CLAUDE_PROJECTS)
-    for (const proj of projects) {
-      const candidate = join(CLAUDE_PROJECTS, proj, id + '.jsonl')
-      if (existsSync(candidate)) {
-        file = candidate
-        break
-      }
-    }
-  } catch {
-    /* ignore */
-  }
+  const file = await resolveNativeSessionFile('claude', id)
   if (!file) return { events: [] }
   let text = ''
   try {

@@ -192,8 +192,10 @@ async function verifyRoleAndReports() {
     catch (error) { if (/Execution context was destroyed|Cannot find context|uniagent/.test(String(error))) return null; throw error }
   }, rows => rows?.some(row => row.id === session.id), 'renderer session hydration')
   await waitFor(()=>evaluate('!!document.querySelector(".app") && !document.querySelector(".app").inert && document.getElementById("ua-startup")?.hidden === true'),Boolean,'renderer startup settled')
-  await evaluate('document.querySelector(".sl-seg [data-view=all]")?.click()')
-  await waitFor(() => evaluate(`(() => {const node=document.querySelector('[data-session-id="${session.id}"]');node?.click();return !!node;})()`), Boolean, 'select completed role session')
+  await evaluate('document.querySelector(".scope-view-trigger").click()')
+  await waitFor(() => evaluate('(() => {const node=document.querySelector("[data-sidebar-view=task]");node?.click();return !!node;})()'), Boolean, 'show sidebar task list')
+  await waitFor(() => evaluate(`(() => {const node=document.querySelector('.scope-nav-row[data-task-id="${session.id}"] .scope-nav-name');if(!node || node.disabled)return false;node.click();return true;})()`), Boolean, 'select completed role task')
+  await waitFor(() => evaluate(`!!document.querySelector('.session-task-content[data-task-id="${session.id}"] .event-stream')`), Boolean, 'open completed role conversation')
   await waitFor(() => evaluate(`(async () => ({text:document.querySelector('.session-view')?.innerText || document.body.innerText,events:(await window.uniagent.getEvents(${JSON.stringify(session.id)})).length,html:document.querySelector('.session-view')?.innerHTML.slice(0,1800)}))()`), value => value.text.includes('Claude 上下文') && value.text.includes('Claude 会话用量') && value.text.includes('未返回订阅额度'), 'native report renderer')
   check('packaged renderer displays native context, session usage and missing quota', true)
   await cdp('Page.bringToFront')

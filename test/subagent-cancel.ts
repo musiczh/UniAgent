@@ -17,6 +17,7 @@ const runner = { async cancelSubAgent(id: string) { if (failure) throw failure; 
 // Exercise the real boundary without constructors, disk state or a live provider.
 const host = Object.assign(Object.create(Orchestrator.prototype), {
   worktreeTransitions: new Set(),
+  deletingSessionRecords: new Set(),
   sessions: new Map([[session.id, session]]), protocolRunners: new Map([[session.id, runner]]),
   getAgent: (id: string) => ({ adapter: id })
 }) as Orchestrator
@@ -41,6 +42,7 @@ async function denied(mutate: () => void, reset: () => void, expected: RegExp): 
   assert.equal(accepted.length, before, 'rejected cancellation never reaches the native provider')
 }
 await assert.rejects(host.cancelSubAgent('missing', 'child'), /会话不存在/)
+await denied(() => { (host as any).deletingSessionRecords.add('owner') }, () => { (host as any).deletingSessionRecords.delete('owner') }, /任务正在删除/)
 await assert.rejects(host.cancelSubAgent('owner', 'foreign-child'), /不属于当前会话/)
 for (const value of ['', ' child', 'child\n', 'child\u0000']) {
   await assert.rejects(host.cancelSubAgent('owner', value), /无效/)

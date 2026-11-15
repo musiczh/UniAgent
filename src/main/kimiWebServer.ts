@@ -52,7 +52,7 @@ export class KimiWebServer {
   }) {}
 
   static async start(options: KimiWebServer['options']): Promise<KimiWebServer> {
-    await awaitACPStartup()
+    await awaitACPStartup('kimi')
     const server = new KimiWebServer(options)
     try {
       const origin = await server.launch()
@@ -97,7 +97,12 @@ export class KimiWebServer {
     void ready.catch(() => {})
     if (process.platform !== 'win32' && child.pid) {
       const inspected = await inspectACPProcess(child.pid)
-      if (!inspected.ok || !inspected.process || inspected.process.ppid !== process.pid || inspected.process.uid !== process.getuid?.() || inspected.process.pgid !== child.pid) throw new KimiWebError('server_source_unverified')
+      if (!inspected.ok) throw Object.assign(new KimiWebError('server_source_unverified'), { cause: inspected.error })
+      if (!inspected.process || inspected.process.ppid !== process.pid || inspected.process.uid !== process.getuid?.() || inspected.process.pgid !== child.pid) {
+        throw Object.assign(new KimiWebError('server_source_unverified'), { cause: new Error('Kimi server process identity mismatch: ' + JSON.stringify({
+          expected: { pid: child.pid, ppid: process.pid, uid: process.getuid?.(), pgid: child.pid }, observed: inspected.process ?? null
+        })) })
+      }
       this.identity = inspected.process
       await this.captureProcesses()
     }
@@ -114,7 +119,7 @@ export class KimiWebServer {
     const known = new Map(this.processes.map(entry => [entry.pid, entry]))
     for (const entry of group) if (entry.uid === this.identity.uid && entry.pid !== process.pid) known.set(entry.pid, entry)
     this.processes = [...known.values()]
-    rememberACPProcesses(this.identity, this.processes)
+    rememberACPProcesses(this.identity, this.processes, 'kimi')
   }
 
   closeAndWait(): Promise<void> {
@@ -137,7 +142,7 @@ export class KimiWebServer {
         return
       }
       try { await this.captureProcesses(); await stopACPProcessGroup(this.identity, this.processes) }
-      catch { throw new KimiWebError('shutdown_incomplete') }
+      catch (cause) { throw Object.assign(new KimiWebError('shutdown_incomplete'), { cause }) }
       await this.childExit
       forgetACPProcesses(this.identity)
     })()

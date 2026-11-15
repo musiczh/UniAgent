@@ -698,7 +698,11 @@ async function queueWaitMetadataSurvivesStatusReplacement(): Promise<void> {
   const events: UAEvent[] = []
   runner.on('event', (event) => events.push(event))
   try {
-    await runner.startTurn('wait for compute')
+    assert.equal(runner.isRunning(), false, 'a prepared runner is idle before a turn')
+    const starting = runner.startTurn('wait for compute')
+    assert.equal(runner.isRunning(), true, 'turn startup counts as running before the native receipt')
+    await starting
+    assert.equal(runner.isRunning(), true, 'the native turn keeps the runner busy')
     transport.emit('notification', 'item/started', {
       threadId: 'thread-1',
       item: { id: 'queue-progress', type: 'agentMessage', text: '' }
@@ -707,6 +711,7 @@ async function queueWaitMetadataSurvivesStatusReplacement(): Promise<void> {
       threadId: 'thread-1',
       turn: { id: 'turn-1', status: 'completed' }
     })
+    assert.equal(runner.isRunning(), false, 'native completion releases the runner for queued input')
     const queueEvents = events.filter(({ type }) => type === 'queue_status')
     assert.equal(queueEvents.length, 4, 'turn/start must close an active final wait phase')
     assert.match(
@@ -2809,7 +2814,7 @@ async function orchestratorManualCompactGate(): Promise<void> {
   orchestrator.loadPersisted()
   const session = orchestrator.getSessionById('goal-session')!
   let compactCalls = 0
-  const fakeStreamer = { compact: async () => { compactCalls += 1 } }
+  const fakeStreamer = { compact: async () => { compactCalls += 1 }, isRunning: () => false }
   try {
     await assert.rejects(
       orchestrator.compactSession(session.id),
@@ -4085,6 +4090,7 @@ async function orchestratorStartingReviewCancellation(): Promise<void> {
   } finally {
     AppServerRunner.prototype.startReview = originalStartReview
     orchestrator.disposeAll()
+    await orchestrator.closeSessionLogs()
     await rm(root, { recursive: true, force: true })
   }
 }
@@ -4381,6 +4387,7 @@ async function planBadgeExitDismissesPendingModeChange(): Promise<void> {
       assert.equal(owner.status, 'running')
     } finally {
       orchestrator.disposeAll()
+      await orchestrator.closeSessionLogs()
       await rm(root, { recursive: true, force: true })
     }
   }
@@ -4621,6 +4628,7 @@ async function orchestratorStaleDisconnectResponseState(): Promise<void> {
     assert.equal(session.status, 'running')
   } finally {
     orchestrator.disposeAll()
+    await orchestrator.closeSessionLogs()
     await rm(root, { recursive: true, force: true })
   }
 }
@@ -4676,6 +4684,7 @@ async function orchestratorMultipleServerRequestsStayAwaiting(): Promise<void> {
     assert.equal(session.status, 'running')
   } finally {
     orchestrator.disposeAll()
+    await orchestrator.closeSessionLogs()
     await rm(root, { recursive: true, force: true })
   }
 }
@@ -4808,6 +4817,7 @@ async function orchestratorRetainOwnerReentry(
     orchestrator.off('statusChange', onStatus)
     runner.dispose()
     orchestrator.disposeAll()
+    await orchestrator.closeSessionLogs()
     await rm(root, { recursive: true, force: true })
   }
 }
@@ -4872,6 +4882,7 @@ async function orchestratorRetainNewPendingReentry(): Promise<void> {
     orchestrator.off('event', registerPending)
     orchestrator.off('statusChange', onStatus)
     orchestrator.disposeAll()
+    await orchestrator.closeSessionLogs()
     await rm(root, { recursive: true, force: true })
   }
 }
@@ -4938,6 +4949,7 @@ async function orchestratorRetainOwnerAba(
     orchestrator.off('statusChange', onStatus)
     runner.dispose()
     orchestrator.disposeAll()
+    await orchestrator.closeSessionLogs()
     await rm(root, { recursive: true, force: true })
   }
 }
@@ -5016,6 +5028,7 @@ async function orchestratorRawSuccessOwnerAba(
     orchestrator.off('event', reinstallSameOwner)
     orchestrator.off('statusChange', onStatus)
     orchestrator.disposeAll()
+    await orchestrator.closeSessionLogs()
     await rm(root, { recursive: true, force: true })
   }
 }

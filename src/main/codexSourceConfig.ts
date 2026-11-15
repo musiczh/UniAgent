@@ -2,6 +2,19 @@ import * as TOML from '@iarna/toml'
 import { isDeepStrictEqual } from 'node:util'
 import { CODEX_SOURCE_PRESETS, isCodexSourceModelId, type CodexSourceInput, type CodexSourceModelQueryInput, type CodexSourcePreset } from '../shared/codexSources'
 
+/** Copy only connection fields into tool-free homes; never inherit hooks, MCP or skills. */
+export function appServerTransportConfig(config: Record<string, any>, provider?: string): Record<string, any> {
+  const transport: Record<string, any> = {}
+  if (provider) {
+    transport.model_provider = provider
+    const definition = config.model_providers?.[provider]
+    const fields = new Set(['name','base_url','env_key','env_key_instructions','http_headers','env_http_headers','wire_api','requires_openai_auth','supports_websockets','request_max_retries','stream_max_retries','stream_idle_timeout_ms','experimental_bearer_token'])
+    if (definition && typeof definition === 'object' && !Array.isArray(definition)) transport.model_providers = { [provider]: Object.fromEntries(Object.entries(definition).filter(([key])=>fields.has(key))) }
+  }
+  for (const key of ['openai_base_url','chatgpt_base_url']) if (typeof config[key] === 'string') transport[key] = config[key]
+  return transport
+}
+
 export type ConfigScalar = string | boolean | null
 export interface ConfigField { path: string[]; before: ConfigScalar; applied: ConfigScalar; initial?: ConfigScalar }
 const forbidden = new Set(['__proto__', 'constructor', 'prototype'])

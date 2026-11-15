@@ -104,8 +104,8 @@ function latestJob(jobs: CapabilitySyncJob[]): CapabilitySyncJob | undefined {
 }
 
 export function CapabilitySyncPanel({ onBack, initialRequest }: { onBack: () => void; initialRequest?: CapabilityInventorySyncRequest | null }): JSX.Element {
-  const [source, setSource] = useState<'codex' | 'traex'>(initialRequest?.source || 'codex')
-  const target = source === 'codex' ? 'traex' : 'codex'
+  const [source, setSource] = useState<'codex' | 'traex' | 'qoder'>(initialRequest?.source || 'codex')
+  const [target, setTarget] = useState<'codex' | 'traex' | 'qoder'>(initialRequest?.target || (source === 'codex' ? 'traex' : 'codex'))
   const [scan, setScan] = useState<CapabilityScanResult | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [cloneCategories, setCloneCategories] = useState<Set<CapabilityKind>>(new Set())
@@ -206,6 +206,7 @@ export function CapabilitySyncPanel({ onBack, initialRequest }: { onBack: () => 
     invalidatePlan()
     invalidatePreview()
     setSource(initialRequest.source)
+    setTarget(initialRequest.target)
     setScan(null)
     setSelected(new Set())
     setCloneCategories(new Set())
@@ -235,6 +236,7 @@ export function CapabilitySyncPanel({ onBack, initialRequest }: { onBack: () => 
     invalidatePlan()
     invalidatePreview()
     setSource(target)
+    setTarget(source)
     setScan(null)
     setSelected(new Set())
     setCloneCategories(new Set())
@@ -494,7 +496,7 @@ export function CapabilitySyncPanel({ onBack, initialRequest }: { onBack: () => 
           const categoryDisabled = draftLocked || (mode === 'merge' && members.length === 0)
           return <div className="cap-sync-group" key={kind}><h3><label><input type="checkbox" checked={all} disabled={categoryDisabled} onChange={(event) => mode === 'clone-supported-scope' ? updateCloneCategory(kind, event.target.checked) : updateSelection(members.map((item) => item.id), event.target.checked)}/> {KIND[kind] || kind}</label></h3>{scan.items.filter((item) => item.kind === kind).map((item) => <div className="cap-sync-item" key={item.id}><input type="checkbox" checked={selected.has(item.id)} disabled={!item.selectable || draftLocked || mode === 'clone-supported-scope'} onChange={(event) => updateSelection([item.id], event.target.checked)}/><span className="cap-sync-name">{item.name}</span><span className={`cap-sync-status ${item.status}`}>{STATUS[item.status]}</span>{item.status === 'conflict' && selected.has(item.id) && item.kind !== 'global-instructions' && <select value={resolutions[item.id] || 'target'} disabled={draftLocked || mode === 'clone-supported-scope'} onChange={(event) => updateResolution(item.id, event.target.value as CapabilityResolution)}><option value="target">保留目标</option><option value="source">使用来源</option>{item.kind === 'memory' && <option value="merge">结构化合并</option>}<option value="skip">跳过</option></select>}</div>)}</div>
         })}
-        {agentsSelected && <div className="cap-sync-agents"><b>共享内容策略</b><select value={strategy} disabled={draftLocked} onChange={(event) => void previewAgents(event.target.value as AgentsStrategy | '')}><option value="">请选择（必填）</option><option value="keep-codex">保留 Codex</option><option value="keep-traex">保留 TraeX</option><option value="keep-shared">保留现有共享文件</option><option value="merge">合并全部来源</option></select><span>最终保存到共享 AGENTS.md，两端入口都会变为软连接。</span>{pending.preview && <span className="settings-dim">正在生成预检摘要…</span>}{agentsPreview && <div className="settings-dim">安全摘要：{agentsPreview.lineCount} 行 · {agentsPreview.headingCount} 个章节 · {agentsPreview.byteCount} 字节</div>}</div>}
+        {agentsSelected && <div className="cap-sync-agents"><b>共享内容策略</b><select value={strategy} disabled={draftLocked} onChange={(event) => void previewAgents(event.target.value as AgentsStrategy | '')}><option value="">请选择（必填）</option><option value="keep-codex">{source === 'qoder' || target === 'qoder' ? `保留 ${source}` : '保留 Codex'}</option><option value="keep-traex">{source === 'qoder' || target === 'qoder' ? `保留 ${target}` : '保留 TraeX'}</option><option value="keep-shared">保留现有共享文件</option><option value="merge">合并全部来源</option></select><span>最终保存到共享 AGENTS.md，两端入口都会变为软连接。</span>{pending.preview && <span className="settings-dim">正在生成预检摘要…</span>}{agentsPreview && <div className="settings-dim">安全摘要：{agentsPreview.lineCount} 行 · {agentsPreview.headingCount} 个章节 · {agentsPreview.byteCount} 字节</div>}</div>}
       </section><section className="settings-section"><div className="settings-section-title">同步方式与预检</div><label><input type="radio" checked={mode === 'merge'} disabled={draftLocked} onChange={() => updateMode('merge')}/> 增量转移（默认，不删除目标独有项）</label><label className="cap-sync-overwrite"><input type="radio" checked={mode === 'clone-supported-scope'} disabled={draftLocked} onChange={() => updateMode('clone-supported-scope')}/> 覆盖转移（完全复刻支持范围）</label><button className="settings-add-preset" disabled={!canPlan} onClick={() => void doPlan()}>{pending.plan ? '生成中…' : '生成确定计划'}</button>
         {plan && planSummary && <div className="cap-sync-plan"><div><b>{plan.source} → {plan.target}</b> · {plan.mode === 'merge' ? '增量转移' : '覆盖转移'}{plan.agentsStrategy ? ` · AGENTS: ${STRATEGY[plan.agentsStrategy]}` : ''}</div><b>{planSummary.writes} 写入 · {planSummary.deletes} 删除 · {plan.destructiveCount} 破坏性 · {planSummary.noops} 无变化 · {planSummary.skips} 跳过</b>{planSummary.deletes > 0 && <span className="cap-sync-danger">删除：{plan.operations.filter((operation) => operation.action === 'delete').map((operation) => operation.name).join('、')}</span>}{plan.blockedReasons.length > 0 ? <div className="cap-sync-error">阻断：{plan.blockedReasons.join('、')}</div> : <button className="settings-add-preset" disabled={!canExecute} onClick={() => void execute()}>{pending.execute ? '正在启动…' : job?.planId === plan.id ? '任务已启动' : '执行同步'}</button>}</div>}
       </section></>}

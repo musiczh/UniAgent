@@ -71,7 +71,8 @@
 .startup-screen.error .halo { background: radial-gradient(circle, #e3934a23, transparent 67%); animation: none; }
 .startup-screen.error .glow { background: radial-gradient(ellipse at 50% 45%, #e3934a0b, transparent 56%); animation: none; }
 .startup-screen.error h1 { font-size: 26px; color: #e8d2b6; }
-.startup-screen.entering { background: transparent; pointer-events: none; }
+body:has(.startup-screen.error) .app { visibility: hidden; }
+.startup-screen.entering:not(.error) { background: transparent; pointer-events: none; }
 .startup-screen.entering .pulse { animation: none; }
 .startup-entering .app { will-change: transform, clip-path; }
 .startup-screen .motion-trails, .startup-screen .motion-fx { position: absolute; inset: 0; width: 440px; height: 275px; overflow: visible; pointer-events: none; }

@@ -12,6 +12,7 @@ import { codexModelKey, codexWireModel, parseCodexModelKey } from '../shared/cod
 import type { ModelDef, SessionConfig } from '../shared/types'
 import type { ClaudeConnection } from './claudeSourceRuntime'
 import { cleanupStaleClaudeRuntimes } from './claudeSourceRuntime'
+import { ClaudeFerrySource } from './claudeFerrySource'
 
 type StoredSource = Omit<CodexSourceInput, 'apiKey'> & { encryptedKey: string }
 
@@ -22,12 +23,14 @@ export function validateClaudeSource(input: unknown): CodexSourceInput {
 }
 
 export class ClaudeSourceService extends EventEmitter {
+  private readonly ferry = new ClaudeFerrySource()
   private readonly directory = join(resolveUserDataHome(), 'claude-sources')
   private readonly file = join(this.directory, 'settings.json')
   private sources: StoredSource[] = []
   private flight: Promise<unknown> = Promise.resolve()
   private loading?: Promise<void>
   private loadError?: string
+  private connectionRevision = 0
 
   start(): Promise<void> {
     return this.loading ??= this.load()
@@ -78,6 +81,9 @@ export class ClaudeSourceService extends EventEmitter {
       await chmod(temporary, 0o600)
       await rename(temporary, this.file)
       this.sources = next
+      if (JSON.stringify(previous) !== JSON.stringify(next.find(item => item.id === source.id))) {
+        this.emit('connectionChanged', { revision: ++this.connectionRevision, sourceIds: [source.id] })
+      }
       const snapshot = this.snapshot()
       this.emit('changed', snapshot)
       return snapshot
@@ -99,6 +105,10 @@ export class ClaudeSourceService extends EventEmitter {
   assertReady(config: SessionConfig): void {
     const normalized = this.normalize(config)
     if (normalized.agentId !== 'claude' || !normalized.modelSource || normalized.modelSource.kind === 'native') return
+    if (normalized.modelSource.kind === 'third-party' && normalized.modelSource.sourceId === 'ferry') {
+      this.ferry.assertReady(codexWireModel(normalized)!)
+      return
+    }
     if (this.loadError) throw new Error(this.loadError)
     const source = this.sources.find(item => item.id === normalized.modelSource!.sourceId)
     if (normalized.modelSource.kind !== 'third-party' || !source?.enabled || !source.models.includes(codexWireModel(normalized)!)) {
@@ -114,13 +124,21 @@ export class ClaudeSourceService extends EventEmitter {
       contextWindow: codexSourceCatalogModel(model, source.preset).context_window as number,
       imageInput: codexSourceModelImageInput(source.preset, model),
       modelSource: { kind: 'third-party' as const, sourceId: source.id }
-    })))]
+    }))), ...this.ferry.models]
+  }
+
+  async refreshModels(native: ModelDef[]): Promise<ModelDef[]> {
+    await this.ferry.refresh()
+    return this.mergeModels(native)
   }
 
   async connection(config: SessionConfig): Promise<ClaudeConnection> {
     await this.start()
-    this.assertReady(config)
     const normalized = this.normalize(config)
+    if (normalized.modelSource?.kind === 'third-party' && normalized.modelSource.sourceId === 'ferry') {
+      return this.ferry.connection(codexWireModel(normalized)!)
+    }
+    this.assertReady(normalized)
     const source = this.sources.find(item => item.id === normalized.modelSource?.sourceId)
     if (!source) throw new Error('Claude 模型来源不可用')
     return { baseUrl: source.baseUrl, apiKey: await decryptLocalSecretAsync(source.encryptedKey), model: codexWireModel(normalized)!, preset: source.preset as ClaudeSourcePreset }
@@ -132,7 +150,7 @@ export class ClaudeSourceService extends EventEmitter {
     return Promise.all(this.sources.map(async ({ encryptedKey, ...source }) => ({ ...source, apiKey: await decryptLocalSecretAsync(encryptedKey) })))
   }
 
-  async draftConnection(input: CodexSourceInput): Promise<ClaudeConnection> {
+  async draftConnection(input: CodexSourceInput): Promise<ClaudeConnection & { preset: ClaudeSourcePreset }> {
     await this.start()
     const source = validateClaudeSource(input)
     const previous = this.sources.find(item => item.id === source.id && item.preset === source.preset && item.baseUrl === source.baseUrl)

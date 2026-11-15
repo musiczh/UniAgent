@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react'
 import type { Requirement } from '@shared/requirementTypes'
 
-export function useRequirements(): { requirements: Requirement[]; error: string; loading: boolean } {
+export function useRequirements(enabled = true): { requirements: Requirement[]; error: string; loading: boolean; retry: () => void } {
   const [requirements, setRequirements] = useState<Requirement[]>([])
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(true)
+  const [retryKey, setRetryKey] = useState(0)
   useEffect(() => {
+    if (!enabled) { setRequirements([]); setError(''); setLoading(false); return }
     let live = true, generation = 0
     const refresh = (): void => {
       const ticket = ++generation
@@ -16,6 +18,6 @@ export function useRequirements(): { requirements: Requirement[]; error: string;
     const stop = window.uniagent.onRequirementsChanged(refresh)
     refresh()
     return () => { live = false; stop() }
-  }, [])
-  return { requirements, error, loading }
+  }, [enabled, retryKey])
+  return { requirements, error, loading, retry: () => { setLoading(true); setRetryKey(key => key + 1) } }
 }

@@ -2,7 +2,8 @@ import { buildDecisionAnswer } from '../shared/approvalDecision'
 import { INTERNAL_DISTRIBUTION } from '../shared/distribution'
 export { buildDecisionAnswer } from '../shared/approvalDecision'
 import { parseAssistantCommand } from '../shared/assistant'
-import { resolveAgentModel, resolveAgentPermission, resolveModelEffort } from '../shared/agentChoices'
+import type { AssistantConversationSelection } from '../shared/assistantConversation'
+import { resolveAgentModel, resolveAgentPermission, resolveModelEffort, withLastAgentChoices } from '../shared/agentChoices'
 import { powerMonitor, systemPreferences } from 'electron'
 import { WSClient, EventDispatcher, Client, defaultHttpInstance, normalizeCardAction } from '@larksuiteoapi/node-sdk'
 import { constants, readFileSync } from 'node:fs'
@@ -22,6 +23,8 @@ import { asInteractionRequest, planFeedbackInAnswer } from '../shared/interactio
 import { agentForSession, isToolSession } from '../shared/types'
 import { isSessionBusy } from '../shared/sessionStatus'
 import { feishuModelCard, feishuModelPatch, feishuModelSummary, modelDepth, selectFeishuModel, type FeishuModelSelection } from './feishuModelCard'
+import { canRetryRouterRequest, type RouterInput, type RouterRequest, type RouterResolution } from '../shared/router'
+import { feishuRouteAnswer, feishuRouteCard, feishuRouteId, feishuRouteSourceMatches } from './feishuRouting'
 import {
   normalizeQuestions,
   encodeAnswer,
@@ -84,6 +87,18 @@ export interface FeishuBridgeDeps {
   getAgents: () => AgentDef[]
   /** Current persisted Feishu config, or undefined when not configured. */
   getSettings: () => FeishuSettings | undefined
+  router?: {
+    status: () => { enabled: boolean; available: boolean; reason?: string }
+    request: (id: string) => Promise<RouterRequest | undefined>
+    topic: (botAppId: string, chatId: string, rootId?: string, parentId?: string, threadId?: string) => Promise<RouterRequest | undefined>
+    requests: () => Promise<RouterRequest[]>
+    submit: (input: RouterInput) => Promise<RouterRequest>
+    resolve: (input: RouterResolution) => Promise<RouterRequest>
+    cancel: (id: string, version: number) => Promise<RouterRequest>
+    retry: (id: string, version: number) => Promise<RouterRequest>
+    replaceCard?: (id: string, expectedCardId: string, cardMessageId: string) => Promise<RouterRequest>
+  }
+  onOpenSession?: (id: string) => void
   saveNotificationTarget?: (target: FeishuNotificationTarget | undefined) => void
   getAgentPref?: (agentId: string) => import('../shared/types').AgentPref | undefined
   getProjects?: () => Project[]
@@ -100,7 +115,7 @@ export interface FeishuBridgeDeps {
    *  refresh — its 话题 ↔ session binding wasn't visible in the app. */
   onSessionCreated?: (session: Session) => void
   onSessionUpdated?: (session: Session) => void
-  assistantCommand?: (sessionId: string, command: 'new' | 'clear', requestId: string) => Promise<Session>
+  assistantCommand?: (sessionId: string, command: 'new' | 'clear', requestId: string, selection?: AssistantConversationSelection) => Promise<Session>
   acceptsSession?: (session: Session) => boolean
   createAssistantSession?: (text: string, attachments: Attachment[], bind: (session: Session) => void, assertCurrent: () => void) => Promise<Session>
 }
@@ -133,6 +148,7 @@ interface RequestCardState {
 
 /** 需求 — the user's config choices carried by the new-topic card. */
 interface TopicSelection {
+  assignment?: 'manual' | 'auto'
   projectId: string
   requirementId?: string
   executor: 'agent' | 'team'
@@ -142,15 +158,26 @@ interface TopicSelection {
   effort?: ReasoningEffort
 }
 
-/** 需求 — a new-topic message awaiting its config card 开始 press. */
-interface TopicOffer {
+interface FeishuMessageFile {
+  fileKey: string
+  name: string
+}
+
+interface FeishuMessageContent {
   text: string
   imageKeys: string[]
+  files: FeishuMessageFile[]
+}
+
+/** 需求 — a new-topic message awaiting its config card 开始 press. */
+interface TopicOffer extends FeishuMessageContent {
   chatId: string
   userMessageId: string
   sel: TopicSelection
   cardMessageId?: string
   threadId?: string
+  attachments?: Attachment[]
+  error?: string
 }
 
 interface ModelCardState {
@@ -537,6 +564,8 @@ export class FeishuBridge {
 
   private async stopNow(preserveProgress = false): Promise<void> {
     this.connectionGeneration++
+    if (this.routeRetryTimer) clearTimeout(this.routeRetryTimer)
+    this.routeRetryTimer = undefined
     this.modelCards.clear()
     this.log(undefined, 'connection_stop', { preserved: preserveProgress, cards: this.allProgressCards().length })
     const ws = this.ws
@@ -546,6 +575,9 @@ export class FeishuBridge {
     this.connected = false
     this.botName = undefined
     if (!preserveProgress) {
+      this.routeRendered.clear()
+      this.routeSupplementForms.clear()
+      this.routeReplayed.clear()
       this.clientAppId = undefined
       this.notificationBinding = undefined
       this.defaultChatId = undefined
@@ -592,6 +624,7 @@ export class FeishuBridge {
     }
     this.handleTeamChanged()
     void this.syncThreadTitles()
+    void this.syncRouterRequests().catch(error => this.deps.onError?.(safeErr(error)))
   }
 
   private async syncThreadTitles(): Promise<void> {
@@ -735,11 +768,11 @@ export class FeishuBridge {
     return [...chats.values()]
   }
 
-  async executeAssistantCommandFromApp(sessionId: string, command: 'new' | 'clear', requestId: string): Promise<Session> {
+  async executeAssistantCommandFromApp(sessionId: string, command: 'new' | 'clear', requestId: string, selection?: AssistantConversationSelection): Promise<Session> {
     const execute = this.deps.assistantCommand
     if (!execute) throw new Error('个人助手会话命令不可用')
     const run = async (): Promise<Session> => {
-      const next = await execute(sessionId, command, requestId)
+      const next = await execute(sessionId, command, requestId, selection)
       this.rebindAssistantSession(sessionId, next, { command, requestId })
       return next
     }
@@ -1932,7 +1965,8 @@ export class FeishuBridge {
     const parentId: string | undefined = message.parent_id
     const content = extractMessageContent(message.content, message.message_type)
     const text = stripMentions(content.text)
-    if (!text && content.imageKeys.length === 0) return
+    const hasAttachments = content.imageKeys.length > 0 || content.files.length > 0
+    if (!text && !hasAttachments) return
     if (chatId && (!this.deps.createAssistantSession || !inGroup)) this.defaultChatId = chatId
 
     // Assistant private chats always use the current session, including replies
@@ -1946,6 +1980,32 @@ export class FeishuBridge {
       if (!link && parentId) link = this.deps.threadStore.byRootMessage(parentId)
     }
 
+    if (!link && this.deps.router && this.clientAppId && (rootId || parentId || threadId)) {
+      let request: RouterRequest | undefined
+      try { request = await this.deps.router.topic(this.clientAppId, chatId, rootId, parentId, threadId) }
+      catch (error) {
+        if (!(error instanceof Error) || error.message !== 'router_topic_ambiguous') throw error
+        await this.replyText({ sessionId: '', chatId, rootMessageId: rootId || parentId || messageId, lastPushedSeq: 0 }, '当前话题有多个分配请求，请回复对应的结果卡片补充信息。')
+        return
+      }
+      if (generation !== this.connectionGeneration) throw new Error('connection_changed')
+      if (request) {
+        if (request.state === 'bound' && request.targetId) {
+          const original = this.deps.threadStore.bySession(request.targetId)
+          if (original && feishuRouteSourceMatches(request.feishu, original.botAppId, original.chatId)) link = original
+        }
+        if (!link) {
+          const destination = { sessionId: '', chatId, rootMessageId: request.feishu!.rootMessageId, lastPushedSeq: 0 }
+          if ((request.state === 'needs_input' || canRetryRouterRequest(request) && request.state === 'failed') && (text || hasAttachments)) {
+            const attachments = hasAttachments ? await this.downloadAttachments(messageId, content) : undefined
+            if (generation !== this.connectionGeneration) throw new Error('connection_changed')
+            await this.deps.router.resolve({ requestId: request.requestId, expectedVersion: request.version, action: request.state === 'needs_input' ? 'answer' : 'retry', answer: text, attachments, sourceId: messageId })
+            await this.syncRouterRequests()
+          } else await this.replyText(destination, request.state === 'needs_input' ? '请用文字补充归属信息，或点击卡片改为手动选择。' : '本次路由尚未完成或投递结果待确认，请查看路由卡片。')
+          return
+        }
+      }
+    }
     if (link) {
       if (this.deps.createAssistantSession && (link.chatId !== chatId || link.botAppId !== this.clientAppId)) return
       const bound = this.deps.orchestrator.getSessionById(link.sessionId)
@@ -1960,13 +2020,13 @@ export class FeishuBridge {
         link = this.deps.threadStore.patch(bound.id, { replyInThread: false, threadId: undefined })!
       }
       if (text === '/model') {
-        if (content.imageKeys.length) { await this.replyText(link, '会话命令不支持附件，请移除附件后重试'); return }
+        if (hasAttachments) { await this.replyText(link, '会话命令不支持附件，请移除附件后重试'); return }
         await this.offerModelCard(bound, link)
         return
       }
       const command = bound.config.assistantSnapshot ? parseAssistantCommand(text) : undefined
       if (command && this.deps.assistantCommand) {
-        if (content.imageKeys.length) { await this.replyText(link, '会话命令不支持附件，请移除附件后重试'); return }
+        if (hasAttachments) { await this.replyText(link, '会话命令不支持附件，请移除附件后重试'); return }
         const next = await this.deps.assistantCommand(bound.id, command, messageId)
         link = this.rebindAssistantSession(bound.id, next) || link
         this.deps.onSessionCreated?.(next)
@@ -1980,11 +2040,11 @@ export class FeishuBridge {
       // Continuing an archived session from Feishu restores it first (out of the
       // archive drawer) so the turn can run and the user just keeps chatting.
       if (bound.archived) {
-        if (bound.teamBinding && this.deps.teams) this.deps.teams.archive(this.deps.teams.binding(bound.id).p.id, false)
-        else this.deps.orchestrator.setArchived(link.sessionId, false)
+        if (bound.teamBinding && this.deps.teams) await this.deps.teams.archive(this.deps.teams.binding(bound.id).p.id, false)
+        else await this.deps.orchestrator.setArchived(link.sessionId, false)
       }
       this.sessionChat.set(link.sessionId, chatId)
-      const attachments = await this.downloadImages(messageId, content.imageKeys)
+      const attachments = await this.downloadAttachments(messageId, content)
       const candidates = [...this.pending.values()].filter(request => request.sessionId === link!.sessionId)
       const referenced = parentId ? candidates.find(request => this.requestCards.get(`${link!.sessionId}/${request.requestId}`)?.messageId === parentId) : undefined
       const pending = referenced || (candidates.length === 1 ? candidates[0] : undefined)
@@ -2027,7 +2087,7 @@ export class FeishuBridge {
         await this.replyUnboundAssistant(chatId, anchorId, '当前没有助手对话，请先发送消息开始对话。', inGroup)
         return
       }
-      const attachments = await this.downloadImages(messageId, content.imageKeys)
+      const attachments = await this.downloadAttachments(messageId, content)
       try {
         await this.deps.createAssistantSession(appendFeishuContext(text), attachments, session => {
           this.sessionChat.set(session.id, chatId)
@@ -2053,7 +2113,9 @@ export class FeishuBridge {
       const mentioned = Array.isArray(message.mentions) && message.mentions.length > 0
       if (!mentioned) return
     }
-    await this.offerTopicCard(text, content.imageKeys, chatId, messageId)
+    if (this.deps.getSettings()?.autoRouteNewConversations && this.deps.router?.status().enabled && this.deps.router.status().available) {
+      await this.beginTopicRouting({ ...content, text, chatId, userMessageId: messageId, sel: this.defaultSelection() })
+    } else await this.offerTopicCard({ ...content, text }, chatId, messageId)
   }
 
   private sendFeishuMessage(sessionId: string, text: string, attachments: Attachment[]): Promise<void> {
@@ -2188,6 +2250,220 @@ export class FeishuBridge {
 
   /** sessionId → the topic config card currently offered for a new message. */
   private pendingTopics = new Map<string, TopicOffer>()
+  private routeChains = new Map<string, Promise<unknown>>()
+  private routeRendered = new Map<string, string>()
+  private routeReplayed = new Set<string>()
+  private routeSync?: Promise<void>
+  private routeSyncAgain = false
+  private routeRetryTimer?: ReturnType<typeof setTimeout>
+
+  private routeSerial<T>(id: string, run: () => Promise<T>): Promise<T> {
+    const operation = (this.routeChains.get(id) || Promise.resolve()).catch(() => {}).then(run)
+    this.routeChains.set(id, operation)
+    void operation.finally(() => { if (this.routeChains.get(id) === operation) this.routeChains.delete(id) }).catch(() => {})
+    return operation
+  }
+
+  private async beginTopicRouting(offer: TopicOffer, explicitStart = false): Promise<void> {
+    const router = this.deps.router, client = this.client, botAppId = this.clientAppId
+    if (!router || !client || !botAppId) throw new Error('飞书路由连接不可用')
+    const requestId = feishuRouteId(botAppId, offer.userMessageId)
+    await this.routeSerial(requestId, async () => {
+      const previous = await router.request(requestId)
+      if (previous) {
+        const next = explicitStart && previous.state === 'cancelled' ? await router.retry(previous.requestId, previous.version) : previous
+        await this.renderRouteRequest(next); return
+      }
+      const config = this.resolveSelection(offer.sel)
+      const pending = feishuRouteCard({ requestId, version: 0, state: 'routing', delivery: 'pending' })
+      if (this.client !== client) throw new Error('connection_changed')
+      if (offer.cardMessageId) {
+        const result = await withFeishuDeadline('show_routing', () => client.im.v1.message.patch({ path: { message_id: offer.cardMessageId! }, data: { content: JSON.stringify(pending) } }))
+        if (result.code) throw new FeishuBusinessError(result.code, result.msg)
+      } else {
+        const result = await withFeishuDeadline('show_routing', () => client.im.v1.message.reply({ path: { message_id: offer.userMessageId },
+          data: { content: JSON.stringify(pending), msg_type: CARD_MSG_TYPE, reply_in_thread: true, uuid: requestId } }))
+        if (result.code) throw new FeishuBusinessError(result.code, result.msg)
+        if (!result.data?.message_id) throw new Error('飞书未返回路由卡片 ID')
+        offer.cardMessageId = result.data.message_id; offer.threadId = result.data.thread_id
+        this.sentMessageIds.add(offer.cardMessageId)
+      }
+      try {
+        const attachments = offer.attachments ||= await this.downloadAttachments(offer.userMessageId, offer)
+        if (this.client !== client) throw new Error('connection_changed')
+        const request = await router.submit({ requestId, prompt: appendFeishuContext(offer.text || (offer.files.length ? '[文件]' : '[图片]')), attachments, scope: { kind: 'global' },
+          execution: { agentId: config.agent.id, model: config.model, effort: config.effort, permissionMode: config.permissionMode, workdir: '' },
+          feishu: { botAppId, chatId: offer.chatId, rootMessageId: offer.userMessageId, cardMessageId: offer.cardMessageId!, threadId: offer.threadId } })
+        await this.renderRouteRequest(request)
+      } catch (error) {
+        // A failed/ambiguous submit is looked up by the same ID on redelivery.
+        // Keep the original selection available when nothing reached the Router.
+        if (!await router.request(requestId)) {
+          this.pendingTopics.set(requestId, offer)
+          if (this.client === client) await client.im.v1.message.patch({ path: { message_id: offer.cardMessageId! }, data: { content: JSON.stringify(this.topicCard(requestId, offer)) } })
+        }
+        throw error
+      }
+    })
+  }
+
+  /** Called before a routed input can produce Session events or approvals. */
+  async prepareRoutedSession(request: RouterRequest, session: Session, recovering = false): Promise<void> {
+    if (!request.feishu) return
+    await this.routeSerial(request.requestId, async () => {
+      const client = this.client
+      if (!this.client || !this.deps.getSettings()?.enabled || !feishuRouteSourceMatches(request.feishu, this.clientAppId, request.feishu!.chatId)) throw new Error('飞书连接已变化，未投递任务')
+      if (this.deps.acceptsSession && !this.deps.acceptsSession(session)) throw new Error('目标会话不属于当前 Session 机器人')
+      const existing = this.deps.threadStore.bySession(session.id)
+      if (existing && !feishuRouteSourceMatches(request.feishu, existing.botAppId, existing.chatId)) throw new Error('目标任务已有其他聊天或机器人的话题，请在 UniAgent 中处理')
+      await this.renderRouteRequest({ ...request, targetId: session.id, targetTitle: session.title }, session)
+      if (this.client !== client) throw new Error('connection_changed')
+      // Bind only after the route result is visible, before dispatch begins.
+      if (!existing) {
+        this.bindTopic(session.id, { text: '', imageKeys: [], files: [], chatId: request.feishu!.chatId,
+          userMessageId: request.feishu!.rootMessageId, threadId: request.feishu!.threadId, sel: this.defaultSelection() })
+      } else this.deps.threadStore.patch(session.id, { driver: 'feishu' })
+      this.sessionChat.set(session.id, request.feishu!.chatId)
+      if (!recovering) this.routeReplayed.add(request.requestId)
+    })
+  }
+
+  async syncRouterRequests(): Promise<void> {
+    if (!this.deps.router || !this.client) return
+    if (this.routeSync) { this.routeSyncAgain = true; return this.routeSync }
+    this.routeSync = (async () => {
+      do {
+        this.routeSyncAgain = false
+        let failure: unknown
+        for (const request of await this.deps.router!.requests()) {
+          if (!feishuRouteSourceMatches(request.feishu, this.clientAppId, request.feishu?.chatId || '')) continue
+          try {
+            if (request.state === 'bound' && request.targetId && !this.deps.threadStore.bySession(request.targetId)) {
+              const target = this.deps.orchestrator.getSessionById(request.targetId)
+              if (target) await this.prepareRoutedSession(request, target, true)
+            }
+            await this.routeSerial(request.requestId, async () => {
+              const current = await this.deps.router!.request(request.requestId)
+              if (current) await this.renderRouteRequest(current)
+            })
+          } catch (error) { failure ||= error }
+        }
+        if (failure) throw failure
+      } while (this.routeSyncAgain && this.client)
+    })().catch(error => {
+      if (!this.routeRetryTimer && this.client) {
+        this.routeRetryTimer = setTimeout(() => {
+          this.routeRetryTimer = undefined
+          void this.syncRouterRequests().catch(error => this.deps.onError?.(safeErr(error)))
+        }, PROGRESS_RETRY_BASE_MS)
+        this.routeRetryTimer.unref?.()
+      }
+      throw error
+    }).finally(() => { this.routeSync = undefined })
+    return this.routeSync
+  }
+
+  private async renderRouteRequest(request: RouterRequest, target?: Session): Promise<void> {
+    const client = this.client, source = request.feishu
+    if (!client || !this.deps.getSettings()?.enabled || !feishuRouteSourceMatches(source, this.clientAppId, source?.chatId || '')) return
+    const session = target || (request.targetId ? this.deps.orchestrator.getSessionById(request.targetId) : undefined)
+    const link = session && this.deps.threadStore.bySession(session.id)
+    const original = link && link.rootMessageId !== source!.rootMessageId && feishuRouteSourceMatches(source, link.botAppId, link.chatId) ? link : undefined
+    if (this.routeSupplementForms.has(request.requestId) && this.routeSupplementForms.get(request.requestId) !== request.version) this.routeSupplementForms.delete(request.requestId)
+    const card = feishuRouteCard({ ...request,
+      projectName: request.projectName || this.projects().find(item => item.id === session?.config.projectId)?.name,
+      requirementName: request.requirementName || this.deps.getRequirements?.().find(item => item.id === session?.config.requirementId)?.name }, session, original, this.routeSupplementForms.get(request.requestId) === request.version)
+    const signature = JSON.stringify(card)
+    if (this.routeRendered.get(request.requestId) !== signature) {
+      try {
+        const result = await withFeishuDeadline('update_routing', () => client.im.v1.message.patch({ path: { message_id: source!.cardMessageId }, data: { content: signature } }))
+        if (result.code) throw new FeishuBusinessError(result.code, result.msg)
+      } catch (error) {
+        if (Number((error as any)?.response?.data?.code || (error as any)?.code) !== 230031 || !this.deps.router?.replaceCard) throw error
+        if (this.client !== client) throw new Error('connection_changed')
+        const result = await withFeishuDeadline('replace_routing', () => client.im.v1.message.reply({ path: { message_id: source!.rootMessageId },
+          data: { content: signature, msg_type: CARD_MSG_TYPE, reply_in_thread: true, uuid: feishuRouteId(source!.botAppId, 'replacement:' + source!.cardMessageId) } }))
+        if (result.code) throw new FeishuBusinessError(result.code, result.msg)
+        if (!result.data?.message_id) throw new Error('飞书未返回替代卡片 ID')
+        const next = await this.deps.router.replaceCard(request.requestId, source!.cardMessageId, result.data.message_id)
+        request.feishu = next.feishu
+        this.sentMessageIds.add(result.data.message_id)
+      }
+      if (this.client !== client) throw new Error('connection_changed')
+      this.routeRendered.set(request.requestId, signature)
+    }
+    if (session && request.state === 'bound' && !this.routeReplayed.has(request.requestId) && link && feishuRouteSourceMatches(source, link.botAppId, link.chatId)) {
+      const events = await this.deps.orchestrator.getEvents(session.id)
+      if (this.client !== client) return
+      this.routeReplayed.add(request.requestId)
+      for (const event of events.filter(event => event.ts >= request.createdAt && event.seq > link.lastPushedSeq)) this.handleEvent(event)
+    }
+  }
+
+  private readonly routeSupplementForms = new Map<string, number>()
+  private async onRouteCardAction(value: Record<string, unknown>, evt: any, raw?: any): Promise<unknown> {
+    const router = this.deps.router, request = await router?.request(String(value.routeId))
+    const source = request?.feishu
+    if (!router || !request || !this.client || !this.deps.getSettings()?.enabled || !feishuRouteSourceMatches(source, this.clientAppId, evt.chatId) || source?.cardMessageId !== evt.messageId) {
+      return { toast: { type: 'error', content: '路由卡片已失效，请使用当前话题中的最新卡片' } }
+    }
+    if (value.act === 'openRoutedTask' && request.targetId) {
+      const session = this.deps.orchestrator.getSessionById(request.targetId)
+      if (!session || this.deps.acceptsSession && !this.deps.acceptsSession(session) || !this.deps.onOpenSession) return { toast: { type: 'error', content: '目标任务当前不可打开' } }
+      this.deps.onOpenSession(session.id)
+      return { toast: { type: 'info', content: '已在 UniAgent 中打开' } }
+    }
+    if (request.version !== value.version) return { toast: { type: 'error', content: '路由状态已变化，请使用最新卡片' } }
+    if (request.delivery === 'unknown' && value.act !== 'verifyRoute') return { toast: { type: 'error', content: '投递结果仍待核对，请使用再次核对或查看原任务' } }
+    if (!['retryRoute', 'cancelRoute', 'manualRoute','supplementRoute','submitRouteSupplement','verifyRoute'].includes(String(value.act))) return { toast: { type: 'error', content: '无效的路由操作' } }
+    let answer: ReturnType<typeof feishuRouteAnswer> | undefined
+    if (value.act === 'submitRouteSupplement') {
+      try { answer = feishuRouteAnswer(request, raw?.action?.form_value) }
+      catch (error) { return { toast: { type: 'error', content: safeErr(error) } } }
+    }
+    const client = this.client
+    const failed = (error: unknown) => {
+      this.deps.onError?.(safeErr(error))
+      if (this.client !== client || this.clientAppId !== source!.botAppId) return
+      void this.replyText({ sessionId: '', chatId: source!.chatId, rootMessageId: source!.rootMessageId, lastPushedSeq: 0 }, '本次操作未完成：' + safeErr(error)).catch(failure => this.deps.onError?.(safeErr(failure)))
+    }
+    if (value.act === 'verifyRoute') {
+      // Reconciliation can cross the beforeDispatch display barrier. It must
+      // not hold that same route chain while waiting for the Controller.
+      void router.resolve({ requestId: request.requestId, expectedVersion: request.version, action: 'verify' })
+        .then(() => this.syncRouterRequests()).catch(failed)
+      return { toast: { type: 'info', content: '正在核对原任务…' } }
+    }
+    void this.routeSerial(request.requestId, async () => {
+      if (this.client !== client || !this.deps.getSettings()?.enabled) throw new Error('飞书连接已变化，请使用当前话题')
+      const current = await router.request(request.requestId)
+      if (!current || current.version !== request.version) { if (current) await this.renderRouteRequest(current); return }
+      if (value.act === 'supplementRoute') {
+        if (!canRetryRouterRequest(current)) throw new Error('当前请求不能重试，请查看最新状态')
+        this.routeSupplementForms.set(request.requestId, request.version)
+        await this.renderRouteRequest(current); return
+      }
+      this.routeSupplementForms.delete(request.requestId)
+      if (value.act === 'retryRoute') await router.retry(request.requestId, request.version)
+      else if (value.act === 'submitRouteSupplement') await router.resolve({ requestId: request.requestId, expectedVersion: request.version, ...answer! })
+      else {
+        await router.cancel(request.requestId, request.version)
+        if (value.act === 'manualRoute') {
+          const offer: TopicOffer = { text: splitFeishuContext(request.prompt)?.text || request.prompt, imageKeys: [], files: [],
+            attachments: request.attachments, chatId: source!.chatId, userMessageId: source!.rootMessageId, threadId: source!.threadId,
+            cardMessageId: source!.cardMessageId, sel: { ...this.defaultSelection(), assignment: 'manual', ...request.execution } }
+          this.pendingTopics.set(request.requestId, offer)
+          const result = await this.client!.im.v1.message.patch({ path: { message_id: source!.cardMessageId }, data: { content: JSON.stringify(this.topicCard(request.requestId, offer)) } })
+          if (result.code) throw new FeishuBusinessError(result.code, result.msg)
+          // The cancelled route must no longer replace the manual configuration.
+          this.routeRendered.set(request.requestId, JSON.stringify(feishuRouteCard({ ...request, state: 'cancelled', version: request.version + 1 })))
+          return
+        }
+      }
+      await this.renderRouteRequest((await router.request(request.requestId))!)
+    }).catch(failed)
+    return { toast: { type: 'info', content: '正在处理…' } }
+  }
 
   /**
    * 需求 — reply a config card anchored on the user's message. The card lets the
@@ -2196,15 +2472,14 @@ export class FeishuBridge {
    * the user's own message, so later agent replies thread underneath it.
    */
   private async offerTopicCard(
-    text: string,
-    imageKeys: string[],
+    content: FeishuMessageContent,
     chatId: string,
     userMessageId: string
   ): Promise<void> {
     if (!this.client) return
     const topicId = randomUUID()
     const sel = this.defaultSelection()
-    const offer: TopicOffer = { text, imageKeys, chatId, userMessageId, sel }
+    const offer: TopicOffer = { ...content, chatId, userMessageId, sel }
     try {
       const res = await this.client.im.v1.message.reply({
         data: { content: JSON.stringify(this.topicCard(topicId, offer)), msg_type: CARD_MSG_TYPE, reply_in_thread: true },
@@ -2234,7 +2509,7 @@ export class FeishuBridge {
     const agents = this.installedAgents()
     const wantId = settings?.defaultAgentId
     const agent = (wantId && agents.find((a) => a.id === wantId || a.adapter === wantId)) || agents[0]
-    const pref = agent && this.deps.getAgentPref?.(agent.id)
+    const pref = withLastAgentChoices(agent ? this.deps.getAgentPref?.(agent.id) : undefined)
     const model = resolveAgentModel(agent, settings?.defaultModel, pref?.defaultModel)
     return {
       projectId: this.defaultProjectId(settings),
@@ -2263,11 +2538,14 @@ export class FeishuBridge {
       offer.sel.model = resolved.model
       offer.sel.effort = resolved.effort
     }
-    return topicConfigCard(
+    const card = topicConfigCard(
       topicId, offer.sel, this.installedAgents(), this.projects(),
       (this.deps.getRequirements?.() || []).filter((requirement) => requirement.status !== 'archived'),
-      (catalog?.teams || []).filter((team) => team.status === 'active' && !catalog?.unavailableReasons?.[team.id])
+      (catalog?.teams || []).filter((team) => team.status === 'active' && !catalog?.unavailableReasons?.[team.id]),
+      this.deps.router?.status()
     )
+    if (offer.error) (card as { body: { elements: object[] } }).body.elements.unshift({ tag: 'markdown', content: `自动路由未开始：${offer.error}。可手动选择或重试。` })
+    return card
   }
 
   private projects(): Project[] {
@@ -2306,6 +2584,7 @@ export class FeishuBridge {
   private async onCardAction(raw: unknown): Promise<unknown> {
     const evt = normalizeCardAction(raw as any)
     const value = (evt?.action?.value || {}) as Record<string, unknown>
+    if (value.routeId) return this.onRouteCardAction(value, evt, raw)
     if (value.modelCardId) return this.onModelCardAction(value, evt)
     // 需求 — new-topic config card: agent change re-renders the model/effort
     // options (dynamic linkage); 开始 creates the session with the chosen config.
@@ -2438,10 +2717,12 @@ export class FeishuBridge {
     const option = evt?.action?.option != null ? String(evt.action.option) : undefined
     const act = String(value.act || '')
     const agents = this.installedAgents()
-    if (act === 'setProject' && option) offer.sel.projectId = option
+    if (act === 'setAssignment') offer.sel.assignment = option === 'auto' ? 'auto' : 'manual'
+    else if (act === 'setProject' && option) offer.sel.projectId = option
     else if (act === 'setRequirement') offer.sel.requirementId = option && option !== '__none__' ? option : undefined
     else if (act === 'setExecutor' && (option === 'agent' || option === 'team')) {
       offer.sel.executor = option
+      if (option === 'team') offer.sel.assignment = 'manual'
       if (option === 'team' && !offer.sel.teamId) offer.sel.teamId = this.availableTeams()[0]?.id
     }
     else if (act === 'setTeam' && option) offer.sel.teamId = option
@@ -2459,10 +2740,27 @@ export class FeishuBridge {
       // Only Agent/模型 change the DOWNSTREAM options (模型 follows Agent, 推理强度
       // follows 模型), so only those re-render the card. 项目/推理强度 have nothing
       // below them — just ACK, so the card doesn't flicker on every pick.
-      const relinks = act === 'setExecutor' || act === 'agentChange' || act === 'setModel'
+      const relinks = act === 'setAssignment' || act === 'setExecutor' || act === 'agentChange' || act === 'setModel'
       return relinks
         ? { toast: { type: 'info', content: '已更新' }, card: { type: 'raw', data: this.topicCard(topicId, offer) } }
         : { toast: { type: 'info', content: '已更新' } }
+    }
+    if (offer.sel.assignment === 'auto' && offer.sel.executor !== 'team') {
+      const status = this.deps.router?.status()
+      if (!status?.enabled || !status.available) return { toast: { type: 'error', content: status?.reason || 'RouterAgent 尚未启用，请手动选择或到设置中启用' } }
+      this.pendingTopics.delete(topicId)
+      const client = this.client
+      void this.beginTopicRouting(offer, true).catch(async error => {
+        this.deps.onError?.(safeErr(error))
+        if (this.client !== client || !client) return
+        const request = await this.deps.router?.request(feishuRouteId(this.clientAppId!, offer.userMessageId))
+        if (request) { await this.syncRouterRequests(); return }
+        offer.error = safeErr(error); offer.sel.assignment = 'manual'
+        this.pendingTopics.set(topicId, offer)
+        const result = await client.im.v1.message.patch({ path: { message_id: offer.cardMessageId! }, data: { content: JSON.stringify(this.topicCard(topicId, offer)) } })
+        if (result.code) throw new FeishuBusinessError(result.code, result.msg)
+      }).catch(error => this.deps.onError?.(safeErr(error)))
+      return { toast: { type: 'info', content: '正在自动路由…' } }
     }
     if (offer.sel.requirementId && !this.deps.getRequirements?.().some((item) => item.id === offer.sel.requirementId && item.status !== 'archived')) {
       return { toast: { type: 'error', content: '所选需求不存在或已归档，请重新选择' } }
@@ -2478,7 +2776,8 @@ export class FeishuBridge {
     const resolved = offer.sel.executor === 'team' ? undefined : this.resolveSelection(offer.sel)
     void (async () => {
       try {
-        const attachments = await this.downloadImages(offer.userMessageId, offer.imageKeys)
+        const attachments = offer.attachments || await this.downloadAttachments(offer.userMessageId, offer)
+        const prompt = offer.text || (offer.files.length ? '[文件]' : '[图片]')
         let title: string
         let leaderSessionId = ''
         if (offer.sel.executor === 'team') {
@@ -2486,13 +2785,13 @@ export class FeishuBridge {
           if (!this.deps.createTeamProject) throw new Error('专家团创建入口不可用')
           const project = await this.deps.createTeamProject({
             teamId: team.id, spaceId: offer.sel.projectId, requirementId: offer.sel.requirementId,
-            prompt: offer.text || '[图片]', attachments
+            prompt, attachments
           }, (created) => {
             leaderSessionId = created.memberSessions[created.team.leaderMemberId]
             if (!leaderSessionId) throw new Error('team_leader_session_missing')
             this.sessionChat.set(leaderSessionId, offer.chatId)
             this.bindTopic(leaderSessionId, offer)
-          }, { prompt: appendFeishuContext(offer.text || '[图片]'), source: 'feishu' })
+          }, { prompt: appendFeishuContext(prompt), source: 'feishu' })
           leaderSessionId = project.memberSessions[project.team.leaderMemberId]
           if (!leaderSessionId) throw new Error('team_leader_session_missing')
           title = project.name
@@ -2585,7 +2884,7 @@ export class FeishuBridge {
     const agents = this.installedAgents()
     const agent = agents.find((a) => a.id === sel.agentId) || agents[0]
     if (!agent) throw new Error('没有可接收飞书消息的 Agent')
-    const pref = this.deps.getAgentPref?.(agent.id)
+    const pref = withLastAgentChoices(this.deps.getAgentPref?.(agent.id))
     const configuredAgent = !settings?.defaultAgentId || settings.defaultAgentId === agent.id || settings.defaultAgentId === agent.adapter
     const permissionMode = resolveAgentPermission(agent, configuredAgent ? settings?.defaultPermissionMode : undefined) || 'read-only'
     const model = resolveAgentModel(agent, sel.model, configuredAgent ? settings?.defaultModel : undefined, pref?.defaultModel)
@@ -2616,38 +2915,45 @@ export class FeishuBridge {
     return session
   }
 
-  private async downloadImages(messageId: string, imageKeys: string[]): Promise<Attachment[]> {
-    if (!imageKeys.length) return []
-    if (!this.client || !messageId) throw new Error('无法下载飞书图片')
-    const keys = [...new Set(imageKeys)]
-    if (keys.length > 10) throw new Error('一条消息最多处理 10 张图片')
+  private async downloadAttachments(messageId: string, content: FeishuMessageContent): Promise<Attachment[]> {
+    const resources: Array<{ kind: Attachment['kind']; key: string; name?: string }> =
+      [...new Set(content.imageKeys)].map(key => ({ kind: 'image', key }))
+    for (const file of content.files) {
+      if (!resources.some(item => item.key === file.fileKey)) resources.push({ kind: 'file', key: file.fileKey, name: file.name })
+    }
+    if (!resources.length) return []
+    if (!this.client || !messageId) throw new Error('无法下载飞书附件')
+    if (resources.length > 10) throw new Error('一条消息最多处理 10 个附件')
     const directory = join(tmpdir(), INTERNAL_DISTRIBUTION ? 'uniagent-feishu-images' : 'uniagent-public-feishu-images')
     await mkdir(directory, { recursive: true, mode: 0o700 })
     const attachments: Attachment[] = []
     try {
-      for (const [index, fileKey] of keys.entries()) {
+      for (const [index, item] of resources.entries()) {
+        const isImage = item.kind === 'image'
+        const limit = isImage ? IMAGE_LIMIT : FILE_LIMIT
+        const label = isImage ? '图片' : '文件'
+        const sizeError = `飞书${label}超过 ${limit / 1024 / 1024} MB 限制`
         const resource = await this.client.im.v1.messageResource.get({
-          params: { type: 'image' },
-          path: { message_id: messageId, file_key: fileKey }
+          params: { type: item.kind },
+          path: { message_id: messageId, file_key: item.key }
         })
         const contentType = responseHeader(resource.headers, 'content-type')
         const contentLength = Number(responseHeader(resource.headers, 'content-length'))
-        if (Number.isFinite(contentLength) && contentLength > IMAGE_LIMIT) {
-          throw new Error('飞书图片超过 10 MB 限制')
-        }
+        if (Number.isFinite(contentLength) && contentLength > limit) throw new Error(sizeError)
         const imageType = FEISHU_IMAGE_TYPES[contentType || ''] || FEISHU_IMAGE_TYPES['image/png']
-        const name = `feishu-image-${index + 1}${imageType.extension}`
-        const path = join(directory, `${randomUUID()}${imageType.extension}`)
+        const name = isImage ? `feishu-image-${index + 1}${imageType.extension}`
+          : basename((item.name || 'feishu-file').replace(/\\/g, '/')).replace(/[\u0000-\u001f\u007f]/g, '') || 'feishu-file'
+        const path = join(directory, `${randomUUID()}${isImage ? imageType.extension : `-${name}`}`)
         try {
           await resource.writeFile(path)
           const metadata = await stat(path)
-          if (!metadata.isFile() || metadata.size === 0) throw new Error('飞书图片为空')
-          if (metadata.size > IMAGE_LIMIT) throw new Error('飞书图片超过 10 MB 限制')
+          if (!metadata.isFile() || metadata.size === 0) throw new Error(`飞书${label}为空`)
+          if (metadata.size > limit) throw new Error(sizeError)
         } catch (error) {
           await rm(path, { force: true }).catch(() => undefined)
           throw error
         }
-        attachments.push({ kind: 'image', path, name, mime: imageType.mime })
+        attachments.push({ kind: item.kind, path, name, mime: isImage ? imageType.mime : contentType })
       }
       return attachments
     } catch (error) {
@@ -2919,7 +3225,8 @@ export function topicConfigCard(
   agents: AgentDef[],
   projects: Project[] | string[],
   requirements: Requirement[] = [],
-  teams: TeamDefinition[] = []
+  teams: TeamDefinition[] = [],
+  router?: { enabled: boolean; available: boolean; reason?: string }
 ): object {
   const projectOptions: Project[] = projects.map((project) => typeof project === 'string'
     ? { id: project, name: project, primaryDirectory: project, additionalDirectories: [], createdAt: 0, updatedAt: 0 }
@@ -2934,6 +3241,16 @@ export function topicConfigCard(
   const opt = (v: string, label: string): object => ({ text: { tag: 'plain_text', content: clip(label, 120) }, value: v })
   const elements: object[] = []
 
+  if (router) {
+    elements.push({ tag: 'markdown', content: '**归属方式**' }, {
+      tag: 'select_static', name: 'assignment', initial_option: sel.assignment || 'manual',
+      options: [opt('manual', '手动选择空间与需求'), ...(router.enabled && router.available ? [opt('auto', '自动归属（RouterAgent）')] : [])],
+      behaviors: [{ type: 'callback', value: { topicId, act: 'setAssignment' } }]
+    })
+    if (!router.enabled || !router.available) elements.push({ tag: 'markdown', content: `自动路由暂不可用：${router.enabled ? router.reason || '配置不可用' : 'RouterAgent 尚未启用'}。可继续手动选择。` })
+  }
+
+  if (sel.assignment !== 'auto') {
   elements.push({ tag: 'markdown', content: '**项目**' })
   elements.push({
     tag: 'select_static', name: 'projectId', initial_option: selectedProjectId,
@@ -2952,6 +3269,7 @@ export function topicConfigCard(
     options: [opt('__none__', '不关联需求'), ...requirements.map((requirement) => opt(requirement.id, requirement.name))],
     behaviors: [{ type: 'callback', value: { topicId, act: 'setRequirement' } }]
   })
+  } else elements.push({ tag: 'markdown', content: '由 RouterAgent 判断空间、需求与任务归属；新建任务使用以下参数，已有任务沿用原配置。' })
 
   elements.push({ tag: 'markdown', content: '**执行方**' })
   elements.push({
@@ -3002,7 +3320,7 @@ export function topicConfigCard(
   }
 
   elements.push({
-    tag: 'button', text: { tag: 'plain_text', content: '开始' }, type: 'primary',
+    tag: 'button', text: { tag: 'plain_text', content: sel.assignment === 'auto' ? '开始自动归属' : '开始' }, type: 'primary',
     disabled: sel.executor === 'team' && !teams.length,
     behaviors: [{ type: 'callback', value: { topicId, act: 'startTopic' } }]
   })
@@ -3272,29 +3590,41 @@ export function extractText(content: string, messageType: string): string {
   return extractMessageContent(content, messageType).text
 }
 
-function extractMessageContent(content: string, messageType: string): { text: string; imageKeys: string[] } {
+function extractMessageContent(content: string, messageType: string): FeishuMessageContent {
   try {
     const parsed = JSON.parse(content)
-    if (messageType === 'text') return { text: typeof parsed?.text === 'string' ? parsed.text.trim() : '', imageKeys: [] }
+    if (messageType === 'text') return { text: typeof parsed?.text === 'string' ? parsed.text.trim() : '', imageKeys: [], files: [] }
     if (messageType === 'image') {
-      return { text: '', imageKeys: typeof parsed?.image_key === 'string' ? [parsed.image_key] : [] }
+      return { text: '', imageKeys: typeof parsed?.image_key === 'string' ? [parsed.image_key] : [], files: [] }
+    }
+    if (messageType === 'file' && typeof parsed?.file_key === 'string' && parsed.file_key.trim()) {
+      return { text: '', imageKeys: [], files: [{ fileKey: parsed.file_key, name: typeof parsed.file_name === 'string' ? parsed.file_name : 'feishu-file' }] }
     }
     if (messageType === 'post' && Array.isArray(parsed?.content)) {
       const parts: string[] = typeof parsed.title === 'string' && parsed.title.trim() ? [parsed.title.trim()] : []
       const imageKeys: string[] = []
+      const files: FeishuMessageFile[] = []
+      for (const file of Array.isArray(parsed.files) ? parsed.files : []) {
+        if (typeof file?.file_key === 'string' && file.file_key.trim() && !file.is_folder) {
+          files.push({ fileKey: file.file_key, name: typeof file.file_name === 'string' ? file.file_name : 'feishu-file' })
+        }
+      }
       for (const line of parsed.content) {
         if (!Array.isArray(line)) continue
         const lineText: string[] = []
         for (const run of line) {
           if (typeof run?.text === 'string') lineText.push(run.text)
           if (typeof run?.image_key === 'string') imageKeys.push(run.image_key)
+          if (typeof run?.file_key === 'string' && run.file_key.trim()) {
+            files.push({ fileKey: run.file_key, name: typeof run.file_name === 'string' ? run.file_name : 'feishu-file' })
+          }
         }
         if (lineText.length) parts.push(lineText.join(''))
       }
-      return { text: parts.join('\n').trim(), imageKeys }
+      return { text: parts.join('\n').trim(), imageKeys, files }
     }
   } catch { /* not JSON */ }
-  return { text: '', imageKeys: [] }
+  return { text: '', imageKeys: [], files: [] }
 }
 
 function responseHeader(headers: any, name: string): string | undefined {

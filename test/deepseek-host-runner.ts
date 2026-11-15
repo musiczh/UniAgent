@@ -36,6 +36,7 @@ class Host {
   nativeIds = new Set<string>()
   lifetime = new AbortController()
   followBaseline = true
+  eventConnections = 0
   async call(method: string, args: any = {}): Promise<any> {
     this.calls.push({ method, args })
     if (method === 'session/create') { this.nativeIds.add(args.request.sessionId); return { sessionId: args.request.sessionId } }
@@ -62,6 +63,7 @@ class Host {
   }
   async *stream(endpoint: string, _args: any, signal: AbortSignal): AsyncGenerator<any> {
     if (endpoint === '$events') {
+      this.eventConnections++
       yield { type: 'ready', clientId: 'client-1', host: { home: '/private' } }
       yield* this.events.read(AbortSignal.any([signal, this.lifetime.signal]))
     } else if (endpoint === 'session/follow') {
@@ -75,6 +77,28 @@ class Host {
 const host = new Host()
 const agent = { id: 'deepseek', adapter: 'deepseek' } as AgentDef
 const config = { agentId: 'deepseek', workdir: '/tmp', model: '["provider","model"]', permissionMode: 'ask' as const }
+for (const fault of ['session-follow', 'shared-events']) {
+  const recoveringHost = new Host()
+  const acquire = async () => recoveringHost as unknown as DeepSeekHostClient
+  const original = new DeepSeekHostRunner('old-router', { n: 0 }, agent, config, undefined, undefined, acquire)
+  const replacement = new DeepSeekHostRunner('new-router', { n: 0 }, agent, config, undefined, undefined, acquire)
+  try {
+    const old = await original.probeSession()
+    if (fault === 'session-follow') recoveringHost.follow.push(null)
+    else recoveringHost.lifetime.abort()
+    await tick(); await tick()
+    await assert.rejects(original.updateConfig(config), error => error instanceof DeepSeekHostError && error.code === 'connection-lost-reopen-session')
+    await original.disposeAndWait()
+    recoveringHost.lifetime = new AbortController()
+    const next = await replacement.probeSession()
+    assert.notEqual(next.nativeSessionId, old.nativeSessionId)
+    assert.equal(recoveringHost.eventConnections, fault === 'shared-events' ? 2 : 1, 'only a failed shared event subscription is replaced')
+    const running = replacement.startTurn('recovered task'); await tick()
+    recoveringHost.native('turn/end', { turn: 1, reason: { kind: 'completed' } })
+    await running
+    assert.equal(recoveringHost.calls.filter(call => call.method === 'session/prompt').length, 1)
+  } finally { await original.disposeAndWait(); await replacement.disposeAndWait(); recoveringHost.lifetime.abort() }
+}
 for (const action of ['interrupt', 'timeout'] as const) {
   const stalledHost = new Host()
   stalledHost.followBaseline = false
@@ -111,6 +135,7 @@ for (const action of ['interrupt', 'timeout'] as const) {
     cancelled.interrupt()
     await pending
     assert.equal(done.at(-1)?.interrupted, true)
+    assert.deepEqual(emitted.filter(event => event.type === 'turn_completed').map(event => event.state), ['cancelled'])
     assert.equal(emitted.some(event => event.type === 'error'), false, 'user cancellation is not a provider failure')
     assert.equal(cancelledHost.calls.some(call => call.method === 'session/prompt'), false)
     cancelledHost.followBaseline = true
@@ -213,6 +238,7 @@ try {
   const texts = events.filter(event => event.type === 'agent_message')
   assert.equal(texts.length, 2); assert.equal(texts[0].payload.id, texts[1].payload.id)
   assert.equal(completions.length, 1); assert.equal(completions[0].failed, false)
+  assert.equal(events.filter(event => event.type === 'turn_completed').length, 1, 'native completion is published exactly once')
   assert.equal((await runner.queryUsage())?.outputTokens, 1)
   const slow = runner.startTurn('Slow'); await tick()
   runner.interrupt(); await tick()
@@ -224,6 +250,7 @@ try {
   await runner.startTurn('conflict'); await tick()
   assert.equal(host.calls.filter(call => call.method === 'session/prompt').length, before + 1, 'occupied writer never retries or queues')
   assert.equal(completions.at(-1).failed, true)
+  assert.deepEqual(events.filter(event => event.type === 'turn_completed').map(event => event.state), ['success', 'cancelled', 'failed'])
   host.promptError = undefined
   const afterFailure = runner.startTurn('next'); await tick()
   host.native('turn/end', { turn: 3, reason: { kind: 'completed' } }); await afterFailure
@@ -249,6 +276,10 @@ try {
   assert.equal(events.filter(event => event.type === 'error').some(event => event.payload.message?.includes('sensitive-provider-detail')), false)
   const disconnecting = runner.startTurn('connection loss'); await tick()
   host.follow.push(null); await disconnecting
+  assert.equal(events.filter(event => event.type === 'turn_completed').length, completions.length, 'connection loss must publish the terminal event consumed by Router')
+  assert.equal(events.at(-1)?.type, 'turn_completed')
+  assert.equal(events.at(-1)?.state, 'failed')
+  assert.equal(events.at(-1)?.payload.nativeSubmission, 'unknown', 'ending local execution does not confirm native delivery')
   const delivered = host.calls.filter(call => call.method === 'session/prompt').length
   await runner.startTurn('manual retry 1')
   const repeated = runner.startTurn('manual retry 2'); await tick()

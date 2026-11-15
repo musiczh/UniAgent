@@ -1,10 +1,13 @@
 import { assistantIdentity } from '../shared/assistant'
+import { appServerForkCapacity, type ForkJob } from '../shared/sessionFork'
+import { forkContextWork } from './forkContextClient'
+import { homedir } from 'node:os'
 import { assistantPrompt } from './assistant/context'
 import { requirementInstructions } from './requirementRuntime'
 import { worktreeInstructions } from './worktreeService'
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { appServerAdditionalDirectoryArgs, codexSandbox } from './adapter'
+import { agentAdditionalDirectories, appServerAdditionalDirectoryArgs, codexSandbox } from './adapter'
 import {
   AppServerRpcClient,
   SharedAppServerRpc,
@@ -13,8 +16,10 @@ import {
 } from './appServerTransport'
 import { readThreadTurnItems } from './appServerHistory'
 import { repairTransplantedSessionHistory } from './history'
+import { sessionStoreWriteCommitted } from './sessionStore'
 import { handoffMcpArgs, uniAgentSessionInstructions } from './handoff'
 import { teamRuntime } from './teamRuntime'
+import { ROUTER_SYSTEM_PROMPT } from '../shared/router'
 import { computeCost } from './pricing'
 import { normalizeCodexRateLimits } from './codexRateLimits'
 import {
@@ -184,6 +189,7 @@ const THREAD_TITLE_PROMPT_MAX_BYTES = 960
 const THREAD_TITLE_MODEL = 'gpt-5.6-luna'
 
 function developerInstructions(config: SessionConfig, sessionId?: string, syncRequirement = true): string {
+  if (config.managedPurpose === 'router') return ROUTER_SYSTEM_PROMPT
   return [
     uniAgentSessionInstructions(),
     assistantIdentity(config.assistantSnapshot),
@@ -315,6 +321,7 @@ export class AppServerRunner extends EventEmitter {
   private negotiatedModelProvider?: string
   private portableCompactionProvider?: string
   private portableCompactionOverrides?: Record<string, unknown>
+  private providerForkFromThreadId?: string
 
   private wireConfig(config = this.config): SessionConfig {
     return this.agent.adapter === 'codex' ? { ...config, model: codexWireModel(config) } : config
@@ -353,6 +360,7 @@ export class AppServerRunner extends EventEmitter {
   private negotiatedModel?: string
   private lastCollaborationModeWireSequence = 0
   private shouldGenerateInitialTitle: boolean
+  private initialTitleGenerationPolicy?: () => boolean
   private initialTitleSeed?: string
   private traexTitleRequestId?: string
   private codexTitleGeneration?: CodexTitleGeneration
@@ -482,7 +490,9 @@ export class AppServerRunner extends EventEmitter {
   shareConnectionWith(parent: AppServerRunner): void {
     if (this.transport || this.sharedTransport) throw new Error('app-server 已连接')
     if (!this.matchesAgentRuntime(parent.agent)) throw new Error('app_server_runtime_changed')
-    if (this.codexCatalogOverride() !== parent.codexCatalogOverride()) return
+    const identity = (runner: AppServerRunner) => (runner.runtimeArgsSnapshot ?? codexAppServerArgs(runner.agent, runner.config))
+      .filter(value => value !== '-c' && !/^(?:model|review_model)=/.test(value))
+    if (JSON.stringify(identity(this)) !== JSON.stringify(identity(parent))) return
     this.sharedRpc = parent.sharedRpc
     this.sharedParent = parent
     const transport = this.sharedRpc.acquire()
@@ -547,7 +557,7 @@ export class AppServerRunner extends EventEmitter {
         state: 'failed',
         payload: { message: `app-server 启动失败: ${err?.message || err}` }
       })
-      this.finishTurn(false, undefined, turnToken, true)
+      this.finishTurn(false, undefined, turnToken, true, false, 'not-accepted')
       return
     }
 
@@ -575,7 +585,8 @@ export class AppServerRunner extends EventEmitter {
       this.turnPricing = { modelId: turnConfig.model, fastMode: !!turnConfig.fastMode }
       const res = await this.rpc(
         'turn/start',
-        buildTurnStartParams(this.agent, this.wireConfig(turnConfig), this.threadId, effectivePrompt, attachments, nativeContext)
+        { ...buildTurnStartParams(this.agent, this.wireConfig(turnConfig), this.threadId, effectivePrompt, attachments, nativeContext),
+          ...(this.exportOutputSchema ? { outputSchema: this.exportOutputSchema } : {}) }
       )
       const nativeTurnId = res?.turn?.id
       if (typeof nativeTurnId !== 'string' || !nativeTurnId) throw new Error('turn/start 未返回 turn id')
@@ -702,6 +713,7 @@ export class AppServerRunner extends EventEmitter {
       this.config.requirementId !== config.requirementId ||
       JSON.stringify(this.config.additionalDirectories || []) !== JSON.stringify(config.additionalDirectories || []) ||
       roleSnapshotChanged(this.config, config) ||
+      worktreeInstructions(this.config) !== worktreeInstructions(config) ||
       runtimeArgsChanged
     this.config = config
     if (threadRuntimeChanged) this.invalidateReadyConnection(runtimeArgsChanged)
@@ -724,6 +736,15 @@ export class AppServerRunner extends EventEmitter {
     if (!seed || this.forkFromThreadId || this.initialTitleSeed) return
     this.initialTitleSeed = seed
     this.shouldGenerateInitialTitle = true
+  }
+
+  /** Omitted policy retains the native Session naming contract. */
+  setInitialTitleGenerationPolicy(policy?: () => boolean): void {
+    this.initialTitleGenerationPolicy = policy
+  }
+
+  private initialTitleGenerationAllowed(): boolean {
+    return this.initialTitleGenerationPolicy?.() !== false
   }
 
   /**
@@ -798,6 +819,10 @@ export class AppServerRunner extends EventEmitter {
     return undefined
   }
 
+  isRunning(): boolean {
+    return !this.disposed && !!(this.startingTurnToken || this.startingReviewToken || this.curTurnId || this.activeGoalTurnToken)
+  }
+
   /**
    * Manually compress the thread's context. Emits a notice on success/failure;
    * the CLI then pushes a `thread/compacted` follow-up.
@@ -809,32 +834,47 @@ export class AppServerRunner extends EventEmitter {
   /** Prepare a portable summary with the destination model before committing its UI config. */
   async compactForProviderSwitch(maxContextTokens?: number, target = this.config): Promise<void> {
     const previous = this.config
+    const previousThreadId = this.threadId
     const reason = codexProviderChanged(previous, target) ? 'provider-switch' : undefined
     try {
       // Only the original provider can decode its opaque compaction summary.
       if (codexProviderChanged(previous, target) && this.providerSwitchNeedsTranslation) {
-        await this.runCompaction(true, undefined, reason)
+        await this.runCompaction(true, undefined, reason, true, target)
       }
-      this.updateConfig(target)
-      await this.runCompaction(true, maxContextTokens, reason)
+      await this.applyProviderConfig(target)
+      await this.runCompaction(false, maxContextTokens, reason, true)
     } catch (error) {
       // 仅失败时还原旧配置。成功后必须留在目标模型：随后的容量复查与
       // applyProviderConfig 会复用当前配置续跑线程，若还原成旧模型，codex 会对
       // 已记录为目标模型的 rollout 再发一条反向的 resume 模型不一致警告。
-      this.updateConfig(previous)
+      this.restoreProviderConfig(previous, previousThreadId)
       throw error
     }
   }
 
-  private async runCompaction(portable: boolean, maxContextTokens?: number, reason?: 'provider-switch'): Promise<void> {
+  /** Migration waits for the real native terminal state without switching providers. */
+  async compactForExport(): Promise<void> { await this.runCompaction(false, undefined, undefined, true) }
+
+  private exportOnlyConfig?: Record<string, unknown>
+  private exportOutputSchema?: Record<string, unknown>
+  async restrictToHandoffExport(outputSchema?: Record<string, unknown>): Promise<void> {
+    this.exportOutputSchema = outputSchema
+    this.exportOnlyConfig = titleGenerationConfig(['uniagent'])
+    await this.ensureReady()
+    const result = await this.rpc('config/read', { includeLayers: false, cwd: this.config.workdir })
+    this.exportOnlyConfig = titleGenerationConfig(['uniagent', ...Object.keys(result?.config?.mcp_servers || {})])
+    this.invalidateReadyConnection()
+  }
+
+  private async runCompaction(portable: boolean, maxContextTokens?: number, reason?: 'provider-switch', strict = portable, portableTarget = this.config): Promise<void> {
     if (this.disposed) {
-      if (portable) throw new Error('app-server 已关闭')
+      if (strict) throw new Error('app-server 已关闭')
       return
     }
     const unavailable = this.compactionActivity.manualUnavailableReason()
     if (unavailable) {
       this.emitRejectedCompaction(unavailable)
-      if (portable) throw new Error(unavailable)
+      if (strict) throw new Error(unavailable)
       return
     }
     try {
@@ -842,13 +882,17 @@ export class AppServerRunner extends EventEmitter {
         const queuedUnavailable = this.compactionActivity.manualUnavailableReason()
         if (queuedUnavailable) {
           this.emitRejectedCompaction(queuedUnavailable)
-          if (portable) throw new Error(queuedUnavailable)
+          if (strict) throw new Error(queuedUnavailable)
           return
         }
         const started = this.compactionLifecycle.beginInvocation()
         let release!: (result: CompactionTransition) => void
         const terminal = new Promise<CompactionTransition>((resolve) => { release = resolve })
-        const invocation = { id: started.id, reason, requesting: false, requireTurnCompletion: portable, turnCompleted: false } as NonNullable<typeof this.manualCompaction>
+        const invocation = { id: started.id, reason, requesting: false, requireTurnCompletion: strict, turnCompleted: false } as NonNullable<typeof this.manualCompaction>
+        const originalThreadId = this.threadId
+        const originalConfig = this.config
+        const originalUsage = this.lastTokenUsage
+        let portableThreadId: string | undefined
         this.manualCompaction = invocation
         this.compactionWaiters.set(started.id, result => {
           invocation.itemResult = result
@@ -864,7 +908,7 @@ export class AppServerRunner extends EventEmitter {
             const provider = this.threadModelParams().modelProvider || this.nativeModelProvider
             this.portableCompactionProvider = provider
             this.portableCompactionOverrides = {}
-            // Built-in OpenAI ignores overrides under its own id; an alias retains
+            // Built-in OpenAI rejects overrides under its own id; an alias retains
             // its endpoint/auth and changes only the compaction capability.
             if (provider === 'openai') {
               this.portableCompactionProvider = 'uniagent-portable-openai'
@@ -879,11 +923,13 @@ export class AppServerRunner extends EventEmitter {
               for (const [key, value] of Object.entries(definition)) {
                 this.portableCompactionOverrides[`model_providers.${this.portableCompactionProvider}.${key}`] = value
               }
+              this.providerForkFromThreadId = this.threadId
             }
             // Cold resume applies capability overrides; a warm subscribed thread ignores them.
-            this.invalidateReadyConnection()
+            this.invalidateReadyConnection(provider === 'openai')
             await this.ensureReady()
             this.assertNegotiatedModel()
+            if (provider === 'openai') portableThreadId = this.threadId
           }
           const usageSerial = this.tokenUsageSerial
           if (this.contextRecovery?.cancelled) throw new Error('压缩接续已中断')
@@ -901,8 +947,10 @@ export class AppServerRunner extends EventEmitter {
           // notifications are the authoritative terminal signal; waiting here
           // keeps the next invocation out of the ambiguous pre-alias window.
           const outcome = await terminal
-          if (portable && outcome.state !== 'success') throw new Error(outcome.error || '上下文压缩失败')
-          if (portable) {
+          if (timeout) clearTimeout(timeout)
+          timeout = undefined
+          if (strict && outcome.state !== 'success') throw new Error(outcome.error || '上下文压缩失败')
+          if (portable || maxContextTokens != null) {
             const contextTokens = contextTokenCount(this.lastTokenUsage)
             if (this.tokenUsageSerial <= usageSerial || contextTokens == null) {
               throw new Error('未收到压缩后的上下文用量，无法确认目标模型能接续')
@@ -911,9 +959,27 @@ export class AppServerRunner extends EventEmitter {
               throw new Error(`压缩后的上下文 ${contextTokens} tokens 仍超过目标模型限制 ${maxContextTokens} tokens`)
             }
           }
+          if (this.contextRecovery?.cancelled) throw new Error('压缩接续已中断')
+          if (portableThreadId) {
+            this.portableCompactionProvider = undefined
+            this.portableCompactionOverrides = undefined
+            this.updateConfig(portableTarget)
+            this.providerForkFromThreadId = portableThreadId
+            this.invalidateReadyConnection(true)
+            await this.ensureReady()
+            this.assertNegotiatedModel()
+            if (this.contextRecovery?.cancelled) throw new Error('压缩接续已中断')
+            await this.rpc('thread/archive', { threadId: portableThreadId })
+          }
         } catch (err: any) {
+          if (portable) {
+            this.portableCompactionProvider = undefined
+            this.portableCompactionOverrides = undefined
+            this.restoreProviderConfig(originalConfig, originalThreadId)
+            this.lastTokenUsage = originalUsage
+          }
           this.emitContextCompaction(this.compactionLifecycle.failInvocation(started.id, err?.message || String(err)))
-          if (portable) throw err
+          if (strict) throw err
         } finally {
           if (timeout) clearTimeout(timeout)
           this.compactionWaiters.delete(started.id)
@@ -921,14 +987,14 @@ export class AppServerRunner extends EventEmitter {
           if (portable) {
             this.portableCompactionProvider = undefined
             this.portableCompactionOverrides = undefined
-            this.invalidateReadyConnection()
+            if (!portableThreadId) this.invalidateReadyConnection(true)
           }
         }
       })
     } catch (err) {
       // dispose() closes the queue so queued IPC calls settle without starting
       // another app-server. Other failures remain visible to the caller.
-      if (portable || !this.disposed) throw err
+      if (strict || !this.disposed) throw err
     }
   }
 
@@ -950,11 +1016,60 @@ export class AppServerRunner extends EventEmitter {
     return Math.max(tokens ?? 0, budget.tokens)
   }
 
-  async applyProviderConfig(config: SessionConfig, contextWindow?: number): Promise<void> {
-    this.updateConfig(config)
+  /** Validate a private imported thread without sending a model turn or executing its history. */
+  async validateForkContext(contextTokens: number, modelWindow: number): Promise<NonNullable<ForkJob['capacity']>> {
     await this.ensureThreadReady()
-    this.assertNegotiatedModel()
-    if (contextWindow) this.emitLiveContext({ ...this.lastTokenUsage, modelContextWindow: contextWindow })
+    if (this.agent.adapter === 'codex') this.assertNegotiatedModel()
+    else if (!this.negotiatedModel || this.negotiatedModel.toLowerCase() !== this.config.model?.toLowerCase()) throw new Error('目标 Agent 未应用所选模型')
+    const { config } = await this.rpc('config/read', { includeLayers: false, cwd: this.config.workdir })
+    const catalog = await forkContextWork<{ window?: number; deferredTools: boolean }>('catalog', {
+      home: homedir(), agentId: this.agent.id, model: this.negotiatedModel,
+      catalog: typeof config?.model_catalog_json === 'string' ? config.model_catalog_json : undefined
+    })
+    const window = Math.min(modelWindow, catalog.window || modelWindow,
+      typeof config?.model_context_window === 'number' && config.model_context_window > 0 ? config.model_context_window : modelWindow)
+    let toolTokens = 0, cursor: string | null = null
+    const seen = new Set<string>()
+    do {
+      const page = await this.rpc('mcpServerStatus/list', { threadId: this.threadId, cursor, limit: 100, detail: 'toolsAndAuthOnly' })
+      if (!Array.isArray(page?.data)) throw new Error('目标工具容量暂无法确认，请重试')
+      for (const server of page.data) {
+        if (server.toolsError) throw new Error('目标工具声明尚未加载，无法检查容量，请重试')
+        // Deferred MCP schemas are loaded by a future search, not part of a new thread's prompt.
+        // Output schemas are not function input declarations even for eagerly loaded tools.
+        if (!catalog.deferredTools) toolTokens += Math.ceil(Buffer.byteLength(JSON.stringify(Object.values(server.tools || {}).map((tool: any) => ({
+          name: tool.name, description: tool.description, parameters: tool.inputSchema
+        })))) / 2)
+      }
+      cursor = page.nextCursor || null
+      if (cursor && (seen.has(cursor) || seen.size >= 100)) throw new Error('目标工具列表分页异常')
+      if (cursor) seen.add(cursor)
+    } while (cursor)
+    return appServerForkCapacity(contextTokens, window, toolTokens,
+      typeof config?.model_max_output_tokens === 'number' ? config.model_max_output_tokens : undefined)
+  }
+
+  async applyProviderConfig(config: SessionConfig, contextWindow?: number): Promise<void> {
+    const previous = this.config, previousThreadId = this.threadId
+    const fork = this.agent.adapter === 'codex' && previousThreadId && codexProviderChanged(previous, config)
+    this.updateConfig(config)
+    if (previous.model !== config.model && !fork) this.invalidateReadyConnection()
+    if (fork) this.providerForkFromThreadId = previousThreadId
+    try {
+      await this.ensureThreadReady()
+      this.assertNegotiatedModel()
+      if (contextWindow) this.emitLiveContext({ ...this.lastTokenUsage, modelContextWindow: contextWindow })
+    } catch (error) {
+      this.restoreProviderConfig(previous, previousThreadId)
+      throw error
+    }
+  }
+
+  restoreProviderConfig(config: SessionConfig, threadId?: string): void {
+    this.updateConfig(config)
+    this.invalidateReadyConnection(true)
+    this.threadId = threadId
+    this.providerForkFromThreadId = undefined
   }
 
   private assertNegotiatedModel(): void {
@@ -1166,7 +1281,7 @@ export class AppServerRunner extends EventEmitter {
     sideConfig?: SessionConfig
   ): Promise<string> {
     const snapshot = liveTurnSnapshot(
-      structuredClone(events),
+      events,
       this.activeTurnPrompt,
       [...this.currentTurnSnapshotEvents(), ...this.completedTurnSnapshotEvents]
     )
@@ -1292,7 +1407,7 @@ export class AppServerRunner extends EventEmitter {
         if (temporary) {
           await transport.start()
           await transport.request('initialize', {
-            clientInfo: { name: 'uniagent', version: '1.0.0' },
+            clientInfo: { name: this.agent.adapter === 'codex' ? 'uniagent_codex' : 'uniagent', version: '1.0.0' },
             capabilities: { experimentalApi: true }
           })
           transport.notify('initialized', {})
@@ -1434,6 +1549,13 @@ export class AppServerRunner extends EventEmitter {
     this.lastCollaborationModeWireSequence = 0
   }
 
+  async waitForDisposal(): Promise<void> {
+    this.dispose()
+    await Promise.allSettled([...this.pendingThreadDeletes])
+    this.dispose()
+    await this.retiringTransport
+  }
+
   // ---- connection lifecycle ----
 
   private sessionDeveloperInstructions(): string {
@@ -1517,7 +1639,7 @@ export class AppServerRunner extends EventEmitter {
     await attempt.transport.start()
     this.assertConnectionAttempt(attempt)
     await this.connectionRpc(attempt, 'initialize', {
-      clientInfo: { name: 'uniagent', version: '1.0.0' },
+      clientInfo: { name: this.agent.adapter === 'codex' ? 'uniagent_codex' : 'uniagent', version: '1.0.0' },
       capabilities: { experimentalApi: true }
     })
     this.connectionNotify(attempt, 'initialized', {})
@@ -1555,6 +1677,26 @@ export class AppServerRunner extends EventEmitter {
       if (this.persistentFork) this.emit('nativeThreadReady', prepared.threadId)
     }
     const resumeThreadId = this.threadId
+    if (this.providerForkFromThreadId) {
+      const original = this.providerForkFromThreadId
+      const res = await this.connectionRpc<any>(attempt, 'thread/fork', {
+        threadId: original, ephemeral: this.resumeEphemeral || !!this.forkPreparation && !this.persistentFork, excludeTurns: true,
+        cwd: this.config.workdir, sandbox, approvalPolicy, developerInstructions: sessionDeveloperInstructions,
+        ...reviewerParam, ...this.threadModelParams(), config: this.threadConfigOverrides(this.sessionId, !!this.forkPreparation || this.resumeEphemeral)
+      })
+      const id = stringValue(res?.thread?.id)
+      if (!id || id === original) throw new Error('Codex 来源切换未返回新的原生会话')
+      this.negotiatedModel = stringValue(res?.model) || stringValue(res?.thread?.model)
+      this.negotiatedModelProvider = stringValue(res?.modelProvider) || stringValue(res?.thread?.modelProvider)
+      this.assertNegotiatedModel()
+      await this.refreshGoalFromProvider(id, attempt)
+      if (this.config.collaborationMode === 'plan') await this.applyCollaborationMode('plan', id, this.negotiatedModel, attempt)
+      this.threadId = id
+      attempt.transport.claimThread?.(id)
+      this.providerForkFromThreadId = undefined
+      this.emitEvent({ type: 'system_notice', payload: { kind: 'model_provider_fork', text: `Codex 已从原生会话 ${original} 的历史创建当前来源的原生会话 ${id}。` } })
+      return
+    }
     if (resumeThreadId) {
       // A crash-reconnect OR the first turn of a WRITABLE session (需求1): resume
       // the same thread to keep context.
@@ -1818,14 +1960,22 @@ export class AppServerRunner extends EventEmitter {
     const permissionMode = this.requirePermissionMode()
     const cmd = this.agent.bin
     this.runtimeArgsSnapshot = codexAppServerArgs(this.agent, this.config)
-    // The model manager reads its catalog at process startup. Keep provider,
-    // model and MCP settings thread-scoped so sibling threads retain their identity.
+    // The native process and its threads must agree on the configured Provider.
     const args = ['app-server']
-    if (this.agent.adapter === 'codex') args.push('-c', 'thread_unload_delay_secs=0')
+    if (this.agent.adapter === 'codex') args.push(...this.runtimeArgsSnapshot, '-c', 'thread_unload_delay_secs=0')
+    if (this.agent.adapter === 'codex' && this.portableCompactionProvider) {
+      for (const [key, value] of Object.entries(this.portableCompactionOverrides || {})) {
+        if (value && typeof value === 'object') {
+          for (const [header, content] of Object.entries(value)) args.push('-c', `${key}.${JSON.stringify(header)}=${JSON.stringify(content)}`)
+        } else args.push('-c', `${key}=${JSON.stringify(value)}`)
+      }
+      args.push('-c', `model_provider=${JSON.stringify(this.portableCompactionProvider)}`,
+        '-c', `model_providers.${this.portableCompactionProvider}.capabilities.remote_compaction="unsupported"`)
+    }
     const catalog = this.codexCatalogOverride()
-    if (catalog) args.push('-c', catalog)
+    if (catalog && this.agent.adapter !== 'codex') args.push('-c', catalog)
     if (this.agent.adapter !== 'codex') {
-      args.push(...appServerAdditionalDirectoryArgs(this.config.workdir, this.config.additionalDirectories))
+      args.push(...appServerAdditionalDirectoryArgs(this.config.workdir, agentAdditionalDirectories(this.config)))
     }
     if (this.agent.adapter === 'traex' && this.config.maxMode) {
       args.push('-c', 'model_backend_variant="max"')
@@ -1958,25 +2108,25 @@ export class AppServerRunner extends EventEmitter {
   private retireTransport(transport: AppServerRpc): void {
     if (this.retiredTransports.has(transport)) return
     this.retiredTransports.add(transport)
-    this.retiringTransport = transport.dispose(true).catch(() => {})
+    this.retiringTransport = Promise.allSettled([this.retiringTransport, transport.dispose(true)]).then(() => {})
   }
 
   private threadConfigOverrides(sessionId = this.sessionId, side = false, config = this.config): Record<string, unknown> {
     const args = [
       ...codexAppServerArgs(this.agent, config),
-      ...appServerAdditionalDirectoryArgs(config.workdir, config.additionalDirectories),
+      ...appServerAdditionalDirectoryArgs(config.workdir, agentAdditionalDirectories(config)),
       ...handoffMcpArgs(this.agent.adapter, sessionId, !side, !side)
     ]
     const overrides = Object.fromEntries(args.filter(arg => arg !== '-c').map(arg => {
       const separator = arg.indexOf('=')
       return [arg.slice(0, separator), JSON.parse(arg.slice(separator + 1))]
     }))
-    if (this.portableCompactionProvider && !side) {
+    if (this.portableCompactionProvider) {
       Object.assign(overrides, this.portableCompactionOverrides)
       overrides.model_provider = this.portableCompactionProvider
       overrides[`model_providers.${this.portableCompactionProvider}.capabilities.remote_compaction`] = 'unsupported'
     }
-    return overrides
+    return { ...overrides, ...this.exportOnlyConfig }
   }
 
   private codexCatalogOverride(): string | undefined {
@@ -2276,6 +2426,7 @@ export class AppServerRunner extends EventEmitter {
           p?.turnId === this.traexTitleRequestId
         ) {
           this.traexTitleRequestId = undefined
+          if (!this.initialTitleGenerationAllowed()) break
           if (title) this.emit('sessionInfo', { title, persistProvider: true })
           else if (typeof p?.name === 'string') {
             // An empty generated name is a valid no-result response. Keep the
@@ -2739,7 +2890,7 @@ export class AppServerRunner extends EventEmitter {
   }
 
   private maybeGenerateInitialTitle(userMessage: string): void {
-    if (!this.shouldGenerateInitialTitle || !userMessage || !this.threadId) return
+    if (!this.initialTitleGenerationAllowed() || !this.shouldGenerateInitialTitle || !userMessage || !this.threadId) return
     this.shouldGenerateInitialTitle = false
     if (this.agent.adapter === 'traex') {
       const requestId = randomUUID()
@@ -2757,11 +2908,12 @@ export class AppServerRunner extends EventEmitter {
 
   private async generateCodexTitle(userMessage: string): Promise<void> {
     const transport = this.transport
-    if (!transport || !this.threadId) return
+    if (!this.initialTitleGenerationAllowed() || !transport || !this.threadId) return
     const connectionGeneration = this.connectionGeneration
     let titleThreadId: string | undefined
     let stage = 'config/read'
     const request = async <T>(method: string, params: any): Promise<T> => {
+      if (!this.initialTitleGenerationAllowed()) throw new Error('session_title_generation_disabled')
       if (!this.isTransportOwner(connectionGeneration, transport)) throw new Error('app-server 已关闭')
       const result = await transport.request<T>(method, params)
       if (!this.isTransportOwner(connectionGeneration, transport)) throw new Error('app-server 已关闭')
@@ -2792,7 +2944,7 @@ export class AppServerRunner extends EventEmitter {
           // -c 覆盖，provider 定义（uniagent-local / uniagent-<source>）必须随
           // 每线程 config 下发，否则 thread/start 直接报 Model provider not found。
           ...this.threadConfigOverrides(this.sessionId, true),
-          ...titleGenerationConfig(mcpServers)
+          ...titleGenerationConfig(['uniagent', ...mcpServers])
         }
       })
       titleThreadId = stringValue(response?.thread?.id)
@@ -2818,7 +2970,7 @@ export class AppServerRunner extends EventEmitter {
     } catch (error) {
       this.codexTitleGeneration = undefined
       this.shouldGenerateInitialTitle = true
-      this.emitDiagnostic('title_generation_failed', {
+      if (this.initialTitleGenerationAllowed()) this.emitDiagnostic('title_generation_failed', {
         stage,
         message: extractMsg(error)
       })
@@ -2842,9 +2994,10 @@ export class AppServerRunner extends EventEmitter {
     if (method !== 'turn/completed') return
     this.codexTitleGeneration = undefined
     const title = p?.turn?.status === 'completed' ? parseThreadTitle(generation.response) : undefined
-    if (title) {
+    const allowed = this.initialTitleGenerationAllowed()
+    if (allowed && title) {
       this.emit('sessionInfo', { title, persistProvider: true })
-    } else {
+    } else if (allowed) {
       this.shouldGenerateInitialTitle = true
       this.emitDiagnostic('title_generation_failed', {
         stage: 'response',
@@ -3411,7 +3564,7 @@ export class AppServerRunner extends EventEmitter {
       this.emitEvent({
         type: 'error',
         state: 'failed',
-        payload: { message: turn.error ? extractMsg(turn.error) : '原生 turn 执行失败' }
+        payload: { message: turn.error ? extractMsg(turn.error) : '原生 turn 执行失败', providerError: turn.error, turnId: completedTurnId }
       })
     }
     // An interrupted turn (user pressed 中止, G2-9) is a normal, expected end —
@@ -3447,12 +3600,11 @@ export class AppServerRunner extends EventEmitter {
       void this.reconcilePendingImageGenerations(completedTurnId)
     }
     this.emitTurnUsage(turn?.durationMs)
-    this.finishTurn(interrupted, completedTurnId, undefined, failed)
+    this.finishTurn(interrupted, completedTurnId, undefined, failed, false, failed ? 'accepted' : undefined)
   }
 
   private canRecoverContextOverflow(error: any): boolean {
-    const source = this.config.modelSource ?? (this.config.model ? parseCodexModelKey(this.config.model)?.source : undefined)
-    return this.agent.adapter === 'codex' && source?.kind === 'third-party' &&
+    return this.agent.adapter === 'codex' &&
       !!(this.activeTurnToken || this.startingTurnToken) && !this.contextOverflowRetried &&
       !this.manualCompaction && !this.interrupting &&
       (error?.codexErrorInfo === 'contextWindowExceeded' || !!providerContextLimit(extractMsg(error)))
@@ -3460,16 +3612,24 @@ export class AppServerRunner extends EventEmitter {
 
   private async recoverContextOverflow(turnId: string): Promise<void> {
     const recovery = { cancelled: false }
+    const originalThreadId = this.threadId
+    const originalConfig = this.config
+    const originalUsage = this.lastTokenUsage
     this.contextRecovery = recovery
     this.emitEvent({ type: 'system_notice', payload: { kind: 'notice', text: '目标模型的实际请求超过上下文上限，正在压缩后自动接续。' } })
     try {
       await this.runCompaction(true)
       if (this.disposed) return
       if (recovery.cancelled) throw new Error('压缩接续已中断')
+      if (this.threadId && this.threadId !== originalThreadId) this.emit('nativeThreadRebound', this.threadId)
       // The failed native turn already persisted the user's text and attachments.
       await this.startTurn('', undefined, undefined, true)
     } catch (error: any) {
       if (this.disposed) return
+      if (!sessionStoreWriteCommitted(error)) {
+        this.restoreProviderConfig(originalConfig, originalThreadId)
+        this.lastTokenUsage = originalUsage
+      }
       if (!recovery.cancelled) this.emitEvent({ type: 'error', state: 'failed', payload: { message: `上下文压缩后接续失败：${error?.message || error}` } })
       this.emitEvent({ type: 'turn_completed', state: recovery.cancelled ? 'cancelled' : 'failed', payload: { turnId } })
       this.emit('done', { nativeSessionId: this.threadId, interrupted: recovery.cancelled, ...(!recovery.cancelled ? { failed: true } : {}) })
@@ -3481,6 +3641,8 @@ export class AppServerRunner extends EventEmitter {
   private adoptProviderTurn(turnId: string): void {
     const turnToken = this.activeTurnToken || this.startingTurnToken
     if (!turnToken || this.completedTurnIds.has(turnId) || this.curTurnId === turnId) return
+    // A Goal spans native turns; each new turn's wait needs its own timeline node.
+    if (this.curTurnId) this.queueWait = undefined
     this.curTurnId = turnId
     this.completedAgentTurnToken = undefined
     this.clearFinalAnswerCompletionFallback(turnToken)
@@ -3800,7 +3962,8 @@ export class AppServerRunner extends EventEmitter {
     expectedTurnId?: string,
     expectedToken?: string,
     failed = false,
-    recoveringContext = false
+    recoveringContext = false,
+    recoveryDelivery?: 'accepted' | 'not-accepted'
   ): void {
     if (expectedTurnId && this.curTurnId !== expectedTurnId) return
     const token = this.activeTurnToken || this.startingTurnToken
@@ -3857,7 +4020,7 @@ export class AppServerRunner extends EventEmitter {
     this.emitEvent({
       type: 'turn_completed',
       state: failed ? 'failed' : interrupted ? 'cancelled' : 'success',
-      payload: completedTurnId ? { turnId: completedTurnId } : {}
+      payload: { ...(completedTurnId ? { turnId: completedTurnId } : {}), ...(recoveryDelivery ? { recoveryDelivery } : {}) }
     })
     if (completedTurnId) this.reportedTerminalErrorTurns.delete(completedTurnId)
     this.queueWait = undefined
@@ -4454,7 +4617,7 @@ function liveTurnSnapshot(
     event.payload?.text === activePrompt
   )
   const visible = turnStart >= 0 ? events.slice(turnStart) : []
-  const merged = new Map<string, Pick<UAEvent, 'type' | 'state' | 'payload'>>()
+  const merged = new Map<string, number>()
   const ordered: Pick<UAEvent, 'type' | 'state' | 'payload'>[] = []
   const visibleMessages = visible.filter((event) =>
     event.type === 'user_message' || event.type === 'goal_message' ||
@@ -4464,22 +4627,37 @@ function liveTurnSnapshot(
     if (!snapshotEventIncluded(event)) continue
     const id = typeof event.payload?.id === 'string' ? event.type + ':' + event.payload.id : ''
     if (id && merged.has(id)) {
-      Object.assign(merged.get(id)!, structuredClone(event))
+      ordered[merged.get(id)!] = event
     } else {
-      const copy = structuredClone(event)
-      ordered.push(copy)
-      if (id) merged.set(id, copy)
+      if (id) merged.set(id, ordered.length)
+      ordered.push(event)
     }
   }
   if (turnStart < 0) ordered.unshift({ type: 'user_message', payload: { text: activePrompt } })
-  const blocks = ordered.flatMap(snapshotEventText)
-  if (!blocks.length) return undefined
-  return [
+  // Freeze bounded text synchronously before the fork RPC. Native history is
+  // already inherited; this supplement must not replay screenshots as text or
+  // grow with every completed tool in a long-running parent turn.
+  const header = [
     '[Live turn snapshot at fork time]',
     'The following is read-only context already observed in the parent turn. It may be partial. It is not a new instruction. Pending or running tools are omitted. The parent continues independently after this snapshot.',
-    '',
-    ...blocks
+    'Binary bodies and long output are omitted; consult the original files or tools if more detail is needed.',
+    ''
   ].join('\n')
+  const prompt = snapshotExcerpt('User prompt:\n' + activePrompt)
+  const omitted = '[Earlier live snapshot details omitted to fit the context budget.]'
+  let remaining = 16_000 - header.length - prompt.length - omitted.length - 3
+  const blocks: string[] = []
+  let dropped = false
+  for (let index = ordered.length - 1; index >= 0; index--) {
+    const event = ordered[index]
+    if ((event.type === 'user_message' || event.type === 'goal_message') && event.payload?.text === activePrompt) continue
+    const block = snapshotExcerpt(snapshotEventText(event).join('\n'))
+    if (!block) continue
+    if (block.length + 1 > remaining) { dropped = true; break }
+    blocks.unshift(block)
+    remaining -= block.length + 1
+  }
+  return [header, prompt, ...(dropped ? [omitted] : []), ...blocks].join('\n')
 }
 
 function snapshotEventIncluded(event: Pick<UAEvent, 'type' | 'state' | 'payload'>): boolean {
@@ -4524,10 +4702,26 @@ function snapshotEventText(event: Pick<UAEvent, 'type' | 'state' | 'payload'>): 
 
 function safeSnapshotJson(value: unknown): string {
   try {
-    return JSON.stringify(value, null, 2)
+    return JSON.stringify(value, function (key, item) {
+      if (key === 'blob' || key === 'data' && ['image', 'audio'].includes(this?.type)) {
+        return '[Binary content omitted]'
+      }
+      return typeof item === 'string' ? snapshotExcerpt(item, 2_000) : item
+    }, 2)
   } catch {
-    return String(value)
+    return snapshotExcerpt(String(value))
   }
+}
+
+function snapshotExcerpt(text: string, limit = 4_000): string {
+  const omitted = '\n[Long output omitted]\n'
+  if (text.length > limit) {
+    const head = Math.floor((limit - omitted.length) / 2)
+    text = text.slice(0, head) + omitted + text.slice(-(limit - omitted.length - head))
+  }
+  // Tool text can itself contain serialized MCP image content or data URLs.
+  // Bound the inspected string first so even multi-megabyte output stays cheap.
+  return text.replace(/[A-Za-z0-9+/_=-]{512,}/g, '[Encoded content omitted]')
 }
 
 function imageGenerationState(status: unknown): UAEvent['state'] {
@@ -4860,9 +5054,6 @@ export function titleGenerationConfig(mcpServers: string[]): Record<string, unkn
     'features.view_image': false,
     'orchestrator.skills.enabled': false,
     'skills.include_instructions': false,
-    // 交接 MCP 由 threadConfigOverrides 按线程注入，config/read 看不到，需显式关闭；
-    // 标题线程不需要它，也避免 config.toml 里用户同名服务器被意外启用。
-    'mcp_servers.uniagent.enabled': false,
     'tools.experimental_request_user_input.enabled': false,
     'tools.update_plan.enabled': false,
     web_search: 'disabled',

@@ -1,3 +1,4 @@
+import { qoderOperation } from './qoderSdk'
 import type { AgentDef, CodexRateLimits } from '../shared/types'
 import type { CodexSourceQuota } from '../shared/codexSources'
 import { accountQuota, hasQuotaData, type AgentQuotaSnapshot } from '../shared/agentQuota'
@@ -61,6 +62,14 @@ export class AgentQuotaService {
       case 'codex': return accountQuota(await refreshCodexRateLimits(agent.bin))
       case 'traex': return accountQuota(await queryAppServerRateLimits(agent.bin))
       case 'claude': return accountQuota(getClaudeRateLimits())
+      case 'qoder': {
+        const usage = await qoderOperation(agent.bin, 'usage')
+        const windows = ([['套餐 Credits', usage?.userQuota], ['加购 Credits', usage?.addOnQuota]] as const).flatMap(([label, bucket]) => {
+          const percentage = bucket?.percentage ?? (bucket?.total > 0 && typeof bucket.used === 'number' ? bucket.used / bucket.total * 100 : undefined)
+          return typeof percentage === 'number' && Number.isFinite(percentage) ? [{ label, usedPercent: Math.max(0, Math.min(100, percentage)) }] : []
+        })
+        return windows.length ? { status: 'ready', kind: 'windows', windows, planType: usage.userType, capturedAt: Date.now() } : null
+      }
       case 'kimi': return this.kimi.get(agent.bin)
       case 'deepseek': return getDeepSeekQuota()
       case 'grok': {

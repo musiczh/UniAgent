@@ -1,10 +1,8 @@
+import { testedAgentVersion } from './agentCompatibility'
+
 export const DEEPSEEK_PACKAGE = '@deepseek-ai/dsh'
-/**
- * The only release qualified against the UniAgent Host/ACP contract. DeepSeek
- * asks for >= 0.2.1-rc.1 alongside DeepSeek-V4.1-Flash-1017, so that release
- * line is the verified one; every other version stays refused until requalified.
- */
-export const DEEPSEEK_VERIFIED_VERSION = '0.2.1-rc.2'
+/** Recommended installation version; other versions continue actual protocol checks. */
+export const DEEPSEEK_VERIFIED_VERSION = testedAgentVersion('deepseek')!
 export const DEEPSEEK_BASE_URL = 'https://api.deepseek.com/anthropic'
 export const DEEPSEEK_IPC = { get: 'deepseek:get', save: 'deepseek:save', check: 'deepseek:check', install: 'deepseek:install',
   cancelInstall: 'deepseek:cancel-install', signIn: 'deepseek:sign-in', cancelSignIn: 'deepseek:cancel-sign-in',

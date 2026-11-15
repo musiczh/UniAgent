@@ -14,7 +14,8 @@ import { teamInstructions } from '../src/main/teamContext'
 
 const config = { agentId: 'codex', projectId: 'p', workdir: '/w', requirementId: 'req-1' } as SessionConfig
 const session = { id: 's1', config } as Session
-configureRequirementRuntime((id) => (id === 's1' ? session : undefined))
+const unissued = { id: 's2', config: { ...config } } as Session
+configureRequirementRuntime((id) => (id === 's1' ? session : id === 's2' ? unissued : undefined))
 
 try {
   assert.equal(isRequirementsEnabled(), false, 'switch starts disabled before settings load')
@@ -28,12 +29,35 @@ try {
   assert.ok(requirementMcpEnv('s1').UNIAGENT_REQUIREMENT_TOKEN)
   const token = requirementMcpEnv('s1').UNIAGENT_REQUIREMENT_TOKEN
   assert.equal(requirementCaller('s1', token), session)
+  const rejected = (id: string, value: string, code: string, message: RegExp): void => {
+    assert.throws(() => requirementCaller(id, value), (error: any) => {
+      assert.match(error.message, message)
+      assert.equal(error.details.code, code)
+      assert.equal(typeof error.details.hint, 'string')
+      assert.ok(error.details.hint.length > 0)
+      assert.ok(!JSON.stringify(error.details).includes(token), 'diagnostics never disclose a capability')
+      return true
+    })
+  }
+  rejected('missing', token, 'requirement_session_not_found', /会话不存在/)
+  rejected('s1', '', 'requirement_token_missing', /缺少.*凭证/)
+  rejected('s2', 'unissued-fixture', 'requirement_binding_missing', /尚未建立.*连接/)
+  rejected('s1', 'invalid-fixture', 'requirement_token_mismatch', /凭证.*不匹配/)
+  config.requirementId = undefined
+  rejected('s1', token, 'requirement_not_bound', /未绑定需求/)
+  config.requirementId = 'req-2'
+  rejected('s1', token, 'requirement_binding_changed', /需求.*变更/)
+  const replacement = requirementMcpEnv('s1').UNIAGENT_REQUIREMENT_TOKEN
+  assert.notEqual(replacement, token)
+  assert.equal(requirementCaller('s1', replacement), session)
+  config.requirementId = 'req-1'
+  requirementMcpEnv('s1')
 
   setRequirementsEnabled(false)
   assert.equal(isRequirementsEnabled(), false)
   assert.equal(requirementInstructions(config), '', 'no prompt injection while disabled')
   assert.deepEqual(requirementMcpEnv('s1'), {}, 'no MCP token while disabled')
-  assert.throws(() => requirementCaller('s1', token), /需求功能已停用/, 'in-flight tokens are rejected while disabled')
+  rejected('s1', token, 'requirement_disabled', /需求功能已停用/)
   assert.equal(requirementInstructions({ ...config, requirementId: undefined }), '')
 
   // 团队内联需求指令同样被门控。

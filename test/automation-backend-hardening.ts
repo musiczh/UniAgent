@@ -92,6 +92,9 @@ test('automation backend confines paths and applies weekday-only schedules', asy
       await writeFile(rawPath, rawOriginal)
       assert.equal(await updateAutomation(rawPath, { schedule: 'raw text exactly' }), false)
       assert.equal(await readFile(rawPath, 'utf8'), rawOriginal)
+      assert.equal(await updateAutomation(rawPath, { schedule: 'ONCE:2026-11-01T09:00:00+08:00' }), false,
+        'CLI-owned tasks must not receive the UniAgent-only one-off expression')
+      assert.equal(await readFile(rawPath, 'utf8'), rawOriginal)
     })
 
     await t.test('rejects an invalid cron atomically', async () => {

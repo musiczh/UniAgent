@@ -3,6 +3,7 @@ import { constants as fsConstants, existsSync } from 'node:fs'
 import { access, chmod, lstat, mkdir, open, readFile, readdir, readlink, realpath, stat } from 'node:fs/promises'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import * as TOML from '@iarna/toml'
+import { qoderConfigRoot } from '../qoderPaths.ts'
 import type { CapabilityIssueCode, CapabilityProviderId } from '../../shared/capabilitySync.ts'
 import type { CanonicalCapability, Inventory } from './planner.ts'
 import { semanticHash } from './planner.ts'
@@ -75,6 +76,10 @@ const revisionHash = (parts: Array<string | Buffer>): string => {
 }
 
 export function providerPaths(id: CapabilityProviderId, home: string): ProviderPaths {
+  if (id === 'qoder') {
+    const root = qoderConfigRoot('cn', home)
+    return { root, skills: join(root, 'skills'), config: join(root, 'settings.json'), memories: MEMORY_NAMES.map(name => join(root, name)), agents: join(root, 'AGENTS.md'), layoutKnown: existsSync(root) }
+  }
   if (id === 'codex') {
     const root = join(home, '.codex')
     const config = join(root, 'config.toml')
@@ -200,6 +205,34 @@ export function parseToml(text: string): TomlRecord {
   return parsed
 }
 
+/** MCP sync uses one canonical shape; Qoder persists the equivalent JSON fields. */
+export function parseNativeConfig(text: string, path?: string): TomlRecord {
+  if (!path?.endsWith('.json') && !text.trimStart().startsWith('{')) return parseToml(text)
+  const config = JSON.parse(text.trim() || '{}')
+  if (!isRecord(config) || config.mcpServers !== undefined && !isRecord(config.mcpServers)) throw new Error('invalid_mcp_schema')
+  validateTomlTree(config)
+  const servers: TomlRecord = {}
+  for (const [name, value] of Object.entries(config.mcpServers || {})) {
+    if (!isRecord(value)) throw new Error('invalid_mcp_schema')
+    const { type, headers, disabled, ...rest } = value
+    if (type !== undefined && !['stdio', 'http', 'sse', 'ws'].includes(String(type))) throw new Error('invalid_mcp_schema')
+    servers[name] = { ...rest, ...(type === 'sse' || type === 'ws' ? { type } : {}), ...(headers ? { http_headers: headers } : {}), ...(typeof disabled === 'boolean' ? { enabled: !disabled } : {}) }
+  }
+  const { mcpServers: _servers, ...rest } = config
+  return { ...rest, mcp_servers: servers }
+}
+
+export function stringifyNativeConfig(config: TomlRecord, path: string): string {
+  if (!path.endsWith('.json')) return stringifyToml(config)
+  const { mcp_servers, ...rest } = config
+  const servers = Object.fromEntries(Object.entries(mcp_servers || {}).map(([name, value]) => {
+    if (!isRecord(value)) throw new Error('invalid_mcp_schema')
+    const { http_headers, enabled, ...fields } = value
+    return [name, { ...fields, type: fields.type || (fields.url ? 'http' : 'stdio'), ...(http_headers ? { headers: http_headers } : {}), ...(typeof enabled === 'boolean' ? { disabled: !enabled } : {}) }]
+  }))
+  return JSON.stringify({ ...rest, mcpServers: servers }, null, 2) + '\n'
+}
+
 function validateTomlTree(value: unknown): void {
   if (Array.isArray(value)) { for (const entry of value) validateTomlTree(entry); return }
   if (!isRecord(value)) return
@@ -278,6 +311,10 @@ function redactedClone(value: unknown, path: SecretSegment[] = [], secrets?: Set
   return value
 }
 
+export function redactMcpConfig(value: TomlRecord): TomlRecord {
+  return redactedClone(value) as TomlRecord
+}
+
 function getAt(value: unknown, path: SecretSegment[]): unknown {
   let cursor = value
   for (const part of path) {
@@ -352,14 +389,14 @@ function sameCredentialShape(source: unknown, target: unknown): boolean {
 }
 
 export function parseMcpBlocks(text: string): McpBlock[] {
-  const config = parseToml(text)
+  const config = parseNativeConfig(text)
   const servers = config.mcp_servers
   if (servers == null) return []
   if (!isRecord(servers)) throw new Error('invalid_mcp_schema')
   return Object.entries(servers).map(([privateKey, value]) => {
     if (!safeName(privateKey) || !isRecord(value)) throw new Error('invalid_mcp_schema')
     const secretShape = [...collectSecretShape(value)].sort()
-    const body = stringifyToml({ mcp_servers: { [privateKey]: redactedClone(value) } })
+    const body = stringifyToml({ mcp_servers: { [privateKey]: redactMcpConfig(value) } })
     const secretFields = secretShape.map((path) => String(decodeSecretPath(path).at(-1)))
     return { name: publicMcpName(privateKey), privateKey, body, rawBody: body, secretShape, secretFields, value: cloneToml(value) }
   })
@@ -499,7 +536,7 @@ export async function discoverProvider(id: CapabilityProviderId, home: string): 
     }
   }
 
-  const configResult = await safeRegularFile(paths.config, home, 'unsafe_config_path')
+  const configResult = id === 'qoder' && !existsSync(paths.config) ? { ok: true as const, text: '{}' } : await safeRegularFile(paths.config, home, 'unsafe_config_path')
   if (!configResult.ok) {
     layoutKnown = false
     items.push(invalidItem('mcp:__invalid_config__', 'mcp', 'MCP 配置', configResult.issue, paths.config))
@@ -507,13 +544,13 @@ export async function discoverProvider(id: CapabilityProviderId, home: string): 
   } else {
     revisionParts.push(configResult.text)
     try {
-      const config = parseToml(configResult.text)
+      const config = parseNativeConfig(configResult.text, paths.config)
       const declaredVersion = config.config_version ?? config.schema_version
       if (declaredVersion != null && ![1, '1', '1.0'].includes(declaredVersion as string | number)) layoutKnown = false
       for (const server of parseMcpBlocks(configResult.text)) {
         items.push({
           id: capabilityId('mcp', server.privateKey), kind: 'mcp', name: server.name, owner: 'user',
-          fingerprint: semanticHash(server.body), compatible: true, privateRef: paths.config, privateKey: server.privateKey, secretShape: server.secretShape
+          fingerprint: semanticHash(server.body), compatible: id !== 'qoder' || !['sse', 'ws'].includes(String(server.value.type)), privateRef: paths.config, privateKey: server.privateKey, secretShape: server.secretShape
         })
       }
       for (const key of ['model', 'model_reasoning_effort']) {

@@ -5,7 +5,10 @@ import type { ReasoningEffort, SessionConfig } from '../shared/types'
 import { parseCodexModelKey } from '../shared/codexModelIdentity'
 import { claudeSourceEffort, claudeSourceUsesAuthToken, type ClaudeSourcePreset } from '../shared/claudeSources'
 
-export interface ClaudeConnection { baseUrl: string; apiKey: string; model: string; preset: ClaudeSourcePreset }
+export interface ClaudeConnection {
+  baseUrl: string; apiKey: string; model: string; preset: ClaudeSourcePreset | 'ferry'
+  efforts?: ReasoningEffort[]; defaultEffort?: ReasoningEffort
+}
 export interface ClaudeSourceRuntime {
   model: string
   settings: Record<string, unknown>
@@ -47,7 +50,7 @@ export async function prepareClaudeSourceRuntime(config: SessionConfig): Promise
 
 export async function createClaudeSourceRuntime(connection: ClaudeConnection, effort?: ReasoningEffort): Promise<ClaudeSourceRuntime> {
   const { model, apiKey, baseUrl, preset } = connection
-  const support = claudeSourceEffort(model, preset)
+  const support = preset === 'ferry' ? { efforts: connection.efforts || [], defaultEffort: connection.defaultEffort } : claudeSourceEffort(model, preset)
   const bearer = claudeSourceUsesAuthToken(preset)
   const resolved = effort && support.efforts.includes(effort) ? effort : support.defaultEffort ?? 'auto'
   // MiMo 的 "off" 是思考开关而非档位：CLI 的 CLAUDE_CODE_EFFORT_LEVEL 没有 off 值，
@@ -68,7 +71,11 @@ export async function createClaudeSourceRuntime(connection: ClaudeConnection, ef
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
   }
   for (const alias of ['OPUS', 'SONNET', 'HAIKU', 'FABLE']) env[`ANTHROPIC_DEFAULT_${alias}_MODEL`] = model
-  const settings = { env, apiKeyHelper: '', model }
+  if (preset === 'ferry') {
+    env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = '1'
+    env.CLAUDE_CODE_AUTO_MODE_SERVER = '0'
+  }
+  const settings = { env, apiKeyHelper: '', model, ...(preset === 'ferry' ? { enableArtifact: false } : {}) }
   const root = runtimeRoot()
   await mkdir(root, { recursive: true, mode: 0o700 })
   await chmod(root, 0o700)
@@ -78,7 +85,7 @@ export async function createClaudeSourceRuntime(connection: ClaudeConnection, ef
     const file = join(directory, 'settings.json')
     await writeFile(file, JSON.stringify(settings), { mode: 0o600, flag: 'wx' })
     const runtime: ClaudeSourceRuntime = { model, settings, env, args: ['--settings', file],
-      redact: value => value.split(apiKey).join('[API Key]').split(JSON.stringify(apiKey).slice(1, -1)).join('[API Key]'),
+      redact: value => preset === 'ferry' ? value : value.split(apiKey).join('[API Key]').split(JSON.stringify(apiKey).slice(1, -1)).join('[API Key]'),
       dispose: async () => { await rm(directory, { recursive: true, force: true }); active.delete(runtime) } }
     active.add(runtime)
     return runtime

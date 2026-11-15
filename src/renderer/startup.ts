@@ -28,11 +28,12 @@ function cancelStageAnimation(): void {
 }
 
 export function updateStartup(stageName: string, error = false): void {
-  if (screen.hidden || failed && !error) return
+  if (!error && (screen.hidden || failed)) return
   if (error) {
     failed = true
     cancelStageAnimation()
     animation.fail()
+    screen.hidden = false
     screen.classList.add('error')
     screen.setAttribute('aria-busy', 'false')
     screen.setAttribute('aria-modal', 'true')

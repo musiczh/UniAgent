@@ -1,6 +1,7 @@
 import type { SessionAgentContract, SessionConfig } from '../shared/types.ts'
 import { acquireKimiWebService, kimiWebEnvironment } from './kimiWebService.ts'
 import { KimiWebError } from './kimiWebTransport.ts'
+import { ACPRecoveryError } from './acp/acpProcessLifecycle.ts'
 import { findKimiExecutable } from './kimiInstallation.ts'
 import { KIMI_PERMISSION_VALUES } from './kimiRoleConfig.ts'
 
@@ -62,6 +63,6 @@ export async function probeKimiWeb(bin = 'kimi', cwd = process.cwd(), extraEnv: 
     return { status: 'ready', path, version: lease.version, contract: kimiWebContract(catalog.items, { model: configuration.default_model }) }
   } catch (error) {
     if (error instanceof KimiWebError && error.recovered) return probeKimiWeb(bin, cwd, extraEnv)
-    return { status: 'incompatible', path, reason: error instanceof KimiWebError ? error.message : 'Kimi Web 服务检测失败' }
+    return { status: 'incompatible', path, reason: error instanceof KimiWebError || error instanceof ACPRecoveryError ? error.message : 'Kimi Web 服务检测失败' }
   } finally { await lease?.release() }
 }

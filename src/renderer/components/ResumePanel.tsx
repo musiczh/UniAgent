@@ -48,7 +48,8 @@ export function ResumePanel({
     nativeId: string,
     cwd?: string,
     point?: HistoryForkPoint,
-    compatibilityMode?: boolean
+    compatibilityMode?: boolean,
+    planId?: string
   ) => void | Promise<void>
   onImport: (
     agentId: string,
@@ -60,7 +61,8 @@ export function ResumePanel({
     sourceAgentId: string,
     nativeId: string,
     targetAgentId: string,
-    point?: HistoryForkPoint
+    point?: HistoryForkPoint,
+    planId?: string
   ) => void | Promise<void>
 }): JSX.Element {
   const historyAgents = useMemo(
@@ -394,7 +396,8 @@ function HistoryViewer({
     nativeId: string,
     cwd?: string,
     point?: HistoryForkPoint,
-    compatibilityMode?: boolean
+    compatibilityMode?: boolean,
+    planId?: string
   ) => void | Promise<void>
   onImport: (
     agentId: string,
@@ -406,7 +409,8 @@ function HistoryViewer({
     sourceAgentId: string,
     nativeId: string,
     targetAgentId: string,
-    point?: HistoryForkPoint
+    point?: HistoryForkPoint,
+    planId?: string
   ) => void | Promise<void>
 }): JSX.Element {
   const [events, setEvents] = useState<UAEvent[]>([])
@@ -506,7 +510,7 @@ function HistoryViewer({
     setConfirmation(action)
   }
 
-  const confirmAction = (): void => {
+  const confirmAction = (planId?: string): void => {
     if (!confirmation) return
     const action = confirmation
     setConfirmation(null)
@@ -520,14 +524,15 @@ function HistoryViewer({
           summary.id,
           summary.cwd,
           action.point,
-          action.compatibilityMode === true
+          action.compatibilityMode === true,
+          planId
         )
       } else if (action.kind === 'cross') {
         if (!others.some((agent) => agent.id === action.targetAgentId) ||
             (action.point && !forkPoints.includes(action.point))) {
           throw new Error('所选 Agent 当前不可用，请重新选择')
         }
-        await onForkCross(sourceAgentId, summary.id, action.targetAgentId, action.point)
+        await onForkCross(sourceAgentId, summary.id, action.targetAgentId, action.point, planId)
       } else {
         if (!canImportDirect) throw new Error('当前 Agent 不支持直接导入')
         await onImport(sourceAgentId, summary.id, summary.cwd, summary.title)
@@ -636,6 +641,7 @@ function HistoryViewer({
             : sourceAgent?.name || sourceAgentId}
           title={summary.title}
           sourceAgentId={sourceAgentId}
+          sourceNativeId={summary.id}
           targetAgents={sourceAgent && canForkSame ? [sourceAgent, ...others] : others}
           onChangeAction={setConfirmation}
           selectedEvent={confirmation.kind !== 'import' && confirmation.point
@@ -650,25 +656,25 @@ function HistoryViewer({
 }
 
 export function HistoryConfirmation({
-  action, agentName, title, selectedEvent, sourceAgentId, targetAgents, chooseTarget = false, onChangeAction, onCancel, onConfirm
+  action, agentName, title, selectedEvent, sourceAgentId, sourceNativeId, targetAgents, chooseTarget = false, onChangeAction, onCancel, onConfirm
 }: {
   action: HistoryAction
   agentName: string
   title: string
   selectedEvent?: UAEvent
   sourceAgentId: string
+  sourceNativeId?: string
   targetAgents: AgentDef[]
   chooseTarget?: boolean
   onChangeAction: (action: HistoryAction) => void
   onCancel: () => void
-  onConfirm: () => void
+  onConfirm: (planId?: string) => void
 }): JSX.Element {
   const dialogRef = useRef<HTMLDialogElement>(null)
   useEffect(() => { dialogRef.current?.showModal() }, [])
   const point = action.kind !== 'import' ? action.point : undefined
   const isImport = action.kind === 'import'
   const isCross = action.kind === 'cross'
-  const rebuildsSameAgentHistory = chooseTarget && !point && sourceAgentId === 'claude'
   const sourceAgent = targetAgents.find((agent) => agent.id === sourceAgentId)
   const canUseCompatibilityMode = action.kind === 'same' && (
     (sourceAgent?.id === 'codex' && sourceAgent.adapter === 'codex') ||
@@ -676,16 +682,42 @@ export function HistoryConfirmation({
   )
   const compatibilityMode = action.kind === 'same' && action.compatibilityMode === true
   const targetId = isCross ? action.targetAgentId : sourceAgentId
+  const compactExport = isCross || compatibilityMode
+  const target = targetAgents.find(agent => agent.id === targetId)
+  const [targetModel, setTargetModel] = useState('')
+  useEffect(() => {
+    let current = true
+    setTargetModel('')
+    if (window.uniagent.getPrefs) void window.uniagent.getPrefs().then(prefs => {
+      const preferred = prefs.lastByAgent[targetId]
+      if (current) setTargetModel(preferred?.defaultModel || preferred?.model || '')
+    }).catch(() => {})
+    return () => { current = false }
+  }, [targetId])
+  const model = target?.models.find(model => model.id === targetModel)?.id || target?.defaultModel || target?.models[0]?.id || ''
+  const [preflight, setPreflight] = useState<import('../../shared/sessionFork').ForkPreflight>()
+  const [checkError, setCheckError] = useState('')
+  const [checkVersion, setCheckVersion] = useState(0)
+  const currentPreflight = preflight?.request.targetAgentId === targetId && preflight.request.targetModel === model &&
+    preflight.request.nativeId === sourceNativeId && preflight.request.point?.nativeId === point?.nativeId ? preflight : undefined
+  useEffect(() => {
+    let current = true
+    setPreflight(undefined); setCheckError('')
+    if (!compactExport) return
+    if (!sourceNativeId || !model) { setCheckError('来源会话或目标模型暂不可用'); return }
+    void window.uniagent.preflightFork({ sourceAgentId, nativeId: sourceNativeId, targetAgentId: targetId, targetModel: model, point })
+      .then(result => { if (current) setPreflight(result) })
+      .catch(error => { if (current) setCheckError(String(error.message || error)) })
+    return () => { current = false }
+  }, [compactExport, sourceAgentId, sourceNativeId, targetId, model, point?.nativeId, checkVersion])
   const canChooseTarget = chooseTarget || !!point
   const position = point?.kind === 'after-turn' ? '所选回复所在轮次结束（包含补充信息）'
     : point ? '所选消息之后（包含该条）' : chooseTarget ? '当前会话末尾' : '会话末尾'
-  const range = compatibilityMode ? '部分推理、工具及原生上下文可能无法保留。'
+  const range = compactExport ? '带入原生压缩后的有效上下文，完整历史与可获得的附件另存为资料，供新 Agent 按需读取。'
     : point?.kind === 'after-turn' ? '完整继承本轮全部回复及补充信息；之后的轮次不继承。'
     : point ? '继承至所选消息，包含该条；之后的消息不继承。'
-      : isCross ? '迁移完整会话中可恢复的内容，可能丢失推理、工具及原生上下文。'
-        : isImport ? '直接续写完整原生会话，后续对话会保存到原会话。'
-          : rebuildsSameAgentHistory ? '重建可恢复的历史内容；部分推理、工具及原生上下文可能无法保留。'
-            : '继承完整原生会话历史。'
+      : isImport ? '直接续写完整原生会话，后续对话会保存到原会话。'
+        : '继承完整原生会话历史。'
   const selectedText = typeof selectedEvent?.payload.text === 'string' ? selectedEvent.payload.text : ''
   const quote = selectedText.replace(/\s+/g, ' ').trim()
   return (
@@ -740,8 +772,14 @@ export function HistoryConfirmation({
             </button>
           </div>
         )}
+        {compactExport && <label className="history-confirm-target">
+          <span>目标模型</span>
+          <select className="settings-select" value={model} onChange={event => setTargetModel(event.target.value)}>
+            {target?.models.map(model => <option key={model.id} value={model.id}>{model.label}</option>)}
+          </select>
+        </label>}
         <div className="history-confirm-summary">
-          <div><span>继承方式</span><strong>{isImport ? '原生 Agent 直接导入' : isCross ? '换 Agent 重建' : compatibilityMode ? '兼容模式' : rebuildsSameAgentHistory ? '原 Agent 历史重建' : '原 Agent 原生记录分叉'}</strong></div>
+          <div><span>继承方式</span><strong>{compactExport ? '压缩上下文 + 历史资料' : isImport ? '原生 Agent 直接导入' : '原 Agent 原生记录分叉'}</strong></div>
           {!canChooseTarget && <div><span>Agent</span><strong>{agentName}</strong></div>}
           <div><span>{isImport ? '续写位置' : '分叉位置'}</span><strong>{position}</strong></div>
           <p className="history-confirm-quote">
@@ -749,15 +787,17 @@ export function HistoryConfirmation({
           </p>
         </div>
         <p className="loading-modal-note" id="history-confirm-range">{range}</p>
-        {isCross && point && (
-          <p className="loading-modal-note">跨 Agent 转换可能丢失推理、工具及原生上下文。</p>
-        )}
+        {compactExport && <div className="fork-compact-notice" aria-live="polite">
+          <strong>{checkError ? '暂时无法分叉' : !preflight ? '正在检查上下文与目标模型…' : preflight.reusable ? '已有可复用的压缩结果' : '分叉前需要压缩上下文'}</strong>
+          <p>{checkError || (preflight?.reusable ? '上次压缩已覆盖当前分叉位置，之后没有新增对话内容。本次跳过压缩，直接导出。' : preflight ? '由来源 Agent 在临时副本中执行原生压缩，完成后自动导出并创建分支。' : '正在核对来源状态、压缩记录与模型容量。')}</p>
+          {checkError && <button className="loading-modal-cancel" onClick={() => setCheckVersion(value => value + 1)}>刷新检查</button>}
+        </div>}
         <p className="loading-modal-note">
-          {isImport ? '导入后请勿在 TUI 或其它窗口中并发使用此会话。' : '原会话保留，新分支中的后续对话独立保存。'}
+          {isImport ? '导入后请勿在 TUI 或其它窗口中并发使用此会话。' : compactExport ? '原会话保留。压缩会消耗来源模型用量；必要时由来源模型整理交接说明。' : '原会话保留，新分支中的后续对话独立保存。'}
         </p>
         <div className="rewind-actions">
           <button className="loading-modal-cancel" autoFocus onClick={onCancel}>取消</button>
-          <button className="fork-btn fork-btn-primary" disabled={canChooseTarget && !targetAgents.some((agent) => agent.id === targetId)} onClick={onConfirm}>{isImport ? '确认导入' : '确认分叉'}</button>
+          <button className="fork-btn fork-btn-primary" disabled={compactExport ? !currentPreflight || !!checkError : canChooseTarget && !targetAgents.some((agent) => agent.id === targetId)} onClick={() => onConfirm(compactExport ? currentPreflight?.planId : undefined)}>{compactExport ? !currentPreflight ? '检查中' : currentPreflight.reusable ? '直接分叉' : '压缩并分叉' : isImport ? '确认导入' : '确认分叉'}</button>
         </div>
       </div>
     </dialog>

@@ -2,9 +2,10 @@ import { existsSync, readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { ALL_EFFORTS, PERMISSION_MODE_IDS, type AutomationDetail, type AutomationEditPatch, type NativeAutomationInput, type Session, type SessionStatus } from '../shared/types'
-import { nextScheduleRuns, parseScheduleExpression } from '../shared/automationSchedule'
+import { matchesAutomationDay, nextScheduleRuns, parseScheduleExpression, type AutomationDayMode } from '../shared/automationSchedule'
 import { atomicWrite } from './projectStore'
 import { resolveUserDataHome } from './userData'
+import { automationTaskScope, mergeAutomationPatch } from '../shared/automationOwnership'
 
 interface AutomationRuntime {
   run: (task: AutomationDetail, isCurrent: () => boolean) => Promise<Session | null>
@@ -17,25 +18,41 @@ interface AutomationRuntime {
 const BUSY = new Set<AutomationDetail['lastRunStatus']>(['running', 'awaiting-approval'])
 
 function validateInput(input: NativeAutomationInput): NativeAutomationInput {
-  if (!input || !['name', 'prompt', 'schedule', 'agentId', 'projectId', 'permissionMode'].every(key =>
+  if (!input || !['name', 'prompt', 'schedule', 'agentId', 'permissionMode'].every(key =>
     typeof input[key as keyof NativeAutomationInput] === 'string' && String(input[key as keyof NativeAutomationInput]).trim()) ||
     (input.model !== undefined && typeof input.model !== 'string') ||
-    (input.reasoningEffort !== undefined && !ALL_EFFORTS.includes(input.reasoningEffort))) {
+    (input.reasoningEffort !== undefined && !ALL_EFFORTS.includes(input.reasoningEffort)) ||
+    (input.dayMode !== undefined && !['all', 'workday', 'non-workday'].includes(input.dayMode))) {
     throw new Error('原生定时任务配置无效')
   }
   if (!PERMISSION_MODE_IDS.includes(input.permissionMode)) throw new Error('权限模式无效')
-  if (!parseScheduleExpression(input.schedule).ok) throw new Error('请选择有效的执行计划')
+  const taskScope = automationTaskScope(input)
+  const schedule = parseScheduleExpression(input.schedule)
+  if (!schedule.ok) throw new Error('请选择有效的执行计划')
+  if (schedule.freq === 'once' && input.dayMode && input.dayMode !== 'all') throw new Error('一次性任务不支持工作日筛选')
   return {
     name: input.name.trim(), prompt: input.prompt.trim(), schedule: input.schedule,
-    agentId: input.agentId, projectId: input.projectId, permissionMode: input.permissionMode,
-    model: input.model || undefined, reasoningEffort: input.reasoningEffort
+    agentId: input.agentId, taskScope, projectId: taskScope.kind === 'space' ? taskScope.projectId : undefined, permissionMode: input.permissionMode,
+    model: input.model || undefined, reasoningEffort: input.reasoningEffort, dayMode: input.dayMode ?? 'all'
   }
 }
 
-function nextRun(schedule: string, now = Date.now()): number {
-  const next = nextScheduleRuns(parseScheduleExpression(schedule), 1, new Date(now))[0]
-  if (!next) throw new Error('无法计算下一次执行时间')
-  return next.getTime()
+function nextRun(schedule: string, now = Date.now(), dayMode: AutomationDayMode = 'all'): number | undefined {
+  const parsed = parseScheduleExpression(schedule)
+  const next = nextScheduleRuns(parsed, 1, new Date(now), dayMode)[0]
+  if (!next && dayMode === 'all' && parsed.freq !== 'once') throw new Error('无法计算下一次执行时间')
+  return next?.getTime()
+}
+
+function requiredNextRun(input: NativeAutomationInput, now = Date.now()): number {
+  const next = nextRun(input.schedule, now, input.dayMode)
+  if (!next && parseScheduleExpression(input.schedule).freq === 'once') throw new Error('执行时间已过，请选择未来的日期和时间')
+  if (!next) throw new Error('已确认的中国大陆调休日历内没有后续执行日期，请更新年历或更改执行计划')
+  return next
+}
+
+function isConsumedOnce(task: AutomationDetail): boolean {
+  return parseScheduleExpression(task.schedule ?? '').freq === 'once' && task.nextRunAt === undefined && task.lastRunAt !== undefined
 }
 
 export class NativeAutomations {
@@ -61,8 +78,9 @@ export class NativeAutomations {
     let recovered = false
     const next = rows.map(raw => {
       if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string' || !raw.id.startsWith('uniagent:') ||
-          ids.has(raw.id) || !['active', 'paused'].includes(raw.status) ||
-          !Number.isFinite(raw.nextRunAt) || raw.nextRunAt <= 0 ||
+          ids.has(raw.id) || !['active', 'paused', 'completed'].includes(raw.status) ||
+          (raw.nextRunAt === undefined ? !['workday', 'non-workday'].includes(raw.dayMode) && !isConsumedOnce(raw) :
+            !Number.isFinite(raw.nextRunAt) || raw.nextRunAt <= 0) ||
           typeof raw.createdAt !== 'string' || typeof raw.updatedAt !== 'string' ||
           (raw.lastRunAt !== undefined && !Number.isFinite(raw.lastRunAt)) ||
           (raw.lastSessionId !== undefined && typeof raw.lastSessionId !== 'string') ||
@@ -76,11 +94,18 @@ export class NativeAutomations {
         lastRunAt: raw.lastRunAt, lastSessionId: raw.lastSessionId,
         lastRunStatus: raw.lastRunStatus, lastRunError: typeof raw.lastRunError === 'string' ? raw.lastRunError : undefined
       }
+      const consumed = isConsumedOnce(item)
+      if (item.status === 'completed' && !consumed) throw new Error('原生定时任务文件包含无效的结束状态')
+      if (item.nextRunAt === undefined && !consumed) {
+        item.nextRunAt = nextRun(item.schedule!, Date.now(), item.dayMode)
+        if (item.nextRunAt !== undefined) recovered = true
+      }
       if (BUSY.has(item.lastRunStatus)) {
         recovered = true
         item.lastRunStatus = 'error'
         item.lastRunError = 'UniAgent 已重启，上次执行被中断'
       }
+      if (consumed && item.status !== 'completed') { item.status = 'completed'; recovered = true }
       return item
     })
     if (recovered) atomicWrite(this.file, JSON.stringify(next, null, 2))
@@ -103,7 +128,7 @@ export class NativeAutomations {
     const now = Date.now()
     const item: AutomationDetail = {
       ...fields, id: `uniagent:${randomUUID()}`, source: 'uniagent', status: 'active',
-      createdAt: String(now), updatedAt: String(now), nextRunAt: nextRun(fields.schedule, now)
+      createdAt: String(now), updatedAt: String(now), nextRunAt: requiredNextRun(fields, now)
     }
     this.commit([...this.items, item])
     return structuredClone(item)
@@ -113,11 +138,14 @@ export class NativeAutomations {
     this.load()
     const current = this.items.find(item => item.id === id)
     if (!current) return false
-    const fields = validateInput({ ...current, ...patch } as NativeAutomationInput)
+    const fields = validateInput(mergeAutomationPatch(current as NativeAutomationInput, patch))
     const now = Date.now()
+    const changedPlan = fields.schedule !== current.schedule || fields.dayMode !== current.dayMode
+    const nextRunAt = changedPlan ? requiredNextRun(fields, now) : current.nextRunAt
+    // Multiple edits can share one millisecond; pending work still needs a new revision.
     this.commit(this.items.map(item => item.id === id ? {
-      ...item, ...fields, updatedAt: String(now),
-      nextRunAt: fields.schedule !== current.schedule ? nextRun(fields.schedule, now) : item.nextRunAt
+      ...item, ...fields, updatedAt: String(Math.max(now, (Number(current.updatedAt) || 0) + 1)),
+      status: changedPlan && item.status === 'completed' ? 'active' : item.status, nextRunAt
     } : item))
     return true
   }
@@ -127,10 +155,11 @@ export class NativeAutomations {
     if (status !== 'active' && status !== 'paused') throw new Error('计划状态无效')
     const current = this.items.find(item => item.id === id)
     if (!current) return false
+    if (current.status === 'completed') throw new Error('一次性任务已执行，请重新设置未来的执行时间')
     if (current.status === status) return true
     this.commit(this.items.map(item => item.id === id ? {
-      ...item, status, updatedAt: String(Date.now()),
-      nextRunAt: status === 'active' ? nextRun(item.schedule!) : item.nextRunAt
+      ...item, status, updatedAt: String(Math.max(Date.now(), (Number(current.updatedAt) || 0) + 1)),
+      nextRunAt: status === 'active' ? requiredNextRun(item as NativeAutomationInput) : item.nextRunAt
     } : item))
     return true
   }
@@ -165,15 +194,18 @@ export class NativeAutomations {
       if (item.status !== 'active' || !item.nextRunAt || item.nextRunAt > now) continue
       try {
         const occupied = BUSY.has(item.lastRunStatus) || this.pending.has(item.id)
-        const next = { ...item, nextRunAt: nextRun(item.schedule!, now) }
-        if (!occupied) {
+        if (occupied && parseScheduleExpression(item.schedule!).freq === 'once') continue
+        const canRun = matchesAutomationDay(new Date(now), item.dayMode) === true
+        const next = { ...item, nextRunAt: nextRun(item.schedule!, now, item.dayMode) }
+        if (!occupied && canRun) {
           next.lastRunAt = now
           next.lastRunStatus = 'running'
           next.lastSessionId = undefined
           next.lastRunError = undefined
         }
+        // Persist the consumed occurrence before starting Agent so a restart cannot replay it.
         this.commit(this.items.map(row => row.id === item.id ? next : row))
-        if (!occupied) {
+        if (!occupied && canRun) {
           const token = {}
           this.pending.set(item.id, token)
           void this.execute(structuredClone(next), token)
@@ -186,12 +218,13 @@ export class NativeAutomations {
     let spawned = false
     const isCurrent = (): boolean => {
       const item = this.items.find(item => item.id === task.id)
-      return this.started && this.pending.get(task.id) === token && item?.status === 'active' && item.updatedAt === task.updatedAt
+      return this.started && this.pending.get(task.id) === token && item?.status === 'active' && item.updatedAt === task.updatedAt &&
+        matchesAutomationDay(new Date(Date.now()), item.dayMode) === true
     }
     try {
       const session = await this.runtime.run(task, isCurrent)
       if (!session) {
-        this.finishPending(task, '执行开始前计划已暂停或更改')
+        this.finishPending(task, '执行开始前计划或执行日期已变化')
         return
       }
       spawned = true
@@ -212,7 +245,8 @@ export class NativeAutomations {
 
   private finishPending(task: AutomationDetail, error: string): void {
     if (!this.items.some(item => item.id === task.id && item.lastRunAt === task.lastRunAt)) return
-    this.commit(this.items.map(item => item.id === task.id ? { ...item, lastRunStatus: 'error', lastRunError: error } : item))
+    this.commit(this.items.map(item => item.id === task.id ? { ...item,
+      status: isConsumedOnce(item) ? 'completed' : item.status, lastRunStatus: 'error', lastRunError: error } : item))
   }
 
   handleStatus(sessionId: string, status: SessionStatus, error?: string): void {
@@ -224,6 +258,7 @@ export class NativeAutomations {
     const lastRunStatus = succeeded ? 'success' : failed ? 'error' : status === 'awaiting-approval' ? 'awaiting-approval' : 'running'
     const lastRunError = failed ? error || current.lastRunError || (status === 'error' ? 'Agent 执行失败，请查看执行会话' : '执行已中断') : undefined
     if (current.lastRunStatus === lastRunStatus && current.lastRunError === lastRunError) return
-    this.commit(this.items.map(item => item.id === current.id ? { ...item, lastRunStatus, lastRunError } : item))
+    this.commit(this.items.map(item => item.id === current.id ? { ...item,
+      status: (succeeded || failed) && isConsumedOnce(item) ? 'completed' : item.status, lastRunStatus, lastRunError } : item))
   }
 }

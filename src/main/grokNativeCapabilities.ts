@@ -5,8 +5,6 @@ import { constants } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 
-export const GROK_NATIVE_VERSION = '1.0.70'
-const VERIFIED_NATIVE_VERSIONS = new Set(['1.0.62', GROK_NATIVE_VERSION])
 const FEATURES: GrokNativeCapability[] = ['goal', 'steer', 'subagents', 'questions', 'images', 'usage', 'fork', 'inventory']
 
 /** Export only model limits: the native cache can also contain credentials. */
@@ -17,7 +15,7 @@ export async function grokModelContextWindows(env: NodeJS.ProcessEnv = {}): Prom
     const metadata = await file.stat()
     if (!metadata.isFile() || metadata.size > 2 * 1024 * 1024) return {}
     const cache = JSON.parse(await file.readFile('utf8'))
-    if (!VERIFIED_NATIVE_VERSIONS.has(grokVersion(cache.grok_version) || '') || !cache.models || typeof cache.models !== 'object') return {}
+    if (!cache.models || typeof cache.models !== 'object') return {}
     return Object.fromEntries(Object.entries(cache.models).slice(0,500).flatMap(([id,value]:[string,any]) =>
       value?.info?.id === id && Number.isSafeInteger(value.info.context_window) && value.info.context_window > 0 && value.info.context_window <= 100_000_000
         ? [[id,value.info.context_window]] : []))
@@ -31,10 +29,11 @@ export function grokVersion(value: unknown): string | undefined {
 
 export function grokNativeHandshake(initialize: ACPInitialize): GrokNativeContract {
   const version = grokVersion(initialize.agentInfo?.version || initialize._meta?.agentVersion) || 'unknown'
-  const supported = VERIFIED_NATIVE_VERSIONS.has(version)
+  const supported = initialize.protocolVersion === 1 && (!initialize.agentInfo?.name || /^grok(?:\s|$)/i.test(initialize.agentInfo.name))
+    && (!!initialize.agentInfo || typeof initialize._meta?.agentVersion === 'string')
   return { version, confirmed: supported, capabilities: Object.fromEntries(FEATURES.map(key => [key,
     { status: supported ? key === 'goal' ? 'unknown' : 'verified' : 'unsupported',
-      ...(!supported ? { reason: '当前 Grok 版本尚未验证原生扩展' } : {}) }
+      ...(!supported ? { reason: 'Grok 协议握手不兼容' } : {}) }
   ])) as GrokNativeContract['capabilities'] }
 }
 
@@ -44,7 +43,7 @@ export function grokCapabilityAvailable(state: GrokNativeContract | undefined, k
 
 /** The one projection used after every config/command/mode update. */
 export function projectGrokContract(base: SessionAgentContract, native: GrokNativeContract): SessionAgentContract {
-  if (!VERIFIED_NATIVE_VERSIONS.has(native.version)) return { ...base, grokNative:structuredClone(native) }
+  if (!native.confirmed && FEATURES.every(key => native.capabilities[key].status === 'unsupported')) return { ...base, grokNative: structuredClone(native) }
   const has = (key: GrokNativeCapability) => grokCapabilityAvailable(native, key)
   return { ...base, grokNative: structuredClone(native),
     models: base.models.map(model => ({ ...model, imageInput: has('images') && model.id === 'grok-4.7' })),

@@ -46,6 +46,11 @@ const runner: PluginCommandRunner = async (bin) => ({ stdout: bin === 'codex' ? 
   installed: true, enabled: true, source: { source: 'local', path: pluginDir }
 }], available: [] }) : '' })
 const discovered = await discoverInstalledPlugins('codex', home, runner)
+const installedOnly = await discoverInstalledPlugins('codex', home, async (bin, args, context) => {
+  if (args.includes('--available')) throw new Error('remote_marketplace_timeout')
+  return runner(bin, args, context)
+})
+assert.equal(installedOnly[0].pluginId, 'figma@openai-curated', 'installed plugins must remain readable when the remote marketplace is unavailable')
 assert.equal(discovered.length, 1)
 assert.deepEqual({ pluginId: discovered[0].pluginId, cachedVersions: discovered[0].cachedVersions, components: discovered[0].components }, {
   pluginId: 'figma@openai-curated', cachedVersions: 1,

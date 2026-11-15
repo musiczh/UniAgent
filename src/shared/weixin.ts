@@ -21,6 +21,6 @@ export function splitWeixinContext(text: string): { text: string; context: strin
   return text.endsWith(suffix) ? { text: text.slice(0, -suffix.length), context: WEIXIN_CONTEXT_TEXT } : undefined
 }
 
-export function acceptsFeishuAssistant(config: { assistantChannel?: 'weixin' }): boolean {
-  return config.assistantChannel !== 'weixin'
+export function acceptsFeishuAssistant(config: { assistantChannel?: 'weixin' | 'app' }): boolean {
+  return config.assistantChannel === undefined
 }

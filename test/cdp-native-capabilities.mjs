@@ -16,6 +16,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
+import { installMarkdownInputDriver } from './fixtures/markdown-input-driver.mjs'
 import {
   createAcceptanceProcessSweeper,
   createAcceptanceTerminationHandler
@@ -89,7 +90,7 @@ const expectedRendererPath = join(
   resolvedBinary.slice(0, markerIndex),
   'Contents',
   'Resources',
-  'app.asar',
+  'app.asar.unpacked',
   'out',
   'renderer',
   'index.html'
@@ -365,7 +366,10 @@ try {
   child = spawn(resolvedBinary, [
     `--remote-debugging-port=${port}`,
     `--user-data-dir=${chromiumData}`,
-    '--ua-e2e'
+    '--ua-e2e',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--disable-background-timer-throttling'
   ], {
     env: isolatedEnv,
     detached: process.platform !== 'win32',
@@ -438,7 +442,7 @@ try {
       awaitPromise: true,
       returnByValue: true,
       userGesture: true
-    }), EVAL_TIMEOUT_MS, 'Runtime.evaluate')
+    }), EVAL_TIMEOUT_MS, 'Runtime.evaluate: ' + expression.slice(0, 120))
     if (response.exceptionDetails) throw new Error(response.exceptionDetails.exception?.description || response.exceptionDetails.text)
     return response.result?.value
   }
@@ -452,7 +456,11 @@ try {
     }
     throw new Error(`${label} timed out; last=${JSON.stringify(value)}`)
   }
-  const setTextarea = async (selector, value) => evaluate(`(()=>{const el=document.querySelector(${JSON.stringify(selector)});if(!el)return false;const setter=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;setter.call(el,${JSON.stringify(value)});el.dispatchEvent(new Event('input',{bubbles:true}));return true})()`)
+  await evaluate(`(${installMarkdownInputDriver.toString()})()`)
+  const setTextarea = async (selector, value) => {
+    await evaluate(`window.__markdownInput.fill(${JSON.stringify(selector)},${JSON.stringify(value)})`)
+    await waitFor(`window.__markdownInput.text(${JSON.stringify(selector)})===${JSON.stringify(value)}`, 'committed Markdown input')
+  }
   const clickNativeAction = async (scope, name) => evaluate(`(()=>{const root=document.querySelector(${JSON.stringify(scope)});if(!root)return false;const details=root.querySelector('details.sb-add');if(!details)return false;details.open=true;details.dispatchEvent(new Event('toggle'));const button=[...details.querySelectorAll('.native-action-item')].find((item)=>item.textContent.trim().startsWith(${JSON.stringify(name)}));if(!button)return false;button.click();return true})()`)
 
   await waitFor(`!!document.querySelector('.new-task .prompt-input')`, 'New Task UI')
@@ -486,9 +494,10 @@ try {
 
   await setTextarea('.new-task .prompt-input', 'review-preserve-text')
   assert.equal(await clickNativeAction('.new-task', 'Review'), true)
-  const reviewState = JSON.parse(await evaluate(`(()=>JSON.stringify({dialog:!!document.querySelector('.review-start-dialog'),text:document.querySelector('.new-task .prompt-input')?.value,commands:document.querySelectorAll('.new-task .composer-command-chip').length}))()`))
+  const reviewState = JSON.parse(await evaluate(`(()=>JSON.stringify({dialog:!!document.querySelector('.review-start-dialog'),text:window.__markdownInput.text('.new-task .prompt-input'),commands:document.querySelectorAll('.new-task .composer-command-chip').length}))()`))
   check('Review opens structured dialog without mutating draft', reviewState.dialog && reviewState.text === 'review-preserve-text' && reviewState.commands === 0, JSON.stringify(reviewState))
   await evaluate(`document.querySelector('[aria-label="关闭 Review"]')?.click()`)
+  await waitFor(`!document.querySelector('[aria-label="关闭 Review"]')`, 'Review dialog closed before editing the draft')
 
   await setTextarea('.new-task .prompt-input', '')
   assert.equal(await clickNativeAction('.new-task', 'Goal'), true)
@@ -512,7 +521,7 @@ try {
   const sentGoal = await evaluate(`(()=>{const button=document.querySelector('.new-task-send-btn');if(!button||button.disabled)return false;button.click();return true})()`)
   assert.equal(sentGoal, true, 'Goal action send button must be enabled')
   await waitFor(`!!document.querySelector('.session-view .goal-status-bar')`, 'provider-confirmed Goal bar', 30_000)
-  await waitFor(`[...document.querySelectorAll('.session-view .user-msg')].some((row)=>row.querySelector('.bubble-goal-label')?.textContent==='Goal'&&row.querySelector('.bubble')?.textContent?.includes(${JSON.stringify(goalObjective)}))`, 'Goal user bubble')
+  await waitFor(`[...document.querySelectorAll('.session-view .user-msg')].some((row)=>row.querySelector('[data-command="goal"] .capability-chip-name')?.textContent==='Goal'&&row.querySelector('.bubble')?.textContent?.includes(${JSON.stringify(goalObjective)}))`, 'Goal user bubble')
   const collapsedGoal = JSON.parse(await evaluate(`(()=>{const bar=document.querySelector('.goal-status-bar');return JSON.stringify({expanded:bar?.getAttribute('aria-expanded'),role:bar?.getAttribute('role'),title:bar?.querySelector('.goal-status-title')?.textContent||'',objective:bar?.querySelector('.goal-status-objective')?.textContent||'',clear:!!bar?.querySelector('.goal-clear-btn')})})()`))
   check('Goal bar defaults collapsed as the complete toggle surface without a clear action', collapsedGoal.expanded === 'false' && collapsedGoal.role === 'button' && collapsedGoal.title === 'Goal' && collapsedGoal.objective === '' && !collapsedGoal.clear, JSON.stringify(collapsedGoal))
   await evaluate(`document.querySelector('.goal-status-title')?.click()`)
@@ -526,12 +535,19 @@ try {
   await waitFor(`document.querySelector('.goal-status-bar')?.getAttribute('aria-expanded')==='false'`, 'keyboard-collapsed Goal objective')
   const sessionId = await evaluate(`(async()=>{const sessions=await window.uniagent.listSessions();return sessions.find((session)=>session.goal?.objective===${JSON.stringify(goalObjective)})?.id||''})()`)
   assert.ok(sessionId, 'provider-confirmed Goal session missing')
+  await evaluate(`window.uniagent.interrupt(${JSON.stringify(sessionId)})`)
+  await waitFor(`(async()=>{const sessions=await window.uniagent.listSessions();return ['idle','completed','cancelled'].includes(sessions.find(session=>session.id===${JSON.stringify(sessionId)})?.status)})()`, 'Goal turn settles before the capability turn', 30_000)
   await waitFor(`document.querySelectorAll('.session-view .capability-chip-skill').length===1&&document.querySelectorAll('.session-view .capability-chip-mcp').length===1`, 'Goal-preserved native capability chips')
   const nativeTurnPrompt = `Consume native selections ${provider} ${Date.now()}`
   await setTextarea('.session-view .composer-input', nativeTurnPrompt)
   const sentNativeTurn = await evaluate(`(()=>{const button=document.querySelector('.session-view .composer-send-btn');if(!button||button.disabled)return false;button.click();return true})()`)
   assert.equal(sentNativeTurn, true, 'native capability turn send button must be enabled')
-  await waitFor(`(async()=>{const events=await window.uniagent.getEvents(${JSON.stringify(sessionId)});const event=events.find((item)=>item.type==='user_message'&&item.payload?.text===${JSON.stringify(nativeTurnPrompt)});return event?.payload?.nativeContext?.skills?.some((skill)=>skill.name===${JSON.stringify(providerSkillName)})&&event?.payload?.nativeContext?.mcpServers?.some((server)=>server.name==='isolated_fixture')})()`, 'real turn consumes preserved Skill/MCP selection', 30_000)
+  try {
+    await waitFor(`(async()=>{const events=await window.uniagent.getEvents(${JSON.stringify(sessionId)});const event=events.find((item)=>item.type==='user_message'&&item.payload?.text===${JSON.stringify(nativeTurnPrompt)});return event?.payload?.nativeContext?.skills?.some((skill)=>skill.name===${JSON.stringify(providerSkillName)})&&event?.payload?.nativeContext?.mcpServers?.some((server)=>server.name==='isolated_fixture')})()`, 'real turn consumes preserved Skill/MCP selection', 30_000)
+  } catch (error) {
+    const evidence = await evaluate(`(async()=>({events:(await window.uniagent.getEvents(${JSON.stringify(sessionId)})).filter(event=>['user_message','error'].includes(event.type)),sessions:(await window.uniagent.listSessions()).map(({id,status})=>({id,status}))}))()`)
+    throw new Error(error.message + ': ' + JSON.stringify(evidence))
+  }
   await waitFor(`(async()=>{const snapshot=await window.uniagent.getNativeCapabilities({agentId:${JSON.stringify(provider)},workdir:window.uniagent.homeDir,force:false});return snapshot.candidates.some((candidate)=>candidate.id==='mcp:isolated_fixture'&&candidate.startupStatus==='ready')})()`, 'selected provider-native MCP readiness')
   const readySnapshot = JSON.parse(await evaluate(`(async()=>JSON.stringify(await window.uniagent.getNativeCapabilities({agentId:${JSON.stringify(provider)},workdir:window.uniagent.homeDir,force:false})))()`))
   const injectedMcp = requireReadyInjectedMcp(readySnapshot.candidates, 'isolated_fixture')
@@ -559,8 +575,9 @@ try {
     { sessionId, seq: 90_000, ts: baseTs + 1, type: 'turn_started', payload: { turnId: 'fixture-turn' } },
     runningEvent
   ])})`)
-  await waitFor(`[...document.querySelectorAll('.tool-call-title')].some((node)=>node.textContent.includes('FixtureServer')&&node.textContent.includes('fixture_tool'))`, 'MCP running card')
-  await evaluate(`(()=>{const card=[...document.querySelectorAll('.tool-call')].find((node)=>node.querySelector('.tool-call-title')?.textContent.includes('FixtureServer'));if(!card)return false;card.dataset.nativeProbe='stable';return true})()`)
+  await evaluate(`(()=>{const fold=[...document.querySelectorAll('.processed-fold')].at(-1);if(fold&&!fold.classList.contains('open'))fold.querySelector('.processed-head')?.click();})()`)
+  await waitFor(`(()=>{for(const step of document.querySelectorAll('.process-step'))if(!step.classList.contains('open'))step.querySelector('.process-step-meta')?.click();return [...document.querySelectorAll('.step-call-name')].some(node=>node.textContent.includes('FixtureServer')&&node.textContent.includes('fixture_tool'));})()`, 'MCP running card')
+  await evaluate(`(()=>{const card=[...document.querySelectorAll('.step-call')].find(node=>node.querySelector('.step-call-name')?.textContent.includes('FixtureServer'));if(!card)return false;card.dataset.nativeProbe='stable';return true})()`)
   const terminalEvent = {
     ...runningEvent,
     seq: 90_002,
@@ -581,22 +598,38 @@ try {
     state: 'running',
     payload: { id: 'fixture-plan', steps: [{ text: 'Fixture plan step', status: 'in_progress' }] }
   }] )})`)
-  await waitFor(`[...document.querySelectorAll('.tool-call.state-success')].some((node)=>node.dataset.nativeProbe==='stable')`, 'MCP terminal in-place update')
-  const mcpCard = JSON.parse(await evaluate(`(()=>{const cards=[...document.querySelectorAll('.tool-call')].filter((node)=>node.querySelector('.tool-call-title')?.textContent.includes('FixtureServer'));const card=cards[0];card?.querySelector('.card-head')?.click();return JSON.stringify({count:cards.length,stable:card?.dataset.nativeProbe==='stable',title:card?.querySelector('.tool-call-title')?.textContent||'',state:card?.className||''})})()`))
-  await waitFor(`[...document.querySelectorAll('.tool-call .tool-body')].some((node)=>node.textContent.includes('captured-result'))`, 'MCP terminal result detail')
-  check('MCP running→terminal updates one DOM card', mcpCard.count === 1 && mcpCard.stable && /FixtureServer/.test(mcpCard.title) && /fixture_tool/.test(mcpCard.title) && /state-success/.test(mcpCard.state), JSON.stringify(mcpCard))
+  await waitFor(`!!document.querySelector('.step-call[data-native-probe="stable"]:not(.running):not(.failed)')`, 'MCP terminal in-place update')
+  const mcpCard = JSON.parse(await evaluate(`(()=>{const cards=[...document.querySelectorAll('.step-call')].filter(node=>node.querySelector('.step-call-name')?.textContent.includes('FixtureServer'));const card=cards[0];card?.querySelector('.step-call-row')?.click();return JSON.stringify({count:cards.length,stable:card?.dataset.nativeProbe==='stable',title:card?.querySelector('.step-call-name')?.textContent||'',terminal:!!card&&!card.classList.contains('running')&&!card.classList.contains('failed')})})()`))
+  await waitFor(`[...document.querySelectorAll('.step-call .step-call-detail')].some(node=>node.textContent.includes('captured-result'))`, 'MCP terminal result detail')
+  check('MCP running→terminal updates one DOM card', mcpCard.count === 1 && mcpCard.stable && /FixtureServer/.test(mcpCard.title) && /fixture_tool/.test(mcpCard.title) && mcpCard.terminal, JSON.stringify(mcpCard))
   check('agent PlanStatusBar remains independent', await waitFor(`!!document.querySelector('.plan-bar')`, 'PlanStatusBar'), 'injected plan event visible')
 
-  const widths = JSON.parse(await evaluate(`(()=>{const goal=document.querySelector('.goal-status-bar');const eventCard=document.querySelector('.event-stream .card');const composer=document.querySelector('.composer-wrap');const view=document.querySelector('.session-view');const shell=goal?.parentElement;const header=view?.querySelector('.session-header');const body=view?.querySelector('.session-body');return JSON.stringify({goal:goal?.getBoundingClientRect().width||0,event:eventCard?.getBoundingClientRect().width||0,composer:composer?.getBoundingClientRect().width||0,ordered:!!(shell&&header&&body&&[...view.children].indexOf(header)<[...view.children].indexOf(shell)&&[...view.children].indexOf(shell)<[...view.children].indexOf(body))})})()`))
+  const widths = JSON.parse(await evaluate(`(()=>{
+    const view=document.querySelector('.session-view');
+    const goal=view?.querySelector('.goal-status-bar'),shell=goal?.closest('.goal-status-shell');
+    const header=view?.querySelector('.session-header'),body=view?.querySelector('.session-body');
+    const eventCard=body?.querySelector('.event-stream .card'),composer=view?.querySelector('.composer-wrap');
+    const rect=node=>node?.getBoundingClientRect();
+    const headerRect=rect(header),shellRect=rect(shell),bodyRect=rect(body);
+    return JSON.stringify({
+      goal:rect(goal)?.width||0,event:rect(eventCard)?.width||0,composer:rect(composer)?.width||0,
+      ordered:!!(shell&&header&&body&&shell.closest('.session-view')===view&&!body.contains(shell)&&
+        (header.compareDocumentPosition(shell)&Node.DOCUMENT_POSITION_FOLLOWING))&&
+        !!(shell.compareDocumentPosition(body)&Node.DOCUMENT_POSITION_FOLLOWING)&&
+        headerRect.bottom<=shellRect.top+1&&shellRect.bottom<=bodyRect.top+1,
+      parents:[header?.parentElement?.className,shell?.parentElement?.className,body?.parentElement?.className],
+      bounds:[headerRect?.bottom,shellRect?.top,shellRect?.bottom,bodyRect?.top]
+    });
+  })()`))
   check('Goal persists between header and scroll body at conversation width', widths.ordered && Math.abs(widths.goal - widths.event) < 1 && Math.abs(widths.goal - widths.composer) < 1, JSON.stringify(widths))
 
-  const permissionBefore = await evaluate(`document.querySelector('.composer-wrap select[title="权限模式"]')?.value||''`)
+  const permissionBefore = await evaluate(`document.querySelector('.composer-wrap .sb-cfg select')?.value||''`)
   await evaluate(`window.uniagent.setCollaborationMode(${JSON.stringify(sessionId)},'plan')`)
   await waitFor(`!!document.querySelector('.plan-mode-badge[data-collaboration-mode="plan"]')`, 'Plan collaboration badge')
-  const permissionDuring = await evaluate(`document.querySelector('.composer-wrap select[title="权限模式"]')?.value||''`)
+  const permissionDuring = await evaluate(`document.querySelector('.composer-wrap .sb-cfg select')?.value||''`)
   await evaluate(`document.querySelector('.plan-mode-badge button[aria-label="退出 Plan"]')?.click()`)
   await waitFor(`!document.querySelector('.plan-mode-badge')`, 'exit Plan collaboration mode')
-  const permissionAfter = await evaluate(`document.querySelector('.composer-wrap select[title="权限模式"]')?.value||''`)
+  const permissionAfter = await evaluate(`document.querySelector('.composer-wrap .sb-cfg select')?.value||''`)
   check('Plan collaboration mode is independent from permission', !!permissionBefore && permissionBefore === permissionDuring && permissionDuring === permissionAfter, `${permissionBefore} → ${permissionDuring} → ${permissionAfter}`)
 
   check('Goal remains resident after collapse', await evaluate(`!!document.querySelector('.goal-status-bar')`), provider)

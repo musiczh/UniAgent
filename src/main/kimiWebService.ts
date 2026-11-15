@@ -4,8 +4,8 @@ import { isAbsolute, join, resolve } from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { connectKimiWebServer, KimiWebServer } from './kimiWebServer.ts'
+import { awaitACPStartup } from './acp/acpProcessLifecycle.ts'
 import { isKimiWebServiceFailure, KimiWebError, type KimiWebTransport } from './kimiWebTransport.ts'
-import { parseSemver } from './semver.ts'
 
 export interface KimiWebServiceOptions {
   bin: string
@@ -39,9 +39,9 @@ function recoveryBudget(key: string): RecoveryBudget {
   return budget
 }
 
-function failRecovery(budget: RecoveryBudget, kind: string): never {
+function failRecovery(budget: RecoveryBudget, kind: string, cause?: unknown): never {
   budget.failedAt = kind === 'shutdown_incomplete' ? Infinity : Date.now()
-  budget.error = new KimiWebError(kind)
+  budget.error = Object.assign(new KimiWebError(kind), cause === undefined ? {} : { cause })
   throw budget.error
 }
 
@@ -71,7 +71,7 @@ function recoverService(key: string, flight: Promise<Service>, service: Service,
     const replacement: Promise<Service> = (async () => {
       service.closing = service.server!.closeAndWait()
       try { await service.closing }
-      catch { services.set(key, flight); failRecovery(budget, 'shutdown_incomplete') }
+      catch (cause) { services.set(key, flight); failRecovery(budget, 'shutdown_incomplete', cause) }
       if (budget.attempts.length >= MAX_RESTARTS) failRecovery(budget, 'recovery_limit')
       while (budget.attempts.length < MAX_RESTARTS) {
         if (generation !== epoch) throw new KimiWebError('closed')
@@ -93,8 +93,8 @@ function recoverService(key: string, flight: Promise<Service>, service: Service,
           try {
             if (next?.server) await next.server.closeAndWait()
             else await next?.transport.closeAndWait()
-          } catch { failRecovery(budget, 'shutdown_incomplete') }
-          if (error instanceof KimiWebError && error.kind === 'shutdown_incomplete') failRecovery(budget, 'shutdown_incomplete')
+          } catch (cause) { failRecovery(budget, 'shutdown_incomplete', cause) }
+          if (error instanceof KimiWebError && error.kind === 'shutdown_incomplete') failRecovery(budget, 'shutdown_incomplete', error)
           if (generation !== epoch) throw new KimiWebError('closed')
         }
       }
@@ -149,23 +149,23 @@ async function discover(home: string, timeoutMs?: number): Promise<KimiWebTransp
 }
 
 async function open(options: KimiWebServiceOptions, env: NodeJS.ProcessEnv): Promise<Service> {
+  await awaitACPStartup('kimi')
   const existing = await discover(env.KIMI_CODE_HOME!, options.timeoutMs)
   if (!existing && !options.argsPrefix?.length) {
     const result = await promisify(execFile)(options.bin, ['--version'], { env, cwd: options.cwd, timeout: 8000, maxBuffer: 8192 }).catch(() => undefined)
-    if (!parseSemver(result?.stdout.trim().match(/(?:^|\s)v?(\S+)$/)?.[1])) throw new KimiWebError('version_unsupported')
+    if (!result) throw new KimiWebError('spawn')
   }
   const server = existing ? undefined : await KimiWebServer.start({ ...options, env })
   const transport = existing || server!.transport!
   try {
     const meta = await transport.request<any>('GET', '/api/v1/meta')
-    if (typeof meta.server_version !== 'string' || !parseSemver(meta.server_version)) throw new KimiWebError('version_unsupported')
     const spec = await transport.specification('/openapi.json')
     for (const [path, method] of [
       ['/api/v1/sessions/{session_id}/goal', 'get'], ['/api/v1/sessions/{session_id}/profile', 'post'],
       ['/api/v1/sessions/{session_id}/prompts', 'post'], ['/api/v1/sessions/{session_id}/prompts/{tail}', 'post']
     ]) if (!spec.paths?.[path]?.[method]) throw new KimiWebError('official_api_unsupported')
     if (typeof (await transport.specification('/asyncapi.json')).asyncapi !== 'string') throw new KimiWebError('official_events_unsupported')
-    return { transport, version: meta.server_version, interactionResponses: !!spec.paths?.['/api/v1/sessions/{session_id}/interactions/{interaction_id}']?.post, server, users: 0, sessions: new Set() }
+    return { transport, version: typeof meta.server_version === 'string' ? meta.server_version : '', interactionResponses: !!spec.paths?.['/api/v1/sessions/{session_id}/interactions/{interaction_id}']?.post, server, users: 0, sessions: new Set() }
   } catch (error) {
     if (server) await server.closeAndWait(); else await transport.closeAndWait()
     throw error

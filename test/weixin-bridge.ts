@@ -8,6 +8,7 @@ import type { WeixinApi } from '../src/main/assistant/weixinApi'
 import type { Session } from '../src/shared/types'
 import { acceptsFeishuAssistant, splitWeixinContext } from '../src/shared/weixin'
 import { asyncQuestionReply } from '../src/shared/interactionRequests'
+import type { AssistantConversationSelection } from '../src/shared/assistantConversation'
 
 const root = await mkdtemp(join(tmpdir(), 'uniagent-weixin-'))
 const original = process.env.UNIAGENT_USER_DATA
@@ -29,6 +30,7 @@ try {
   const forwarded: any[] = []
   const answered: any[] = []
   const executed: string[] = []
+  let commandSelection: AssistantConversationSelection | undefined
   const snapshot = { assistantId: 'personal' as const, soul: '', soulRevision: 1, workingRules: '', workingRulesRevision: 1 }
   let activeTurn: { ts: number } | undefined
   let created = 0
@@ -53,7 +55,7 @@ try {
   }
   bridge = new WeixinBridge({ store: restored, api, orchestrator: orchestrator as any, attachmentsDirectory: root, onState() {}, onError(message) { throw new Error(message) },
     async createSession(prompt, attachments, bind, assertCurrent) { assertCurrent(); const session = create(); await bind(session); forwarded.push([session.id,prompt,attachments]); return session },
-    async command(id, command) { executed.push(command + ':' + id); return create() }
+    async command(id, command, _requestId, selection) { commandSelection = selection; executed.push(command + ':' + id); return create() }
   })
   await bridge.restore(); await wait(() => bridge!.getState().phase === 'connected')
   const message = (id: string, text: string, from = 'owner') => ({ message_id: id, message_type: 1, from_user_id: from, to_user_id: 'bot', context_token: 'context', item_list: [{ type: 1, text_item: { text } }] })
@@ -132,6 +134,12 @@ try {
   await bridge.receive({ ...message('image',''),item_list: [{type:2,image_item:{}}] })
   assert.equal(forwarded.at(-1)[2][0].mime,'image/png','image MIME follows its bytes rather than a guessed JPEG filename')
   assert.match(forwarded.at(-1)[2][0].name,/\.png$/)
+  const selection = { agentId: 'codex', model: 'chosen', effort: 'low' as const }
+  const selected = await bridge.executeCommandFromApp('weixin-2', 'new', 'selected-new', selection)
+  assert.deepEqual(commandSelection, selection, 'App one-off choices reach the command boundary')
+  assert.equal(restored.get().sessionId, selected.id, 'parameterized creation moves the existing Weixin binding')
+  assert.equal(bridge.owns('weixin-2'), false)
+  assert.equal(bridge.owns(selected.id), true)
   await bridge.disconnect()
   const disconnected = new WeixinStore(file); await disconnected.load()
   assert.equal(disconnected.get().account,undefined)

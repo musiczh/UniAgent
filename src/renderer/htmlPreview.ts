@@ -1,4 +1,26 @@
 import { Marked, type Token, type Tokens, type TokensList } from 'marked'
+import { load, JSON_SCHEMA } from 'js-yaml'
+
+export function splitMarkdownMetadata(text: string): {
+  body: string
+  metadata?: { raw: string; type: string; status: string; tags: string[] }
+} {
+  const match = /^---\r?\n([\s\S]{0,16384}?)\r?\n---(?:\r?\n|$)/.exec(text)
+  if (!match) return { body: text }
+  try {
+    const value = load(match[1], { schema: JSON_SCHEMA })
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return { body: text }
+    const fields = value as Record<string, unknown>
+    return {
+      body: text.slice(match[0].length).replace(/^(?:[ \t]*\r?\n)+/, ''),
+      metadata: {
+        raw: match[1], type: typeof fields.type === 'string' ? fields.type : '',
+        status: typeof fields.status === 'string' ? fields.status : '',
+        tags: Array.isArray(fields.tags) ? fields.tags.filter((tag): tag is string => typeof tag === 'string') : [],
+      },
+    }
+  } catch { return { body: text } }
+}
 
 export interface HtmlPreviewReference {
   path?: string

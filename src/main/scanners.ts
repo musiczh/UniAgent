@@ -281,7 +281,10 @@ export async function updateAutomation(
   path: string,
   patch: AutomationEditPatch
 ): Promise<boolean> {
-  if (patch.schedule != null && !parseScheduleExpression(patch.schedule).ok) return false
+  if (patch.schedule != null) {
+    const parsed = parseScheduleExpression(patch.schedule)
+    if (!parsed.ok || parsed.freq === 'once') return false
+  }
   const safePath = resolveAutomationPath(path)
   if (!safePath) return false
   let text = ''

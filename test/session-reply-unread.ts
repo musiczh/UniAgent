@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { unreadAfterReplyStatus } from '../src/renderer/App.tsx'
+import { SessionAttentionBadge } from '../src/main/appNotifications'
 import { StatusIndicator } from '../src/renderer/components/SessionList.tsx'
 import { teamRowSessionId, teamRowSessionIds } from '../src/shared/teamAttention'
 import { isSessionBusy, sessionActivityStatus } from '../src/shared/sessionStatus'
@@ -9,15 +9,17 @@ import type { Session, SessionStatus } from '../src/shared/types'
 for (const status of ['draft', 'idle', 'completed', 'cancelled', 'interrupted', 'archived'] as const) {
   assert.equal(StatusIndicator({ status }), null, `${status} stays unmarked when read`)
 }
-assert.equal(unreadAfterReplyStatus(undefined, 'running', 'idle', 'side'), 'side', 'a side reply becomes cyan unread')
-assert.equal(unreadAfterReplyStatus(undefined, 'running', 'completed', 'main'), 'main', 'a main reply becomes blue unread')
-assert.equal(unreadAfterReplyStatus('main', 'idle', 'idle', 'side'), 'main', 'repeated idle status does not create a new unread reply')
-assert.equal(unreadAfterReplyStatus(undefined, 'running', 'idle', 'main', false), undefined, 'the visible main reply stays read')
-assert.equal(unreadAfterReplyStatus(undefined, 'running', 'error', 'main'), 'main', 'a failed turn is unread like the Dock badge')
-assert.equal(unreadAfterReplyStatus(undefined, 'running', 'cancelled', 'main'), 'main', 'a cancelled turn is unread')
-assert.equal(unreadAfterReplyStatus(undefined, 'running', 'interrupted', 'main'), 'main', 'an interrupted turn is unread')
-assert.equal(unreadAfterReplyStatus(undefined, 'idle', 'error', 'main'), 'main', 'an error status alone requires attention')
-assert.equal(unreadAfterReplyStatus('main', 'error', 'error', 'main'), 'main', 'a repeated error status creates no new unread')
+for (const source of ['main', 'side'] as const) {
+  for (const terminal of ['idle', 'completed', 'error', 'cancelled', 'interrupted']) {
+    const owner = { id: 'reply', status: 'idle', config: {} } as Session
+    const attention = new SessionAttentionBadge(() => {}, () => false)
+    attention.handleStatus(owner, 'running', owner, source)
+    attention.handleStatus(owner, terminal, owner, source)
+    assert.equal(attention.snapshot().unreadBySession.reply, source, `${source} -> ${terminal} produces its original marker`)
+    attention.handleStatus(owner, 'running', owner, source)
+    assert.deepEqual(attention.snapshot().unreadBySession, {}, 'resuming clears the corresponding result')
+  }
+}
 
 const teamRows = teamRowSessionIds([
   { team: { leaderMemberId: 'lead' }, memberSessions: { lead: 'leader', worker: 'worker', empty: '' } },

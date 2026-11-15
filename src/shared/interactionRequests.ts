@@ -46,6 +46,7 @@ export function withInteractionState(event: UAEvent, events: UAEvent[]): UAEvent
   return { ...event, payload: { ...event.payload,
     ...(prior.payload.submittedAnswer !== undefined ? { submittedAnswer: prior.payload.submittedAnswer } : {}),
     ...(prior.payload.interactionExpired ? { interactionExpired: true } : {}),
+    ...(prior.payload.taskResponseState ? { taskResponseState: prior.payload.taskResponseState } : {}),
   } }
 }
 

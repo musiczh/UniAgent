@@ -3,6 +3,7 @@
  * Official sources: docs/agent-icons-2026-10-14/sources.md.
  * Custom / generic agents keep a neutral fallback.
  */
+import { QODER_ICON_DATA } from './qoderIconData'
 import { AGENT_ICON_DATA } from './agentIconData'
 
 export function AgentIcon({
@@ -26,7 +27,7 @@ export function AgentIcon({
     focusable: false as const
   }
 
-  const brand = AGENT_ICON_DATA[key]
+  const brand = key === 'qoder' ? QODER_ICON_DATA : AGENT_ICON_DATA[key]
   if (brand) {
     return (
       <img
@@ -98,10 +99,11 @@ export function AgentIcon({
 function pickKey(
   agentId?: string,
   adapter?: string
-): 'codex' | 'traex' | 'claude' | 'grok' | 'kimi' | 'deepseek' | 'mcode' | 'zcode'  | 'generic' {
+): 'codex' | 'traex' | 'claude' | 'grok' | 'kimi' | 'deepseek' | 'mcode' | 'zcode'  | 'qoder' | 'generic' {
   const id = (agentId || '').toLowerCase()
   const adapterValue = (adapter || '').toLowerCase()
   const v = adapterValue && adapterValue !== 'generic' ? adapterValue : id
+  if (v.includes('qoder')) return 'qoder'
   if (v.includes('codex') || v === 'openai') return 'codex'
   if (v.includes('trae')) return 'traex'
   if (v.includes('claude') || v.includes('anthropic')) return 'claude'

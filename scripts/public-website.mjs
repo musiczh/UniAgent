@@ -61,7 +61,8 @@ export function buildPublicWebsite(html, { version, desktopImage, connectionImag
     .replace(/Codex、TraeX 与 Claude Code/g, 'Codex 与 Claude Code').replace(/Codex 与 TraeX/g, 'Codex 与 Claude Code')
     .replace(/TraeX、?/g, '').replace(/、\s*与/g, '与')
   html = html.replace('九种 Agent，一个工作台。', '七种 Agent，一个工作台。')
-    .replace('统一八种 Agent', '统一七种 Agent')
+    .replace('十种 Agent，一个工作台。', '八种 Agent，一个工作台。')
+    .replace('统一十种 Agent', '统一八种 Agent')
     .replace('新增第八种 Agent，', '新增 Agent，')
   html = html.replace(/(<a id="latest-download"[\s\S]*?href=")[^"]*(")/, `$1${PUBLIC_REPO}/releases/download/v${version}/${PUBLIC_ARTIFACT_PREFIX}-${version}-arm64.dmg$2`)
     .replace(/(<a id="latest-download"[\s\S]*?download=")[^"]*(")/, `$1${PUBLIC_ARTIFACT_PREFIX}-${version}-arm64.dmg$2`)
@@ -77,7 +78,7 @@ export function buildPublicWebsite(html, { version, desktopImage, connectionImag
   html = html.split(/(<(?:script|style)\b[\s\S]*?<\/(?:script|style)>|<[^>]+>)/gi)
     .map(part => part.startsWith('<') ? part : part.replace(/\bUniAgent\b(?! Public)/g, PUBLIC_APP_NAME)).join('')
     .replace('content="UniAgent 多 Agent', `content="${PUBLIC_APP_NAME} 多 Agent`)
-  const privateContent = html.match(/https?:\/\/[^\s'"<>]*(?:byted|byteintl|nika\.fan)[^\s'"<>]*|Kaboo|Bonsai|TraeX|\bNika\b|本地大模型|本地模型|八种 Agent|九种 Agent|第八种 Agent/g)
+  const privateContent = html.match(/https?:\/\/[^\s'"<>]*(?:byted|byteintl|nika\.fan)[^\s'"<>]*|Kaboo|Bonsai|TraeX|\bNika\b|本地大模型|本地模型|九种 Agent|十种 Agent|第八种 Agent/g)
   if (privateContent) throw new Error('Private website content remains: ' + [...new Set(privateContent)].map(value => value.slice(0, 100)).join(', '))
   const anchor = html.match(/<a id="latest-download"[\s\S]*?<\/a>/)?.[0]
   if (!anchor?.includes(`/releases/download/v${version}/`)) throw new Error('Public download fallback is not in sync')

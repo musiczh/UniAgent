@@ -265,6 +265,7 @@ export function ImageLightbox({
             className="ctx-menu image-lightbox-menu"
             role="menu"
             style={{ left: menuLeft, top: menuTop }}
+            onMouseDown={(event) => event.stopPropagation()}
           >
             <button type="button" role="menuitem" className="ctx-item" onClick={copyImage}>
               <UiIcon name={copyState === 'copied' ? 'check' : 'copy'} size={15} />

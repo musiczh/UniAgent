@@ -23,8 +23,10 @@ async function fixture(scenario:Record<string,unknown>, action:(runner:GrokACPRu
   finally {await runner.disposeAndWait();await rm(root,{recursive:true,force:true})}
 }
 
-await fixture({},async(runner,events,frames)=>{
-  assert.equal((await runner.probeSession(false)).contract.steer,true)
+await fixture({nativeVersion:'1.0.78'},async(runner,events,frames)=>{
+  const contract=(await runner.probeSession(false)).contract
+  assert.equal(contract.steer,true)
+  assert.equal(contract.grokNative?.version,'1.0.78','unverified software versions continue the real protocol and extension calls')
   await runner.startTurn('ordinary')
   const usages=events.filter(e=>e.payload.kind==='usage')
   assert.equal(usages.length,1,'notification and prompt result must not double-count usage')

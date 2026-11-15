@@ -24,6 +24,7 @@ import type {
   SessionConfig,
   SessionAgentContract,
   SubmittedUserMessage,
+  TurnBubbleInput,
   UASubAgent,
   UAEvent
 } from '../shared/types'
@@ -150,12 +151,16 @@ export class SessionStore {
   }
 
   saveSideChats(sideChats: PersistedSideChat[]): void {
-    this.ensureDir()
     try {
-      atomicWriteFileSync(this.sideChatsFile, JSON.stringify(sideChats, null, 2))
+      this.saveSideChatsOrThrow(sideChats)
     } catch {
       /* best effort — side-chat cache failure must not break a live turn */
     }
+  }
+
+  saveSideChatsOrThrow(sideChats: PersistedSideChat[]): void {
+    this.ensureDir()
+    atomicWriteFileSync(this.sideChatsFile, JSON.stringify(sideChats, null, 2))
   }
 }
 
@@ -218,6 +223,7 @@ function serializeSession(s: Session): Record<string, unknown> {
   }
   return {
     id: s.id,
+    ...(s.taskRegistration ? { taskRegistration: s.taskRegistration } : {}),
     ...(s.teamBinding ? { teamBinding: s.teamBinding } : {}),
     title: s.title,
     ...(s.worktreeTask ? { worktreeTask: s.worktreeTask } : {}),
@@ -446,14 +452,21 @@ function parseSessionRow(
         ? readOnly ?? false
         : true
     : readOnly
+  const task = value.taskRegistration as Session['taskRegistration']
+  const taskRegistration = task && typeof task.requestId === 'string' && typeof task.inputId === 'string' &&
+    ['provisioning','active'].includes(task.phase) && ['registered','accepted','dispatching','dispatched','unknown'].includes(task.delivery) &&
+    typeof task.inputText === 'string' && Array.isArray(task.events) && task.events.length <= 6 &&
+    task.events.every(item => item && Number.isFinite(item.ts) && ['registered','accepted','dispatching','dispatched','unknown'].includes(item.state))
+    ? { ...task, ...(task.delivery === 'dispatching' ? { delivery: 'unknown' as const, phase: 'active' as const } : {}) } : undefined
 
   return {
     id,
+    ...(taskRegistration ? { taskRegistration } : {}),
     title,
     ...(teamBinding ? { teamBinding: { teamProjectId: teamBinding.teamProjectId as string, memberId: teamBinding.memberId as string } } : {}),
     config,
     // No turn can survive a process restart, so nothing is "running".
-    status: zcodeStateInvalid ? 'error' : pendingWorktree || config.worktree && config.worktree.state !== 'ready' && !nativeSessionId ? 'draft' : normalizeStatus(status),
+    status: zcodeStateInvalid ? 'error' : taskRegistration?.phase === 'provisioning' && !nativeSessionId || pendingWorktree || config.worktree && config.worktree.state !== 'ready' && !nativeSessionId ? 'draft' : normalizeStatus(status),
     ...(pendingWorktree ? { worktreeTask, worktreeTaskError: typeof value.worktreeTaskError === 'string' ? value.worktreeTaskError : '任务准备已中断，请重试' } : {}),
     createdAt: createdAt as number,
     ...(updatedAt === undefined ? {} : { updatedAt }),
@@ -535,6 +548,16 @@ function parseSideChatRow(
   }
 }
 
+function sanitizeBubbleInput(value: Record<string, unknown>): TurnBubbleInput {
+  const comments = Array.isArray(value.comments) ? value.comments.filter(comment =>
+    isRecord(comment) && typeof comment.quote === 'string' && typeof comment.comment === 'string'
+  ).map(comment => ({ quote: comment.quote as string, comment: comment.comment as string })) : []
+  return {
+    ...(typeof value.displayText === 'string' ? { displayText: value.displayText } : {}),
+    ...(comments.length ? { comments } : {})
+  }
+}
+
 function sanitizeSideQueue(value: unknown): QueueItem[] {
   if (!Array.isArray(value)) return []
   const ids = new Set<string>()
@@ -545,16 +568,12 @@ function sanitizeSideQueue(value: unknown): QueueItem[] {
     if (attachments === INVALID_OPTIONAL_FIELD) return []
     ids.add(item.id)
     const nativeContext = sanitizeNativeContext(item.nativeContext)
-    const comments = Array.isArray(item.comments) ? item.comments.filter((comment) =>
-      isRecord(comment) && typeof comment.quote === 'string' && typeof comment.comment === 'string'
-    ).map((comment) => ({ quote: comment.quote as string, comment: comment.comment as string })) : []
     return [{
       id: item.id, prompt: item.prompt,
       ...(item.deliveryUncertain === true || item.state === 'dispatching' || item.state === 'steering' ? { deliveryUncertain: true } : {}),
       ...(attachments ? { attachments } : {}),
       ...(nativeContext ? { nativeContext } : {}),
-      ...(typeof item.displayText === 'string' ? { displayText: item.displayText } : {}),
-      ...(comments.length ? { comments } : {})
+      ...sanitizeBubbleInput(item)
     }]
   })
 }
@@ -581,6 +600,7 @@ function sanitizeSubmittedUserMessages(value: unknown): SubmittedUserMessage[] {
     const nativeContext = sanitizeNativeContext(candidate.nativeContext)
     messages.push({
       type: candidate.type,
+      ...(typeof candidate.routedInputId === 'string' && /^[a-f0-9-]{36}$/i.test(candidate.routedInputId) ? { routedInputId: candidate.routedInputId } : {}),
       ...(candidate.appendedToTurn === true ? { appendedToTurn: true } : {}),
       ...(candidate.source === 'feishu' || candidate.source === 'weixin' || candidate.source === 'app' || candidate.source === 'mcp'
         ? { source: candidate.source }
@@ -590,7 +610,9 @@ function sanitizeSubmittedUserMessages(value: unknown): SubmittedUserMessage[] {
       ...(typeof candidate.assistantText === 'string' && candidate.assistantText.length <= 65536 ? { assistantText: candidate.assistantText } : {}),
       ...(typeof candidate.assistantMessageId === 'string' && /^[\w-]{1,100}$/.test(candidate.assistantMessageId) ? { assistantMessageId: candidate.assistantMessageId } : {}),
       acceptedAt: candidate.acceptedAt as number,
+      ...(typeof candidate.automaticRecovery === 'string' && candidate.automaticRecovery.length <= 150 ? { automaticRecovery: candidate.automaticRecovery } : {}),
       ...(candidate.command === undefined ? {} : { command: candidate.command }),
+      ...sanitizeBubbleInput(candidate),
       ...(attachments === undefined ? {} : { attachments }),
       ...(nativeContext === undefined ? {} : { nativeContext })
     })
@@ -760,7 +782,8 @@ function parseSessionConfig(value: unknown): Session['config'] | undefined {
   if (value.assistantSnapshot !== undefined && !assistantSnapshot) return undefined
   return {
     ...(assistantSnapshot ? { assistantSnapshot } : {}),
-    ...(assistantSnapshot && value.assistantChannel === 'weixin' ? { assistantChannel: 'weixin' as const } : {}),
+    ...(value.managedPurpose === 'router' ? { managedPurpose: 'router' as const } : {}),
+    ...(assistantSnapshot && (value.assistantChannel === 'weixin' || value.assistantChannel === 'app') ? { assistantChannel: value.assistantChannel } : {}),
     agentId,
     ...(model === undefined ? {} : { model }),
     ...(zcodeModelSelection ? { zcodeModelSelection } : {}),
@@ -890,13 +913,15 @@ function sanitizePendingQueue(value: unknown, recoverInFlight: boolean, preserve
     queue.push({
       id: candidate.id,
       prompt: candidate.prompt,
+      ...sanitizeBubbleInput(candidate),
+      ...(candidate.routedInputId === candidate.id ? { routedInputId: candidate.id } : {}),
       ...(candidate.source === 'feishu' || candidate.source === 'weixin' || candidate.source === 'app' || candidate.source === 'mcp'
         ? { source: candidate.source }
         : {}),
       ...(attachments === undefined ? {} : { attachments }),
       ...(nativeContext === undefined ? {} : { nativeContext }),
       acceptedAt: candidate.acceptedAt as number,
-      ...(candidate.deliveryUncertain === true || recoverInFlight && preserveUncertain && candidate.state !== 'pending'
+      ...(candidate.deliveryUncertain === true || recoverInFlight && (preserveUncertain || candidate.routedInputId === candidate.id) && candidate.state !== 'pending'
         ? { deliveryUncertain: true } : {}),
       // Native beta RPCs may already have accepted delivery when the process exits.
       state:
@@ -971,7 +996,8 @@ function sanitizeForkedFrom(value: unknown): Session['forkedFrom'] | undefined {
   ) {
     return undefined
   }
-  return { agentId: value.agentId, nativeId: value.nativeId, mode: value.mode }
+  return { agentId: value.agentId, nativeId: value.nativeId, mode: value.mode,
+    ...(typeof value.exportId === 'string' && /^[\w-]+$/.test(value.exportId) ? { exportId: value.exportId } : {}) }
 }
 
 const REASONING_EFFORTS = new Set<ReasoningEffort>([

@@ -30,6 +30,7 @@ function elements(node: React.ReactNode): React.ReactElement<any>[] {
   )
 }
 const renamed: [string, string][] = []
+const selected: string[] = []
 const pinned: [string, boolean][] = []
 const openedRequirements: [string, string][] = []
 const requirement = { id: 'req', name: '需求一', dir: '/requirements/需求一', docPath: '/requirements/需求一/context.md', status: 'active', createdAt: 1, updatedAt: 1 } as const
@@ -45,7 +46,7 @@ function render() {
   return SessionList({
     requirementsEnabled: true,
     sessions, agents, activeId: 'regular', statusBySession: {}, unreadBySession: {},
-    onSelect: noop, onArchive: noop, onUnarchive: noop, onDelete: noop,
+    onSelect: id => selected.push(id), onArchive: noop, onUnarchive: noop, onDelete: noop,
     onArchiveMany: noop, onDeleteMany: noop, onPin: (id, value) => pinned.push([id, value]),
     onRename: (id, title) => renamed.push([id, title]),
     onOpenRequirement: (path, root) => openedRequirements.push([path, root])
@@ -67,15 +68,12 @@ function openMenu(id: string) {
   return menu
 }
 function edit(id: string) {
-  const sessionRow = row(id)
-  if (id !== 'archived') openMenu(id)
-  const button = id === 'archived'
-    ? elements(sessionRow).find((element) => element.props['aria-label'] === '修改会话标题')
-    : elements(render()).find((element) => element.props.role === 'menuitem' && elements(element).some((child) => child.props.name === 'edit'))
+  openMenu(id)
+  const button = elements(render()).find((element) => element.props.role === 'menuitem' && elements(element).some((child) => child.props.name === 'edit'))
   assert.ok(button, `session ${id} has a rename action`)
-  let stopped = false
-  button.props.onClick({ stopPropagation() { stopped = true } })
-  if (id === 'archived') assert.ok(stopped, 'rename does not also select the session')
+  const selections = selected.length
+  button.props.onClick()
+  assert.equal(selected.length, selections, 'rename does not also select the session')
   assert.equal(elements(render()).some((element) => element.props.role === 'menu'), false, 'rename closes the context menu')
   const input = elements(row(id)).find((element) => element.type === 'input')
   assert.ok(input, 'rename opens the inline editor')
@@ -130,7 +128,8 @@ try {
     const unchanged = edit(id)
     unchanged.target.value = '原标题'
     unchanged.target.blur()
-    assert.equal(renamed.length, before + 1, 'unchanged titles do not lock automatic titles')
+    assert.equal(renamed.length, before + 2, 'confirming an ordinary task title also locks its automatic title')
+    assert.deepEqual(renamed.at(-1), [id, '原标题'])
   }
   for (const view of ['byAgent', 'byProject', 'byRequirement']) {
     const selector = elements(render()).find(element => element.props.ariaLabel === '会话视图')
