@@ -1,5 +1,6 @@
 import { open, readFile } from 'node:fs/promises'
 import type { HistoryLoadProgress } from '../shared/types'
+import { withDecodedHistoryFile } from './historyCompression'
 
 export type HistoryProgressCallback = (progress: HistoryLoadProgress) => void
 
@@ -21,6 +22,14 @@ export function trackHistoryWork(
 
 /** Bound the read to the opened file's size; later appended turns are a new snapshot. */
 export async function readHistoryFile(
+  file: string,
+  onProgress?: HistoryProgressCallback,
+  phase: 'reading' | 'reading-parent' = 'reading'
+): Promise<Buffer> {
+  return withDecodedHistoryFile(file, path => readPlainHistoryFile(path, onProgress, phase))
+}
+
+async function readPlainHistoryFile(
   file: string,
   onProgress?: HistoryProgressCallback,
   phase: 'reading' | 'reading-parent' = 'reading'

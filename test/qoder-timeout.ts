@@ -44,7 +44,7 @@ const bundle = await build({
   } }]
 })
 const context = vm.createContext({ module: { exports: {} }, require: createRequire(import.meta.url),
-  process, console, Buffer, URL, AbortController, FixtureWorker,
+  process, console, Buffer, URL, AbortController, TextEncoder, FixtureWorker,
   setTimeout: (...args: Parameters<typeof setTimeout>) => setTimeout(...args), clearTimeout: (timer: NodeJS.Timeout) => clearTimeout(timer) })
 context.exports = context.module.exports
 vm.runInContext(bundle.outputFiles[0].text, context)

@@ -66,8 +66,10 @@ export function parseMCodeModelValue(value: unknown): MCodeModelRef | undefined 
   if (parts.length < 4 || parts[0] !== 'm') return undefined
   const [, providerId, modelId, kind, variant, ...rest] = parts
   if (!providerId || !modelId || rest.length) return undefined
-  if (kind === 'u') return variant === undefined ? { providerId, modelId } : undefined
-  if (kind === 'v') return variant === undefined ? undefined : { providerId, modelId, variant }
+  try {
+    if (kind === 'u') return variant === undefined ? { providerId: decodeURIComponent(providerId), modelId: decodeURIComponent(modelId) } : undefined
+    if (kind === 'v') return variant === undefined ? undefined : { providerId: decodeURIComponent(providerId), modelId: decodeURIComponent(modelId), variant: decodeURIComponent(variant) }
+  } catch { return undefined }
   return undefined
 }
 

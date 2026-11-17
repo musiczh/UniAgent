@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, lstatSync } from 'node:fs'
-import { mkdir, readFile, rm, realpath, stat, lstat } from 'node:fs/promises'
+import { mkdir, readFile, rm, realpath, stat, lstat, rmdir, rename, link } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
 import { dirname, join, resolve, relative, isAbsolute } from 'node:path'
 import { homedir } from 'node:os'
@@ -507,22 +507,48 @@ export class RequirementStore {
           break
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-          const pid = Number(await readFile(join(lock, 'owner'), 'utf8').catch(() => ''))
-          if (pid > 0) {
+          const ownerPath = join(lock, 'owner')
+          const readOwner = () => readFile(ownerPath, 'utf8').catch(error => {
+            if (error.code === 'ENOENT') return undefined
+            throw error
+          })
+          const identity = await lstat(lock).catch(error => { if (error.code !== 'ENOENT') throw error })
+          if (!identity) continue
+          const owner = await readOwner(), pid = Number(owner)
+          const validPid = Number.isSafeInteger(pid) && pid > 0 && pid <= 0x7fffffff
+          let abandoned = !validPid && Date.now() - identity.mtimeMs > 30_000
+          if (validPid) {
             try { process.kill(pid, 0) } catch (e) {
-              if ((e as NodeJS.ErrnoException).code === 'ESRCH') {
-                // Serialize stale-owner cleanup and recheck: never delete a successor's lock.
-                const recovery = lock + '.recovery'
-                let claimed = false
-                try {
-                  await mkdir(recovery); claimed = true
-                  const owner = Number(await readFile(join(lock, 'owner'), 'utf8').catch(() => ''))
-                  if (owner === pid) await rm(lock, { recursive: true, force: true })
-                } catch (reason) {
-                  if ((reason as NodeJS.ErrnoException).code !== 'EEXIST') throw reason
-                } finally { if (claimed) await rm(recovery, { recursive: true, force: true }) }
-              }
+              abandoned = (e as NodeJS.ErrnoException).code === 'ESRCH'
             }
+          }
+          if (abandoned) {
+            const recovery = lock + '.recovery', savedOwner = join(recovery, 'owner')
+            let claimed = false, restorePending = false
+            const restoreOwner = async () => {
+              if (!restorePending) return
+              try { await link(savedOwner, ownerPath) } catch (error) {
+                if (!['EEXIST', 'ENOENT'].includes((error as NodeJS.ErrnoException).code || '')) throw error
+              }
+              restorePending = false
+            }
+            try {
+              await mkdir(recovery); claimed = true
+              const current = await lstat(lock)
+              if (current.dev !== identity.dev || current.ino !== identity.ino || current.mtimeMs !== identity.mtimeMs || await readOwner() !== owner) continue
+              if (owner !== undefined) {
+                await rename(ownerPath, savedOwner); restorePending = true
+                if (await readFile(savedOwner, 'utf8') !== owner) { await restoreOwner(); continue }
+              }
+              const remaining = await lstat(lock)
+              if (remaining.dev !== identity.dev || remaining.ino !== identity.ino) { await restoreOwner(); continue }
+              // Atomic empty-directory removal preserves an owner published during recovery.
+              await rmdir(lock); restorePending = false
+              continue
+            } catch (reason) {
+              await restoreOwner()
+              if (!['EEXIST', 'ENOENT', 'ENOTEMPTY'].includes((reason as NodeJS.ErrnoException).code || '')) throw reason
+            } finally { if (claimed && !restorePending) await rm(recovery, { recursive: true, force: true }) }
           }
           if (Date.now() - started > 30_000) throw new Error('需求文档写入等待超时，请稍后重试')
           await new Promise(resolve => setTimeout(resolve, 80))

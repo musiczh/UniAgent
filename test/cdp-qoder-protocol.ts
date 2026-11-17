@@ -9,7 +9,7 @@ import { homedir, tmpdir } from 'node:os'
 import { createServer } from 'node:http'
 import type { Options } from '@qoder-ai/qoder-agent-sdk'
 import { QoderSdkClient, qoderLaunch } from '../src/main/qoderSdk.ts'
-import { qoderReviewInput } from '../src/main/qoderRunner.ts'
+import { QoderRunner, qoderReviewInput } from '../src/main/qoderRunner.ts'
 import { writeForkTarget } from '../src/main/forkContext.ts'
 
 const fixture = await realpath(await mkdtemp(join(tmpdir(), 'uniagent-qoder-protocol-')))
@@ -62,10 +62,48 @@ async function turn(client: QoderSdkClient, content: string, attachments?: any[]
     const failed = (error: Error) => finish(error)
     const timer = setTimeout(() => finish(new Error('native turn timed out')), 150000)
     client.on('message', message); client.on('failure', failed)
-    void client.request('send', { uuid: randomUUID(), content, attachments }).catch(failed)
+    void client.request('send', { uuid: randomUUID(), content, attachments, waitForReplay: true }).catch(failed)
   })
 }
 const text = (rows: any[]) => rows.filter(row => row.type === 'assistant').flatMap(row => row.message.content || []).filter(block => block.type === 'text').map(block => block.text).join('\n')
+
+function backgroundAgentLaunch(rows: any[], subagentType: string) {
+  const call = rows.filter(row => row.type === 'assistant' && !row.parent_tool_use_id).flatMap(row => row.message?.content || [])
+    .find(block => block.type === 'tool_use' && block.name === 'Agent' && block.input?.subagent_type === subagentType && block.input?.run_in_background === true)
+  assert.ok(call?.id, 'the requested native background Agent must actually be invoked')
+  const receipt = rows.find(row => row.type === 'user' && row.message?.content?.some?.(block => block.type === 'tool_result' && block.tool_use_id === call.id))?.tool_use_result
+  assert.equal(receipt?.isAsync, true)
+  assert.equal(receipt?.status, 'async_launched')
+  assert.ok(typeof receipt?.agentId === 'string' && receipt.agentId)
+  assert.ok(typeof receipt?.outputFile === 'string' && receipt.outputFile)
+  return { call, receipt }
+}
+
+async function waitForNativeRow(client: QoderSdkClient, rows: any[], matches: (row: any) => boolean): Promise<any> {
+  const existing = rows.find(matches)
+  if (existing) return existing
+  return new Promise((resolve, reject) => {
+    const finish = (error?: Error, row?: any) => {
+      clearTimeout(timer); client.off('message', message); client.off('failure', failed)
+      error ? reject(error) : resolve(row)
+    }
+    const message = (row: any) => { if (matches(row)) finish(undefined, row) }
+    const failed = (error: Error) => finish(error)
+    const timer = setTimeout(() => finish(new Error('native background task notification timed out')), 150000)
+    client.on('message', message); client.on('failure', failed)
+  })
+}
+
+function projectedNativeAgent(rows: any[], nativeHistoryId: string, status: string) {
+  const runner = new QoderRunner('native-child-projection', { n: 0 })
+  const agents: any[] = []
+  runner.on('event', event => { if (event.type === 'subagent') agents.push(...event.payload.agents) })
+  for (const row of rows) runner.acceptMessage(row)
+  const agent = agents.filter(agent => agent.nativeHistoryId === nativeHistoryId).at(-1)
+  assert.ok(agent, 'the real native child must be exposed by QoderRunner with its history identity')
+  assert.equal(agent.status, status)
+  return agent
+}
 
 try {
   for (const path of [cwd, extra, join(home, '.qoder-cn/skills/native-proof'), join(home, '.agents/skills/shared-proof'), join(home, '.qoder-cn/agents'), evidence]) await mkdir(path, { recursive: true, mode: 0o700 })
@@ -82,6 +120,7 @@ try {
   await writeFile(join(home, '.qoder-cn/agents/reader.md'), '---\nname: fixture-reader\ndescription: local reader fixture\ntools: Read, Glob, Grep\n---\nOnly read files and return CHILD_CN_OK.')
   const hook = join(fixture, 'hook.cjs'), hookMarker = join(fixture, 'hook-proof')
   await writeFile(hook, `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(hookMarker)},'HOOK_CN_OK')`, { mode: 0o700 })
+  const hookCommand = [process.execPath, hook].map(value => "'" + value.replaceAll("'", "'\\''") + "'").join(' ')
   const server = join(fixture, 'mcp.cjs')
   await writeFile(server, `const send=v=>process.stdout.write(JSON.stringify(v)+'\\n');let toolCall;
 require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const v=JSON.parse(line);if(v.id===undefined)return;
@@ -92,18 +131,31 @@ if(v.method==='tools/call'&&v.params.name==='form_elicit'){toolCall=v.id;send({j
 if(v.method==='tools/call')result={content:[{type:'text',text:'MCP_CN_OK'}]};
 send({jsonrpc:'2.0',id:v.id,result});})`)
   await writeFile(join(home, '.qoder-cn/settings.json'), JSON.stringify({ skills: { loadFromAgentsDirectory: true },
-    hooks: { PreToolUse: [{ hooks: [{ type: 'command', command: hook }] }] }, mcpServers: { fixture: { command: process.execPath, args: [server] } } }), { mode: 0o600 })
+    hooks: { PreToolUse: [{ hooks: [{ type: 'command', command: hookCommand }] }] }, mcpServers: { fixture: { command: process.execPath, args: [server] } } }), { mode: 0o600 })
   const client = await open()
   const init = await client.ready
   assert.ok((await client.request('models')).some(model => model.value === testModel && model.isEnabled !== false), '指定测试模型未在 CN CLI 目录中开放，停止验收，避免静默使用 Auto')
   await client.request('setModel', testModel)
   await check('Q09.fixture-byok-lifecycle', async () => {
     const provider = 'uniagent-local-fixture'
+    const validations: Array<{ model?: string; stream?: boolean; includeUsage?: boolean }> = []
     const upstream = createServer(async (request, response) => {
-      for await (const _chunk of request) {}
+      let raw = ''; for await (const chunk of request) raw += chunk
+      const input = raw ? JSON.parse(raw) : {}
+      if (!request.url?.endsWith('/models')) validations.push({ model: input.model, stream: input.stream, includeUsage: input.stream_options?.include_usage })
+      const usage = { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
+      if (input.stream) {
+        response.writeHead(200, { 'Content-Type': 'text/event-stream' })
+        for (const value of [
+          { id: 'fixture', object: 'chat.completion.chunk', model: 'fixture-model', choices: [{ index: 0, delta: { role: 'assistant', content: 'BYOK_CN_OK' }, finish_reason: null }] },
+          { id: 'fixture', object: 'chat.completion.chunk', model: 'fixture-model', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage }
+        ]) response.write('data: ' + JSON.stringify(value) + '\n\n')
+        response.end('data: [DONE]\n\n')
+        return
+      }
       response.setHeader('Content-Type', 'application/json')
       response.end(JSON.stringify(request.url?.endsWith('/models') ? { object: 'list', data: [{ id: 'fixture-model', object: 'model' }] }
-        : { id: 'fixture', object: 'chat.completion', model: 'fixture-model', choices: [{ index: 0, message: { role: 'assistant', content: 'BYOK_CN_OK' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }))
+        : { id: 'fixture', object: 'chat.completion', model: 'fixture-model', choices: [{ index: 0, message: { role: 'assistant', content: 'BYOK_CN_OK' }, finish_reason: 'stop' }], usage }))
     })
     await new Promise<void>(done => upstream.listen(0, '127.0.0.1', done))
     const port = (upstream.address() as any).port
@@ -111,6 +163,9 @@ send({jsonrpc:'2.0',id:v.id,result});})`)
       const value = { providerId: provider, displayName: 'Local fixture', baseUrl: `http://127.0.0.1:${port}/v1`, apiKey: 'fixture-local-only', protocol: 'openai', models: [{ model: 'fixture-model' }] }
       const checked = await client.request('byok.check', value)
       assert.equal(checked.success, true, checked.error)
+      assert.ok(validations.length > 0, 'the native CLI must validate the configured model against the local endpoint')
+      assert.ok(validations.every(request => request.model === 'fixture-model'), 'validation preserves the requested model')
+      assert.ok(validations.some(request => request.stream === true && request.includeUsage === true), 'native validation must consume the completed usage-bearing SSE response')
       await client.request('byok.create', value)
       assert.ok((await client.request('byok.list')).some(row => row.providerId === provider))
       await client.request('byok.update', { providerId: provider, displayName: 'Updated fixture' })
@@ -172,11 +227,15 @@ send({jsonrpc:'2.0',id:v.id,result});})`)
   await check('Q20.additional-directory', async () => { await client.request('addDirectories', [extra]) })
   await check('Q32.plan-control', async () => { await client.request('setPlanMode', true); const plan = await client.request('getPlanMode'); assert.equal(plan.active, true); await client.request('setPlanMode', false) })
   let nativeId: string | undefined
+  let completedRoleReplyText: string | undefined
   await check('Q11.Q16.Q38.role-question-mcp', async () => {
     const rows = await turn(client, 'Call fixture MCP proof tool. Then use AskUserQuestion with one question and options A and B. After the answer, report the MCP result and role marker. Do not write files or use Bash.')
     nativeId = rows.find(row => row.type === 'system' && row.subtype === 'init')?.session_id || rows.find(row => row.session_id)?.session_id
     assert.match(text(rows), /MCP_CN_OK/); assert.match(text(rows), /ROLE_CN_OK/)
     assert.ok(rows.some(row => row.message?.content?.some?.(block => block.type === 'tool_use' && block.name === 'AskUserQuestion')))
+    completedRoleReplyText = rows.find(row => row.type === 'result')?.result
+    assert.equal(typeof completedRoleReplyText, 'string')
+    assert.ok(completedRoleReplyText)
     return { nativeId }
   })
   await check('Q16.external-mcp-elicitation', async () => {
@@ -209,25 +268,53 @@ send({jsonrpc:'2.0',id:v.id,result});})`)
   await check('Q19.image-and-file-input', async () => { const rows = await turn(client, 'Confirm that an image attachment is present. Reply IMAGE_CN_OK. Do not use tools.', [{ kind: 'image', path: image }, { kind: 'file', path: hook }]); assert.match(text(rows), /IMAGE_CN_OK/) })
   await check('Q29.subagent-history', async () => {
     const rows = await turn(client, 'Use the Agent tool with fixture-reader to read the workspace and return CHILD_CN_OK. Then report its result. Do not perform the subagent task yourself.')
-    const child = rows.find(row => row.type === 'system' && row.subtype === 'task_started')
-    assert.ok(child?.task_id, 'native child task identity is required')
-    const nativeHistoryId = rows.find(row => row.type === 'user' && row.tool_use_result?.agentId && row.message?.content?.some?.(block => block.type === 'tool_result' && block.tool_use_id === child.tool_use_id))?.tool_use_result.agentId
+    const call = rows.filter(row => row.type === 'assistant' && !row.parent_tool_use_id).flatMap(row => row.message?.content || [])
+      .find(block => block.type === 'tool_use' && block.name === 'Agent' && block.input?.subagent_type === 'fixture-reader')
+    assert.ok(call?.id, 'the foreground child must come from the requested native Agent invocation')
+    const nativeHistoryId = rows.find(row => row.type === 'user' && row.tool_use_result?.agentId && row.message?.content?.some?.(block => block.type === 'tool_result' && block.tool_use_id === call.id))?.tool_use_result.agentId
     assert.ok(nativeHistoryId, 'tool result must provide the actual child history identity')
     const history = await client.request('subagentHistory', { sessionId: nativeId, agentId: nativeHistoryId })
     assert.ok(history.length > 0)
     assert.match(text(history), /CHILD_CN_OK/)
-    return { childTaskId: child.task_id, nativeHistoryId }
+    const projected = projectedNativeAgent(rows, nativeHistoryId, 'completed')
+    assert.equal(projected.dispatchId, call.id)
+    return { childToolUseId: call.id, nativeHistoryId, projectedTaskId: projected.agentThreadId }
   })
   await check('Q29.subagent-cancellation', async () => {
-    let taskId: string | undefined, cancellation: Promise<unknown> | undefined
+    let agentId: string | undefined, cancellation: Promise<unknown> | undefined
+    const observed: any[] = []
+    const projection = new QoderRunner('native-cancel-projection', { n: 0 })
+    const projectedAgents: any[] = []
+    projection.on('event', event => { if (event.type === 'subagent') projectedAgents.push(...event.payload.agents) })
+    ;(projection as any).sdk = client
     const cancel = (row: any) => {
-      if (row.type === 'system' && row.subtype === 'task_started' && !taskId) { taskId = row.task_id; cancellation = client.request('stopTask', taskId); void cancellation.catch(() => {}) }
+      observed.push(row)
+      projection.acceptMessage(row)
+      const receipt = row.type === 'user' && row.tool_use_result
+      if (receipt?.isAsync === true && receipt.status === 'async_launched' && typeof receipt.agentId === 'string' && !agentId) {
+        agentId = receipt.agentId
+        cancellation = Promise.resolve().then(() => {
+          const projected = projectedAgents.filter(agent => agent.nativeHistoryId === agentId).at(-1)
+          assert.ok(projected, 'the actual Runner card must provide the native child cancellation identity')
+          return projection.control('stopTask', projected.agentThreadId)
+        })
+        void cancellation.catch(() => {})
+      }
     }
     client.on('message', cancel)
     try {
-      const rows = await turn(client, 'Start a general-purpose Agent to use Bash to sleep 30 seconds, then return CANCEL_CHILD_END. Wait for that agent. Do not sleep in the parent.')
-      assert.ok(taskId); await cancellation
-      assert.ok(rows.some(row => row.type === 'system' && row.subtype === 'task_notification' && row.task_id === taskId && row.status === 'stopped'))
+      const rows = await turn(client, 'Start a general-purpose Agent with run_in_background=true to use Bash to sleep 30 seconds, then return CANCEL_CHILD_END. Wait for that background agent. Do not sleep in the parent.')
+      const { call, receipt } = backgroundAgentLaunch(rows, 'general-purpose')
+      assert.equal(agentId, receipt.agentId); await cancellation
+      const notification = await waitForNativeRow(client, observed, row => row.type === 'system' && row.subtype === 'task_notification' && row.output_file === receipt.outputFile)
+      assert.equal(notification.status, 'stopped')
+      const sessionId = rows.find(row => row.session_id)?.session_id
+      const history = await client.request('subagentHistory', { sessionId, agentId: receipt.agentId })
+      assert.match(JSON.stringify(history), /\[Request interrupted by user\]/)
+      assert.doesNotMatch(text(history), /CANCEL_CHILD_END/)
+      const projected = projectedNativeAgent(observed, receipt.agentId, 'interrupted')
+      assert.equal(projected.dispatchId, call.id)
+      return { childToolUseId: call.id, nativeHistoryId: receipt.agentId, projectedTaskId: projected.agentThreadId, taskId: notification.task_id, status: notification.status }
     } finally { client.off('message', cancel) }
   })
   await check('Q12.role-tools-apply-to-subagents', async () => {
@@ -236,11 +323,22 @@ send({jsonrpc:'2.0',id:v.id,result});})`)
     const restricted = new QoderSdkClient(launch); clients.add(restricted)
     restricted.on('approval', request => restricted.respond(request.requestId, { behavior: 'allow', updatedInput: request.input }))
     await restricted.ready
+    const observed: any[] = []
+    const observe = (row: any) => observed.push(row)
+    restricted.on('message', observe)
     try {
-      const rows = await turn(restricted, 'Use a general-purpose Agent to try Write to create role-forbidden.txt with ROLE_WRITE_FORBIDDEN, then report whether the write was allowed. Do not perform the write in the parent.')
-      assert.ok(rows.some(row => row.type === 'system' && row.subtype === 'task_started'))
+      const rows = await turn(restricted, 'Use a general-purpose Agent with run_in_background=true to try Write to create role-forbidden.txt with ROLE_WRITE_FORBIDDEN, then report whether the write was allowed. Wait for that background agent. Do not perform the write in the parent.')
+      const { call, receipt } = backgroundAgentLaunch(rows, 'general-purpose')
+      const notification = await waitForNativeRow(restricted, observed, row => row.type === 'system' && row.subtype === 'task_notification' && row.output_file === receipt.outputFile)
+      assert.equal(notification.status, 'completed', 'the real restricted child must finish before checking its write result')
+      const sessionId = rows.find(row => row.session_id)?.session_id
+      const history = await restricted.request('subagentHistory', { sessionId, agentId: receipt.agentId })
+      assert.ok(text(history).trim(), 'the real restricted child must provide a final response')
       await assert.rejects(readFile(join(cwd, 'role-forbidden.txt')))
-    } finally { await restricted.close(); clients.delete(restricted) }
+      const projected = projectedNativeAgent(observed, receipt.agentId, 'completed')
+      assert.equal(projected.dispatchId, call.id)
+      return { childToolUseId: call.id, nativeHistoryId: receipt.agentId, projectedTaskId: projected.agentThreadId, taskId: notification.task_id, status: notification.status }
+    } finally { restricted.off('message', observe); await restricted.close(); clients.delete(restricted) }
   })
   await check('Q24.Q26.history-forks', async () => {
     assert.ok(nativeId)
@@ -248,9 +346,14 @@ send({jsonrpc:'2.0',id:v.id,result});})`)
     assert.ok(history.length > 1)
     const user = history.find(row => row.type === 'user' && typeof row.message?.content === 'string')
     assert.ok(user?.uuid)
+    const completed = history.find(row => row.type === 'assistant' && text([row]) === completedRoleReplyText)
+    assert.ok(completed?.uuid, 'use the persisted entry of the actually completed source reply')
     const whole = await client.request('forkSession', { sessionId: nativeId })
-    const point = await client.request('forkSession', { sessionId: nativeId, messageId: user.uuid })
+    const point = await client.request('forkSession', { sessionId: nativeId, messageId: completed.uuid })
     assert.ok(whole.sessionId !== nativeId && point.sessionId !== whole.sessionId)
+    const prefix = await client.request('history', { sessionId: point.sessionId })
+    assert.equal(prefix.at(-1)?.type, 'assistant', 'cold continuation retains a completed history point')
+    assert.equal(text([prefix.at(-1)]), completedRoleReplyText)
     const resumed = await open(point.sessionId)
     assert.match(text(await turn(resumed, 'Reply FORK_CN_OK without tools.')), /FORK_CN_OK/)
     await resumed.close(); clients.delete(resumed)

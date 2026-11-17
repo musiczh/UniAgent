@@ -4,7 +4,7 @@ import type { UAEvent } from '../src/shared/types'
 
 const sessionId = 'message-prompts'
 const event = (seq: number, type: UAEvent['type'], payload: UAEvent['payload']): UAEvent => ({ sessionId, seq, ts: 1000 + seq, type, payload })
-const wire = '请独立分配这一项新输入。先 router_query mode=bootstrap。\n\n本轮请求数据：\n{"input":"检查布局"}'
+const wire = '本轮路由请求：\n{"requestId":"fixture-request","input":"检查布局","version":1,"hardScope":{"kind":"global"}}'
 const events = [
   event(0, 'user_message', { text: '用户自己写的 router_query 与 [system] 原样保留' }),
   event(1, 'turn_completed', {}),

@@ -319,6 +319,12 @@ export function SubAgentPanel({
                 {canCancel && currentCancel?.failed && active.status === 'running' && (
                   <div className="detail-sub subagent-cancel-error" role="alert">取消失败，请重试。子智能体仍在运行。</div>
                 )}
+                {(active.requestedModel || active.servedModel) && <div className="detail-sub">
+                  请求：{active.requestedModel || '未知'}{active.modelVariant ? ` · ${active.modelVariant}` : ''}<br />
+                  实际：{active.servedModel || '尚未确认'}
+                  {active.executionPhase && ` · ${active.executionPhase}`}
+                  {!!active.fallbackReasons?.length && <><br />回退原因：{active.fallbackReasons.join('、')}</>}
+                </div>}
                 <div className="subagent-detail-stream">
                   {loading || loadedThreadId !== active.agentThreadId ? (
                     <div className="subagent-empty">加载中…</div>

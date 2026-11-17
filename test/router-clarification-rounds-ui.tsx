@@ -30,8 +30,10 @@ const result=await renderEventStream([], 'idle', 'router-clarification-rounds', 
   inspect:`(async()=>{
     const f=window.roundsFixture,tick=()=>new Promise(r=>setTimeout(r,15)),wait=async check=>{for(let i=0;i<180;i++){if(check())return;await tick()}throw Error('Round UI timeout: '+f.host.textContent+' / '+f.errors)};
     const cards=()=>[...f.host.querySelectorAll('[data-router-request="clarify"]')],button=(card,text)=>[...card.querySelectorAll('button')].find(row=>row.textContent===text);
+    const method=card=>card.querySelector('.router-assignment-method strong').textContent,guidance='澄清已结束，后续分配进展请查看下方的新卡片。';
     await wait(()=>cards().length===1&&f.host.querySelector('.router-task-composer'));const initial=cards()[0];
     const checks={choicesFirst:initial.querySelectorAll('input[type=radio]').length===3,noTextBeforeCustom:!initial.querySelector('[aria-label="补充路由信息"]'),duplicateReplyHidden:!f.host.querySelector('.router-list-view').textContent.includes('卡片外重复的澄清说明'),clarificationActionsHidden:!f.host.querySelector('.message-actions.agent')};if(!checks.choicesFirst)return{checks,errors:f.errors};
+    checks.pendingClarificationMethod=method(initial)==='等待补充信息'&&!initial.textContent.includes(guidance);
     initial.querySelectorAll('input[type=radio]')[2].click();await wait(()=>initial.querySelector('[aria-label="补充路由信息"]'));checks.customEmptyBlocked=button(initial,'继续分配').disabled;
     checks.otherLabel=initial.querySelectorAll('input[type=radio]')[2].closest('label').textContent==='其他';
     const custom=initial.querySelector('[aria-label="补充路由信息"]');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(custom,'待保留的自填答案');custom.dispatchEvent(new Event('input',{bubbles:true}));await tick();
@@ -39,13 +41,18 @@ const result=await renderEventStream([], 'idle', 'router-clarification-rounds', 
     initial.querySelectorAll('input[type=radio]')[2].click();await tick();checks.customDraftKept=initial.querySelector('[aria-label="补充路由信息"]').value==='待保留的自填答案';
     initial.querySelectorAll('input[type=radio]')[1].click();await tick();button(initial,'继续分配').click();button(initial,'继续分配').click();await wait(()=>f.resolutions.length===1);
     checks.choiceSubmitsPlainAnswer=f.resolutions[0].input.optionId===undefined&&f.resolutions[0].input.expectedVersion===4&&f.resolutions[0].input.action==='answer'&&f.resolutions[0].input.answer==='把黄框里的「按项目和需求组织侧栏」移到 superAgent 配置页';
-    f.resolutions[0].reject(Error('暂时提交失败'));await wait(()=>initial.textContent.includes('暂时提交失败'));checks.failedChoiceRetained=initial.querySelectorAll('input[type=radio]')[1].checked;
+    f.resolutions[0].reject(Error('暂时提交失败'));await wait(()=>initial.textContent.includes('操作暂未完成，请重试。'));checks.failedChoiceRetained=initial.querySelectorAll('input[type=radio]')[1].checked&&!initial.textContent.includes('暂时提交失败');
+    checks.failedSubmitStillNeedsInput=method(initial)==='等待补充信息'&&!initial.dataset.routerClarification&&!initial.textContent.includes(guidance);
     button(initial,'继续分配').click();await wait(()=>f.resolutions.length===2);f.resolutions[1].resolve();await wait(()=>cards().some(card=>card.textContent.includes('澄清结束')));
     checks.queueKeepsOnlyFrozenCard=cards().length===1&&!!f.host.querySelector('.router-input-queue')&&!cards()[0].querySelector('input');
     const frozen=cards()[0],oldText=frozen.textContent;checks.frozenAnswerSaved=frozen.querySelector('.router-clarification-answer').textContent.includes('把黄框里的「按项目和需求组织侧栏」移到 superAgent 配置页');
+    checks.completedStatusConsistent=method(frozen)==='澄清结束'&&frozen.querySelector('.router-assignment-status').textContent===method(frozen);
+    checks.completedGuidance=frozen.querySelector('footer>span').textContent===guidance;
     f.late();await tick();checks.lateOriginalReceiptCannotChangeFrozenCard=cards()[0].textContent===oldText;
     f.start();await wait(()=>cards().length===2);checks.newCardAfterSend=cards().some(card=>card.textContent.includes('正在分配'))&&!f.host.querySelector('.router-input-queue');checks.oldCardUnchangedOnSend=frozen.textContent===oldText;
+    const current=()=>cards().find(card=>!card.dataset.routerClarification);checks.newRoundDoesNotUseCompletedStatus=method(current())==='正在判断'&&!current().textContent.includes(guidance);
     f.finish();await wait(()=>cards().some(card=>card.textContent.includes('分配成功')));checks.oldCardUnchangedOnResult=frozen.textContent===oldText;checks.noDuplicateCurrentCard=cards().length===2;checks.oldReplyStaysHidden=!f.host.querySelector('.router-list-view').textContent.includes('卡片外重复的澄清说明');checks.successReplyHidden=!f.host.querySelector('.router-list-view').textContent.includes('新的分配已经完成');
+    checks.newResultShowsActualMethod=method(current())==='在已有需求中新建任务'&&!current().textContent.includes(guidance);
     f.restart();await wait(()=>cards().length===2&&f.host.querySelector('.router-task-composer'));checks.restoredFrozenHistory=cards().find(card=>card.dataset.routerClarification)?.textContent===oldText;
     f.offline();await wait(()=>f.host.querySelector('.router-unavailable'));checks.disabledRouterKeepsBothCards=cards().length===2&&cards().find(card=>card.dataset.routerClarification)?.textContent===oldText;
     f.emptyCandidates();await wait(()=>cards().some(card=>card.textContent.includes('请自行补充')));const empty=cards().find(card=>!card.dataset.routerClarification);

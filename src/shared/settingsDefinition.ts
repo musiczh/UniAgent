@@ -1,4 +1,5 @@
 import { APP_NAME, INTERNAL_DISTRIBUTION } from './distribution'
+import { QUOTA_QUERY_TEMPLATES } from './modelSourceQuota'
 import { COLOR_THEMES } from './colorThemes'
 import { ALL_EFFORTS, DEFAULT_ENABLED_AGENT_IDS } from './types'
 import { DEFAULT_ROUTER_CONFIG } from './router'
@@ -6,6 +7,7 @@ import { DISTRIBUTION_SETTINGS_CATEGORIES, DEFAULT_SIDEBAR_SHORTCUTS, MAX_SIDEBA
 
 export interface SettingSchema {
   type: 'boolean' | 'string' | 'integer' | 'array' | 'object'
+  description?: string
   enum?: readonly (string | number)[]
   enumLabels?: Record<string,string>
   minimum?: number; maximum?: number; maxLength?: number; maxItems?: number
@@ -20,7 +22,7 @@ export interface SettingField extends SettingSchema {
 }
 export interface SettingsSection {
   path: string; title: string; description?: string
-  store: 'app' | 'assistant'
+  store: 'app' | 'assistant' | 'model-sources'
   persistence?: 'native'
   /** Object-valued settings expose their properties as the section's fields. */
   key?: string
@@ -46,6 +48,17 @@ const feishuFields = (): Record<string,SettingField> => ({
 
 /** Source of truth for settings discovery, controls, validation and editing. */
 export const SETTINGS_SECTIONS: SettingsSection[] = [
+  { path: '/codex-sources/configuration', title: '模型数据源与生效范围', store: 'model-sources', fields: {
+    sources: { type: 'array', label: '数据源', description: '来源数组整体替换；保留稳定 ID。凭据通过专用密码表单保存，地址变更也使用专用流程。', default: [], maxItems: 100, items: { type: 'object', required: ['id','name','preset','enabled','endpoints','models'], properties: {
+      id: { type: 'string', maxLength: 100 }, name: { type: 'string', maxLength: 100 }, preset: { type: 'string', enum: ['deepseek','glm','mimo','ark-coding-plan','custom','kimi'] }, plan: { type: 'string', maxLength: 100 }, enabled: { type: 'boolean' },
+      consoleUrl: { type: 'string', maxLength: 2000, description: '查看来源额度的 HTTPS 控制台地址；不得包含用户名、密码或凭据参数。留空使用官方入口。' },
+      quotaQuery: { type: 'object', description: '额度查询配置；默认自动识别。查询凭据仅通过专用表单加密保存。', required: ['template'], properties: { template: { type: 'string', enum: QUOTA_QUERY_TEMPLATES.map(item => item.id) }, userId: { type: 'string', maxLength: 30, description: 'New API 用户 ID' }, unit: { type: 'string', enum: ['quota', 'USD', 'CNY'], description: '默认原始额度；金额单位需要站点换算比例。' }, quotaPerUnit: { type: 'integer', minimum: 1, maximum: 1000000000000000, description: '站点每单位金额对应的原始额度' } } },
+      endpoints: { type: 'array', maxItems: 10, items: { type: 'object', required: ['id','protocol','baseUrl','auth'], properties: { id: { type: 'string', maxLength: 100 }, protocol: { type: 'string', enum: ['openai-chat','openai-responses','anthropic-messages'] }, baseUrl: { type: 'string', maxLength: 2000 }, auth: { type: 'string', enum: ['bearer','x-api-key','none'] } } } },
+      models: { type: 'array', maxItems: 100, items: { type: 'object', required: ['id','label','routes'], properties: { id: { type: 'string', maxLength: 200 }, label: { type: 'string', maxLength: 200 }, maxContextWindow: { type: 'integer', minimum: 1, maximum: 10000000 }, routes: { type: 'array', maxItems: 10, items: { type: 'object', required: ['endpointId','upstreamModel'], properties: { endpointId: { type: 'string', maxLength: 100 }, upstreamModel: { type: 'string', maxLength: 200 } } } }, capabilities: { type: 'object', properties: { contextWindow: { type: 'integer', minimum: 1, maximum: 10000000 }, imageInput: { type: 'boolean' }, efforts: { type: 'array', maxItems: 20, items: { type: 'string', enum: ALL_EFFORTS } }, defaultEffort: { type: 'string', enum: ALL_EFFORTS }, thinkingOptions: { type: 'array', maxItems: 20, items: { type: 'string', maxLength: 100 } } } } } } }
+    } } },
+    quotaCredentialStatus: { type: 'array', label: '额度查询凭据状态', description: '只读；按来源返回凭据类型与是否已配置，不返回凭据内容。AK/SK 和访问令牌通过专用表单管理。', readOnly: true, items: { type: 'object', properties: { sourceId: { type: 'string' }, type: { type: 'string', enum: ['ak-sk', 'access-token', 'source-key'] }, configured: { type: 'boolean' } } } },
+    bindings: { type: 'array', label: 'Agent 生效范围', description: '绑定数组整体替换；各 Agent 独立应用，模型与协议必须属于对应数据源。', default: [], maxItems: 3000, items: { type: 'object', required: ['sourceId','agentId','enabled','endpointId','modelIds'], properties: { sourceId: { type: 'string', maxLength: 100 }, agentId: { type: 'string', options: 'agents', maxLength: 100 }, enabled: { type: 'boolean' }, endpointId: { type: 'string', maxLength: 100 }, modelIds: { type: 'array', maxItems: 100, uniqueItems: true, items: { type: 'string', maxLength: 200 } } } } }
+  } },
   { path: '/general/updates', title: '应用更新', store: 'app', fields: {
     autoCheckUpdate: flag('自动检查更新', '启动时后台检查' + (INTERNAL_DISTRIBUTION ? ' Bits 版本目录' : ' GitHub 公开版本'), true)
   } },

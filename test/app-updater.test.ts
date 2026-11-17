@@ -33,7 +33,7 @@ function latestRelease(version: string) {
       size: 123,
       sha256: 'a'.repeat(64)
     },
-    downloadUrl: `https://code.byted.org/zhenghuan.zheng/UniAgent/raw/master/release/v${version}/UniAgent-${version}-arm64.dmg`,
+    downloadUrl: `https://code.byted.org/api/v2/api/2022-06-01/DownloadRepoFile?RepoId=1138886&FilePath=${encodeURIComponent(`release/v${version}/UniAgent-${version}-arm64.dmg`)}&Revision=master&FollowLFSPointer=true`,
     releaseUrl
   }
 }
@@ -62,7 +62,7 @@ test('app updater compares Bits versions, caches for six hours, and stays offlin
     currentVersion: '1.2.9',
     latestVersion: '1.10.0',
     hasUpdate: true,
-    downloadUrl: 'https://code.byted.org/zhenghuan.zheng/UniAgent/raw/master/release/v1.10.0/UniAgent-1.10.0-arm64.dmg',
+    downloadUrl: 'https://code.byted.org/api/v2/api/2022-06-01/DownloadRepoFile?RepoId=1138886&FilePath=release%2Fv1.10.0%2FUniAgent-1.10.0-arm64.dmg&Revision=master&FollowLFSPointer=true',
     releaseUrl,
     checkedAt: 100
   })

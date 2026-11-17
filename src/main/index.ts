@@ -6,6 +6,11 @@ import { cloudMonitorConfig } from '../shared/cloudMonitorConfig'
 import { CloudMonitor } from './cloudMonitor'
 import { FORK_IPC, type ForkRequest } from '../shared/sessionFork'
 import { ClaudeSourceService } from './claudeSourceService'
+import { ModelSourceService } from './model-sources/service'
+import { modelSourceAdapters, modelSourceClaudeConnection, modelSourceCodexArgs } from './model-sources/adapters'
+import { MODEL_SOURCE_IPC, type ModelSourceSave, type ModelSourceInput } from '../shared/modelSources'
+import { configureAgentModelsProjection } from './agents'
+
 import { configureClaudeSourceRuntime, closeClaudeSourceRuntimes } from './claudeSourceRuntime'
 import { CLAUDE_SOURCE_IPC, MODEL_CREDENTIAL_IPC, type ModelSourceClient, type CredentialSelection } from '../shared/claudeSources'
 import { ModelCredentials } from './modelCredentials'
@@ -43,19 +48,19 @@ import { TaskTitleService } from './taskTitleService'
 import { RouterController } from './router/controller'
 import { RouterContextService } from './router/context'
 import { createRouterStore } from './router/store'
-import { generateDeepSeekTitle } from './taskTitleDeepSeek'
 import { getDeepSeekHost } from './deepseekService'
-import { configureGlobalMemoryContext } from './assistant/context'
+import { configureProjectContext, currentAssistantContext, queryAssistantContext } from './assistant/context'
 import { ProjectMemoryService } from './projectMemory'
 import { configureProjectMemoryRuntime } from './projectMemoryRuntime'
 import { configureRequirementNavigation } from './requirementNavigation'
 import { PROJECT_MEMORY_IPC, PROJECT_MEMORY_CHANGED, type ProjectMemoryRequest } from '../shared/projectMemory'
 import { routerTargetVersion } from './router/target'
-import { ROUTER_IPC, routerConfig, resolveRouterConfig, type RouterConfig, type RouterInput, type RouterResolution, type GlobalMemoryRequest } from '../shared/router'
+import { ROUTER_IPC, routerConfig, resolveRouterConfig, type RouterConfig, type RouterInput, type RouterResolution } from '../shared/router'
 import { ROUTER_REVIEW_IPC, type RouterFeedbackInput, type RouterReviewQuery, type RouterReviewDeletionItem } from '../shared/routerReview'
 import { isSessionBusy } from '../shared/sessionStatus'
 import { bindTaskTitleLocalSourceChanges, bindTaskTitleSourceChanges, taskTitleGeneratorSignature, taskTitleSelectionMatches, taskTitleSessionPolicy, TaskTitleIntegration, TaskTitleTrials, type TaskTitleSelectionChange, type TaskTitleTrialInput } from './taskTitleIntegration'
 import { TaskTitleRuntimePool, type TaskTitleUsage } from './taskTitleRuntime'
+import { generateRouterContext } from './router/summary'
 import { TaskGenerationConversations, registerTaskGenerationIpc } from './taskGenerationConversation'
 import { TASK_GENERATION_IPC } from '../shared/taskGeneration'
 import { QuickReplyService } from './quickReplyService'
@@ -67,7 +72,7 @@ import { projectTaskBoard, type TaskBoardQuery } from '../shared/taskBoard'
 import { RequirementDistiller } from './requirementDistiller'
 import { resolveTaskTitleConfig } from '../shared/taskTitle'
 import { runRequirementCuration } from './requirementCurationRuntime'
-import { configureRequirementRuntime, isRequirementsEnabled, requirementCaller, setRequirementsEnabled } from './requirementRuntime'
+import { configureRequirementRuntime, isRequirementsEnabled, requirementCaller, requirementContextForCaller, setRequirementsEnabled } from './requirementRuntime'
 import { REQUIREMENT_IPC, type RequirementInput, type RequirementPatch } from '../shared/requirementTypes'
 import { app, BrowserWindow, ipcMain, dialog, shell, clipboard, nativeImage, Notification, powerSaveBlocker } from 'electron'
 import { dirname, isAbsolute, join, relative } from 'node:path'
@@ -96,7 +101,7 @@ import { configureQoderRegionProvider } from './agents'
 import { PrefsStore } from './prefsStore'
 import { AppSettingsStore } from './appSettingsStore'
 import { defaultRecoverySettings } from '../shared/sessionRecovery'
-import { CodexSourceService } from './codexSourceService'
+import { CodexSourceService, mergeCodexSourceModels } from './codexSourceService'
 import { cancelDeepSeekInstall, cancelDeepSeekSignIn, checkDeepSeekConnection, closeDeepSeekHost, configureDeepSeekOnboarding, deepseekSnapshot, installDeepSeek, isDeepSeekMaintenance, readDeepSeekConnection, readDeepSeekReusableConnection, reopenDeepSeekSignIn, saveDeepSeekConnection, signInDeepSeek, signOutDeepSeek } from './deepseekService'
 import { DEEPSEEK_IPC, type DeepSeekConnectionInput } from '../shared/deepseek'
 import { cancelMCodeOperation, checkMCodeConnection, installMCode, mcodeSnapshot, reopenMCodeSignIn, signInMCode } from './mcodeService'
@@ -129,6 +134,7 @@ import { FeishuInstaller, type FeishuInstallProgress } from './feishuInstaller'
 import {
   ensureHandoffServer,
   watchHandoffInbox,
+  watchContextInbox,
   watchAutomationInbox,
   watchFeishuSendInbox,
   watchTeamInbox,
@@ -315,9 +321,23 @@ const worktreeProjectChanges = new Set<string>()
 const codexConfigMutations = new CodexConfigMutationQueue()
 const codexSources = new CodexSourceService()
 const claudeSources = new ClaudeSourceService()
+const modelSources: ModelSourceService = new ModelSourceService({ agents: () => agents, adapters: modelSourceAdapters, busy: (id, sourceId) => orchestrator.hasActiveAgentSessions(id, config => modelSources.usesSource(config, sourceId)),  })
+const projectSourceModels = (agent: AgentDef): AgentDef => {
+  const merged = modelSources.mergeModels(agent.id, agent.models)
+  const models = agent.id === 'codex' ? mergeCodexSourceModels([], merged) : merged
+  return { ...agent, models, ...(models.some(model => model.modelSource?.kind === 'third-party') ? { authenticationRequired: false } : {}), capabilities: { ...agent.capabilities, reasoningEffort: models.some(model => model.efforts.length > 0) } }
+}
+configureAgentModelsProjection(projectSourceModels)
+for (const agentId of ['codex', 'claude', 'qoder', 'deepseek', 'kimi', 'mcode', 'zcode']) bindTaskTitleSourceChanges(modelSources, agentId, invalidateTaskTitleSelection)
+modelSources.on('changed', snapshot => {
+  mainWindow?.webContents.send(MODEL_SOURCE_IPC.changed, snapshot)
+  agents = agentLifecycle.projectModels(projectSourceModels)
+  mainWindow?.webContents.send(IPC.lifecycleProgress, { agentId: '*', phase: 'completed', message: '模型数据源状态已更新' })
+})
+modelSources.on('quotaChanged', snapshot => { mainWindow?.webContents.send(MODEL_SOURCE_IPC.changed, snapshot) })
 const modelCredentials = new ModelCredentials({ codex: () => codexSources.reusableSources(), claude: () => claudeSources.reusableSources(), deepseek: readDeepSeekReusableConnection })
 configureClaudeModelsProvider(models => claudeSources.refreshModels(models))
-configureClaudeSourceRuntime(config => claudeSources.connection(config))
+configureClaudeSourceRuntime(config => modelSources.owns(config) ? Promise.resolve(modelSourceClaudeConnection(modelSources.connection(config), config)) : claudeSources.connection(config))
 bindTaskTitleSourceChanges(claudeSources, 'claude', invalidateTaskTitleSelection)
 claudeSources.on('changed', snapshot => { mainWindow?.webContents.send(CLAUDE_SOURCE_IPC.changed, snapshot) })
 kimiOnboarding.onChanged = snapshot => mainWindow?.webContents.send('kimi:setup-changed', snapshot)
@@ -340,8 +360,8 @@ const reportZCodeSetup: ZCodeSetupReporter = entry => {
 const zcodeConfiguration = new ZCodeConfigurationService(undefined, reportZCodeSetup)
 const zcodeInstallation = new ZCodeInstallationService(undefined, reportZCodeSetup)
 const codexModelSources = new CodexModelSources(codexSources)
-configureCodexModelsProvider(models => codexModelSources.mergeModels(models))
-configureCodexAppServerArgsProvider(config => codexModelSources.runtimeArgs(config))
+configureCodexModelsProvider(models => codexModelSources.refreshModels(models))
+configureCodexAppServerArgsProvider(config => modelSources.owns(config) ? modelSourceCodexArgs(modelSources.connection(config), config) : codexModelSources.runtimeArgs(config))
 bindTaskTitleSourceChanges(codexSources, 'codex', invalidateTaskTitleSelection)
 codexSources.on('changed', snapshot => { mainWindow?.webContents.send(CODEX_SOURCE_IPC.changed, snapshot) })
 
@@ -354,10 +374,9 @@ configureQoderRegionProvider(() => getAgentPref('qoder')?.qoderRegion || 'cn')
 const resolveSessionConfig = (config: SessionConfig, validate = false): SessionConfig => {
   const { taskScope: _scope, taskRequestId: _requestId, ...executionConfig } = config
   const agent = agents.find(agent => agent.id === config.agentId)
-  const normalized = claudeSources.normalize(codexModelSources.normalize(withAgentDefaults(agent, executionConfig, getAgentPref(config.agentId))))
+  const normalized = normalizeModelSourceConfig(withAgentDefaults(agent, executionConfig, getAgentPref(config.agentId)))
   if (validate) {
-    codexModelSources.assertReady(normalized)
-    claudeSources.assertReady(normalized)
+    assertModelSourceReady(normalized)
     if (normalized.agentId === 'codex' && normalized.modelSource && normalized.modelSource.kind !== 'native' &&
         !agents.find(agent => agent.id === 'codex')?.capabilities.streaming) {
       throw new Error('补充模型需要支持 app-server 的 Codex，不能回退到未隔离的 exec 启动方式')
@@ -365,6 +384,8 @@ const resolveSessionConfig = (config: SessionConfig, validate = false): SessionC
   }
   return requirements.resolveSessionConfig(projects.resolveSessionConfig(normalized, validate), validate)
 }
+function normalizeModelSourceConfig(config: SessionConfig): SessionConfig { return modelSources.owns(config) ? modelSources.normalize(config) : claudeSources.normalize(codexModelSources.normalize(config)) }
+function assertModelSourceReady(config: SessionConfig): void { if (modelSources.owns(config)) modelSources.assertReady(config); else { codexModelSources.assertReady(config); claudeSources.assertReady(config) } }
 let stopRequirementInbox: (() => void) | undefined
 const sessionStore = new SessionStore(undefined, (config) => resolveSessionConfig(config))
 const taskCreations = new TaskCreation(join(sessionStore.directory(), 'task-inputs'))
@@ -374,14 +395,15 @@ const assertAgentRunReady = (agentId: string): void => {
   if (agentId === 'kimi' && kimiOnboarding.busy) throw new Error('Kimi 正在安装、登录或检测，请完成后再启动任务')
   if (agentId === 'deepseek' && (isDeepSeekMaintenance() || agentLifecycle.isUpdating(agentId))) throw new Error('DeepSeek 正在安装、更新或配置登录，请完成后再启动任务')
 }
-const orchestrator = new Orchestrator(
+const orchestrator: Orchestrator = new Orchestrator(
   (id) => agents.find((a) => a.id === id),
   sessionStore,
   undefined,
   undefined,
   (config, validateDirectories) => resolveSessionConfig(config, validateDirectories),
   assertAgentRunReady,
-  getAgentPref
+  getAgentPref,
+  (agentId, models) => modelSources.projectNativeModels(agentId, models)
 )
 const taskLifecycle = new TaskLifecycleService(new TaskLifecycleStore(join(sessionStore.directory(), 'task-lifecycle')), {
   session: id => orchestrator.getSessionById(id), busy: id => orchestrator.hasActiveSessionWork(id),
@@ -495,9 +517,8 @@ const comments = new CommentService({
     throw new Error(result.error || '无法读取完整原文件，请重新打开后划线')
   },
   runtime: (config, callbacks, id) => {
-    const normalized = claudeSources.normalize(codexModelSources.normalize(config))
-    codexModelSources.assertReady(normalized)
-    claudeSources.assertReady(normalized)
+    const normalized = normalizeModelSourceConfig(config)
+    assertModelSourceReady(normalized)
     return createCommentRuntime(normalized, callbacks, join(sessionStore.directory(), 'comments', 'runtime', id),
       id => agents.find(agent => agent.id === id), getAgentPref, assertAgentRunReady)
   }
@@ -554,7 +575,7 @@ const requirementDistiller = new RequirementDistiller(requirements, {
     const choice = resolved.config!
     await awaitAgentReady(choice.agentId)
     return runRequirementCuration(requirements, session.config.requirementId!, agents.find(agent => agent.id === choice.agentId)!, choice, prompt, signal, images, {
-      normalizeCodex: config => { const normalized = codexModelSources.normalize(config); codexModelSources.assertReady(normalized); return normalized }
+      normalizeCodex: config => { const normalized = normalizeModelSourceConfig(config); assertModelSourceReady(normalized); return normalized }
     })
   },
   report: (id, message) => orchestrator.reportRequirementSyncError(id, message)
@@ -588,7 +609,9 @@ const nativeAutomations = new NativeAutomations({
     if (!isCurrent()) return null
     const input = validateNativeAutomation(task as NativeAutomationInput)
     const config = resolveSessionConfig(resolveAutomationTaskConfig(input, id => requirements.get(id), id => !!projects.get(id), isRequirementsEnabled()), true)
-    return orchestrator.createSession(config, input.prompt)
+    const session = orchestrator.createSession(config, input.prompt)
+    mainWindow?.webContents.send(IPC.sessionCreated, session)
+    return session
   },
   getSession: id => orchestrator.getSessionById(id),
   getError: nativeAutomationError,
@@ -682,19 +705,17 @@ let projectMemory: ProjectMemoryService
 const router: RouterController = new RouterController(createRouterStore(join(sessionStore.directory(),'router','router.sqlite'),
   app.isPackaged ? join(process.resourcesPath, 'tokenizers', 'deepseek-v4') : join(app.getAppPath(), 'resources', 'tokenizers', 'deepseek-v4')), {
   appVersion: () => app.getVersion(),
+  runtimeContext: (id, tool, args) => tool === 'uniagent_query' ? queryAssistantContext(id, args) : requirementContextForCaller(id, args as import('../shared/requirementTypes').RequirementContextRequest),
   projectMemory: (sessionId, args) => projectMemory.forSession(sessionId, args as ProjectMemoryRequest),
-  currentProjectMemory: row => projectMemory.isCurrent(row),
-  memoryChanged: () => mainWindow?.webContents.send(PROJECT_MEMORY_CHANGED),
   reviewSaved: async feedback => { await cloudMonitor.feedback(feedback) },
   agents:()=>agents,config:()=>appSettings.get().router,saveConfig:config=>{appSettings.set({router:config})},orchestrator,
-  extractMemory:(config,prompt,signal)=>generateDeepSeekTitle(config,prompt,signal,getDeepSeekHost,()=>{}),
-  generateDescription:(config,prompt,signal)=>generateDeepSeekTitle(config,prompt,signal,getDeepSeekHost,()=>{}),
-  generateRouting:(config,prompt,signal)=>generateDeepSeekTitle(config,prompt,signal,getDeepSeekHost,()=>{},[],{maxOutputChars:20000,maxTokens:16384}),
+  generateDescription:(config,prompt,signal)=>generateRouterContext(agents,config,prompt,signal,false,{deepseekHost:getDeepSeekHost}),
+  generateRouting:(config,prompt,signal)=>generateRouterContext(agents,config,prompt,signal,true,{deepseekHost:getDeepSeekHost}),
   changed:()=>{mainWindow?.webContents.send(ROUTER_IPC.changed);taskBoardChanged();void feishuBridge.syncRouterRequests().catch(error=>recordRuntime('feishu','routing_sync_failed',error))},error:error=>recordRuntime('router','router_operation_failed',error),
   beforeDispatch:(request,session)=>feishuBridge.prepareRoutedSession(request,session),
   objects:()=>routerContext.objects(),
   routing: requirements,
-  referenceObject: id => routerContext.reference(id),
+  taskObject: id => routerContext.detail(id),
   newTask:async(request,decision,execution)=>{
     let requirementId=decision.requirementId
     if(decision.action==='create_requirement_and_task'){
@@ -712,6 +733,7 @@ const router: RouterController = new RouterController(createRouterStore(join(ses
         await context.beforeDispatch()
         orchestrator.setTaskRegistration(id,taskRegistration(context.record))
         const session=orchestrator.getSessionById(id)!
+        if (decision.initialRequirementContext) orchestrator.setInitialRequirementContext(id, decision.initialRequirementContext)
         await feishuBridge.prepareRoutedSession(request,session)
         await orchestrator.acceptRoutedInput(id,request.requestId,saved.prompt,saved.attachments,routerTargetVersion(session),request.feishu?'feishu':'app')
         return session
@@ -733,7 +755,7 @@ configureProjectMemoryRuntime(async session => {
 notifyRouterRequirementChanges = () => router.sourcesChanged()
 orchestrator.on('event',(event:UAEvent)=>{routerContext.observe(event);void router.event(event).catch(error=>recordRuntime('router','router_event_failed',error))})
 orchestrator.on('sessionCreated',(session:Session)=>router.trackSession(session))
-configureGlobalMemoryContext(async(id,config)=>{try{return await router.memoryContext(id,config)}catch(error){recordRuntime('router','global_memory_context_failed',error);orchestrator.appendSystemNotice(id,'本轮全局记忆暂不可用，请检查 Router 存储。');return ''}})
+configureProjectContext(async(id,config)=>{try{return await router.projectContext(id,config)}catch(error){recordRuntime('router','project_context_failed',error);orchestrator.appendSystemNotice(id,'本轮项目资料入口暂不可用，请重试读取。');return ''}})
 
 async function createWorkspaceSession(
   input: SessionConfig,
@@ -903,7 +925,7 @@ const agentUpdateStatusChecker = new AgentUpdateStatusChecker({
   }
 })
 for (const event of ['statusChange', 'queueChange', 'sideStatus', 'sideState', 'detailStatus', 'sessionUpdated']) {
-  orchestrator.on(event, () => idleAgentUpdater.markActivity())
+  orchestrator.on(event, () => { idleAgentUpdater.markActivity(); void modelSources.applyPending().catch(error => recordRuntime('model-sources', 'idle_application_failed', error, 'warn')) })
 }
 teams.on('changed', () => { if (teams.hasActiveWork()) idleAgentUpdater.markActivity() })
 comments.on('changed', () => idleAgentUpdater.markActivity())
@@ -1170,6 +1192,7 @@ const appRestart = new AppRestartService(join(resolveUserDataHome(), 'app-restar
   notice: (sessionId, text) => { if (orchestrator.getSessionById(sessionId)) orchestrator.appendSystemNotice(sessionId, text, 'app_restart') }
 })
 const uniagentManagement = new UniAgentManagement({
+  modelSources: { read: async () => { await modelSources.start(); return modelSources.configuration() }, update: (changes, revision) => modelSources.updateConfiguration(changes, revision) },
   appRestart,
   saveRouter: (config,version) => router.saveConfig(config,version),
   recoveryErrors: async () => (await orchestrator.getRecoveryErrors()).map(error => ({value:error.key,label:error.label,agentId:error.agentId})),
@@ -1185,7 +1208,7 @@ const uniagentManagement = new UniAgentManagement({
     if (section === 'projects') return projects.list()
     if (section === 'requirements') return requirements.list()
     if (section === 'presets') return presets.list()
-    if (section === 'models') return { claude: claudeSources.snapshot(), codex: codexSources.snapshot(),  deepseek: deepseekSnapshot() }
+    if (section === 'models') return { sources: modelSources.snapshot(),  deepseek: deepseekSnapshot() }
     if (section === 'capabilities') return listManagedInventories()
     if (section === 'automations') return [...nativeAutomations.list(),...await listAutomations()]
     if (section !== 'all') throw new Error('unknown_configuration_section')
@@ -2427,7 +2450,6 @@ function registerIpc(): void {
   })
   ipcMain.handle(ROUTER_IPC.resolve,async(event,input:RouterResolution)=>{assertTrustedCapabilitySyncIpc(event);await validateTaskAttachments(input.attachments);return router.resolve(input)})
   ipcMain.handle(ROUTER_IPC.cancel,async(event,id:string,version:number)=>{assertTrustedCapabilitySyncIpc(event);return router.cancel(id,version)})
-  ipcMain.handle(ROUTER_IPC.memory,async(event,input:GlobalMemoryRequest)=>{assertTrustedCapabilitySyncIpc(event);return router.memory(input)})
   ipcMain.handle(PROJECT_MEMORY_IPC,async(event,projectId:string,input:ProjectMemoryRequest)=>{assertTrustedCapabilitySyncIpc(event);await awaitSessionHydration();return projectMemory.request(projectId,input)})
   ipcMain.handle(ROUTER_IPC.interrupt,async event=>{assertTrustedCapabilitySyncIpc(event);return router.interrupt()})
   const teamHandle = (channel: string, action: (...args: any[]) => unknown) => ipcMain.handle(channel, async (event, ...args) => {
@@ -3935,6 +3957,11 @@ function registerIpc(): void {
     assertTrustedCapabilitySyncIpc(event)
     return createNativeAutomation(input)
   })
+  ipcMain.handle(IPC.retryAutomation, async (event, task: AutomationDetail): Promise<AutomationDetail> => {
+    assertTrustedCapabilitySyncIpc(event)
+    await awaitSessionHydration()
+    return nativeAutomations.retry(task)
+  })
   ipcMain.handle(
     IPC.setAutomationStatus,
     async (event, target: string | AutomationTask, status: 'active' | 'paused') => {
@@ -4039,6 +4066,16 @@ function registerIpc(): void {
     if (typeof sessionId !== 'string') throw new Error('无效会话')
     return orchestrator.cancelErrorRecovery(sessionId)
   })
+  
+  ipcMain.handle(MODEL_SOURCE_IPC.get, async event => { assertTrustedCapabilitySyncIpc(event); await modelSources.start(); return modelSources.snapshot() })
+  ipcMain.handle(MODEL_SOURCE_IPC.quota, async (event, sourceId?: string, force?: boolean) => { assertTrustedCapabilitySyncIpc(event); return modelSources.refreshQuotas(sourceId, force) })
+  ipcMain.handle(MODEL_SOURCE_IPC.saveQuota, async (event, input: import('../shared/modelSourceQuota').ModelSourceQuotaSave) => { assertTrustedCapabilitySyncIpc(event); return modelSources.saveQuota(input) })
+  ipcMain.handle(MODEL_SOURCE_IPC.save, async (event, input: ModelSourceSave) => { assertTrustedCapabilitySyncIpc(event); await startupCoreReady?.catch(() => {}); return modelSources.save(input) })
+  ipcMain.handle(MODEL_SOURCE_IPC.apply, async (event, sourceId?: string) => { assertTrustedCapabilitySyncIpc(event); return modelSources.apply(sourceId) })
+  ipcMain.handle(MODEL_SOURCE_IPC.import, async event => { assertTrustedCapabilitySyncIpc(event); return modelSources.discoverImports() })
+  ipcMain.handle(MODEL_SOURCE_IPC.query, async (event, input: ModelSourceInput, endpointId: string) => { assertTrustedCapabilitySyncIpc(event); return modelSources.query(input, endpointId) })
+  ipcMain.handle(MODEL_SOURCE_IPC.test, async (event, input: ModelSourceInput, endpointId: string, modelId: string) => { assertTrustedCapabilitySyncIpc(event); return modelSources.test(input, endpointId, modelId) })
+  ipcMain.handle(MODEL_SOURCE_IPC.reveal, async (event, sourceId: string, endpointId: string, expectedConnection: string) => { assertTrustedCapabilitySyncIpc(event); return modelSources.revealCredential(sourceId, endpointId, expectedConnection) })
   
   ipcMain.handle(CODEX_SOURCE_IPC.get, async event => {
     assertTrustedCapabilitySyncIpc(event)
@@ -4908,7 +4945,9 @@ app.whenReady().then(() => {
   const detectionFlights = rendererReady.then(async () => {
     await hydratePathFromLoginShell()
     await claudeSources.start()
+    await modelSources.start()
     const detection = agentLifecycle.detectStartup()
+    void Promise.all([detection.core, detection.protocol]).then(() => modelSources.apply()).catch(error => recordRuntime('model-sources', 'startup_reconciliation_failed', error, 'warn'))
     // Supplemental probes have no place in the native readiness barrier.
     void Promise.allSettled([ codexSources.start()]).then(async () => {
       await detection.core
@@ -5015,6 +5054,7 @@ app.whenReady().then(() => {
   void Promise.all([startupHandoffReady, startupSessionHydration, startupProtocolSettled])
     .then(() => {
       watchHandoffInbox(materializeHandoff)
+      watchContextInbox(currentAssistantContext)
       watchAutomationInbox(createNativeAutomation)
       watchFeishuSendInbox(sendMcpPayloadToFeishu)
       watchTeamInbox((req, signal) => teams.handleTool(req.token, req.tool, req.args, signal))
@@ -5122,5 +5162,5 @@ app.on('before-quit', (event) => {
   const weixinClosing = assistantWeixinBridge.close()
   // Electron does not await before-quit promises. Restore Codex configuration
   // and clean up only the helpers owned by this application before exiting.
-  void Promise.allSettled([restartClosing, acpClosing, weixinClosing, cliAgentSetup.close(), cancelMCodeOperation(),  zcodeInstallation.cancel(), assistantFeishuInstallFlight?.catch(() => {}), sessionFeishuInstallFlight?.catch(() => {}), uniagentManagement.close(), personalAssistant.close(), kimiOnboarding.close(), closeKimiLoginAttempts(), closeKimiWebServices(), closeDeepSeekHost(), codexSources.close(), closeClaudeSourceRuntimes(), grokQuota.close(), agentQuota.close(), orchestrator.closeZCodeRuntime(), orchestrator.closeSessionLogs(), performanceMonitor?.close(), cloudMonitor.close()]).finally(() => { appQuitReady = true; app.quit() })
+  void Promise.allSettled([restartClosing, acpClosing, weixinClosing, modelSources.close(),  cliAgentSetup.close(), cancelMCodeOperation(),  zcodeInstallation.cancel(), assistantFeishuInstallFlight?.catch(() => {}), sessionFeishuInstallFlight?.catch(() => {}), uniagentManagement.close(), personalAssistant.close(), kimiOnboarding.close(), closeKimiLoginAttempts(), closeKimiWebServices(), closeDeepSeekHost(), codexSources.close(), closeClaudeSourceRuntimes(), grokQuota.close(), agentQuota.close(), orchestrator.closeZCodeRuntime(), orchestrator.closeSessionLogs(), performanceMonitor?.close(), cloudMonitor.close()]).finally(() => { appQuitReady = true; app.quit() })
 })

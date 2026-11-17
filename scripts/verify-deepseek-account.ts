@@ -18,6 +18,17 @@ let initialization: any
 let exchanges = 0
 let modelRequests = 0
 let platformOrigin = ''
+const updateTypes: string[] = []
+async function nextState(stream: AsyncGenerator<any>): Promise<any> {
+  const update = await stream.next()
+  assert.equal(update.done, false, 'native account watch stays open until its caller ends it')
+  assert.ok(['snapshot', 'credentials-changed'].includes(update.value?.type), 'rc.4 account watch carries a typed state envelope')
+  const state = update.value.state
+  assert.ok(['signed-out', 'credential-stored'].includes(state?.status))
+  assert.ok(state.attempt === null || typeof state.attempt?.id === 'string')
+  updateTypes.push(update.value.type)
+  return state
+}
 const platform = createServer(async (request, response) => {
   let body = ''
   for await (const chunk of request) body += chunk
@@ -65,22 +76,24 @@ try {
   const metadata = { version: '1.0.9', locale: 'zh-CN', timezoneOffsetSeconds: 28800 }
   assert.equal((await client.call<any>('account/getState')).status, 'signed-out')
   const stream = client.stream<any>('account/watch', {}, AbortSignal.timeout(20000))
-  assert.equal((await stream.next()).value.status, 'signed-out')
+  assert.equal((await nextState(stream)).status, 'signed-out')
+  assert.equal(updateTypes[0], 'snapshot', 'watch replays a complete initial snapshot')
   await client.call('account/startSignIn', { client: metadata, callbackOrigin: client.callbackOrigin, loginSource: 'desktop' })
   let state: any
-  do { state = (await stream.next()).value } while (state.attempt?.phase === 'initializing')
+  do { state = await nextState(stream) } while (state.attempt?.phase === 'initializing')
   assert.equal(state.attempt?.phase, 'waiting-browser')
   assert.equal(state.status, 'signed-out', 'opening authorization is not login success')
   const bad = await fetch(initialization.redirect_uri + '?state=wrong&code=fixture', { redirect: 'manual' })
   assert.equal(bad.status, 400); await bad.body?.cancel()
   assert.equal(exchanges, 0, 'invalid state cannot exchange a code')
   const callback = fetch(initialization.redirect_uri + '?state=' + encodeURIComponent(initialization.state) + '&code=fixture', { redirect: 'manual' })
-  do { state = (await stream.next()).value } while (state.attempt?.phase !== 'succeeded' && state.attempt?.phase !== 'failed')
+  do { state = await nextState(stream) } while (state.attempt?.phase !== 'succeeded' && state.attempt?.phase !== 'failed')
   assert.equal(state.attempt.phase, 'succeeded')
   assert.equal(state.status, 'credential-stored')
   const response = await callback
   assert.equal(response.status, 302); await response.body?.cancel()
   assert.equal(exchanges, 1)
+  assert.ok(updateTypes.includes('credentials-changed'), 'native credential commit is observed through the account stream')
   await stream.return(undefined)
   const accountModels = deepseekAccountModels(await client.call('session/modelCatalog'))
   assert.ok(accountModels.length > 0)
@@ -105,9 +118,9 @@ try {
   await restarted.call('account/signOut', { client: metadata })
   assert.equal((await restarted.call<any>('account/getState')).status, 'signed-out')
   const waiting = restarted.stream<any>('account/watch', {}, AbortSignal.timeout(20000))
-  await waiting.next()
+  assert.equal((await nextState(waiting)).status, 'signed-out')
   await restarted.call('account/startSignIn', { client: metadata, callbackOrigin: restarted.callbackOrigin, loginSource: 'desktop' })
-  do { state = (await waiting.next()).value } while (state.attempt?.phase === 'initializing' || !state.attempt)
+  do { state = await nextState(waiting) } while (state.attempt?.phase === 'initializing' || !state.attempt)
   assert.equal(state.attempt.phase, 'waiting-browser')
   await restarted.call('account/cancelSignIn', { attemptId: state.attempt.id })
   const late = await fetch(initialization.redirect_uri + '?state=' + encodeURIComponent(initialization.state) + '&code=late', { redirect: 'manual' })
@@ -116,7 +129,7 @@ try {
   assert.equal(exchanges, 1, 'cancelled attempt cannot exchange a late callback')
   assert.equal((await restarted.call<any>('account/getState')).status, 'signed-out')
   await waiting.return(undefined)
-  console.log('PASS published Host account API: state validation, PKCE exchange, success stream, persistence, sign-out and cancelled callback')
+  console.log('PASS published Host account API: rc.4 typed snapshot and credential updates, PKCE exchange, success stream, persistence, sign-out and cancelled callback')
 } finally {
   await runner?.disposeAndWait()
   await host?.stop()

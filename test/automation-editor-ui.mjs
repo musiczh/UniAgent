@@ -17,7 +17,7 @@ try {
       import React,{useState} from 'react'; import {createRoot} from 'react-dom/client';
       import {AutomationsPanel} from './src/renderer/components/AutomationsPanel';
       import './src/renderer/styles.css';
-      window.tasks=[]; window.saved=[]; window.patches=[];
+      window.tasks=[]; window.saved=[]; window.patches=[]; window.retries=[];
       window.requirements=[{id:'req',name:'测试需求',projectId:'default',status:'active'}];
       window.uniagent={
         listAutomations:async()=>structuredClone(window.tasks),
@@ -31,6 +31,16 @@ try {
         onPrefsChanged:()=>()=>{},onAutomationsChanged:callback=>{window.notifyAutomations=callback;return ()=>{}},onLifecycleProgress:()=>()=>{},
         createAutomation:async input=>{window.saved.push(input);window.tasks.push({...input,id:'created-'+window.saved.length,source:'uniagent',status:'active',nextRunAt:input.schedule.startsWith('ONCE:')?Date.parse(input.schedule.slice(5)):Date.now()+86400000});},
         getAutomationDetail:async task=>structuredClone(window.tasks.find(item=>item.id===task.id)),
+        retryAutomation:async task=>{
+          window.retries.push(structuredClone(task));
+          if(window.retryError)throw Error(window.retryError);
+          const current=window.tasks.find(item=>item.id===task.id);
+          Object.assign(current,{lastRunAt:Date.now(),lastRunStatus:'running',lastRunError:undefined,lastSessionId:undefined});
+          window.notifyAutomations();
+          if(window.retryWait)await new Promise(resolve=>{window.releaseRetry=resolve});
+          current.lastSessionId='retry-session';
+          window.notifyAutomations(); return structuredClone(current);
+        },
         updateAutomation:async(task,patch)=>{window.patches.push(patch);Object.assign(window.tasks.find(item=>item.id===task.id),patch);return true;}
       };
       function Fixture(){const [enabled,setEnabled]=useState(true);window.setRequirementsEnabled=setEnabled;return <AutomationsPanel requirementsEnabled={enabled} onOpenSession={id=>{window.openedSession=id}} />}
@@ -308,6 +318,8 @@ try {
     first.querySelector('.auto-name').click()
     await wait(() => document.querySelector('.auto-run-error-detail'))
     const execution = () => document.querySelector('.auto-last-run')
+    const retry = () => execution().querySelector('.auto-retry')
+    check(retry() && !retry().disabled && retry().textContent.includes('重试'), 'a failed native run must offer retry beside the card title')
     check(document.querySelectorAll('.auto-run-summary').length === 1 && document.querySelectorAll('.auto-run-error-detail').length === 1,
       'detail must show the result and error only once')
     check(execution().querySelector('.auto-run-error-detail p').textContent === window.tasks[0].lastRunError, 'the side card must retain the full failure reason')
@@ -316,6 +328,9 @@ try {
     check(window.openedSession === 'failed-session', 'the side card session link must open the last execution')
     fill('任务名称','有未保存修改')
     await wait(() => execution().querySelector('.auto-run-link').disabled)
+    check(retry().disabled && retry().title.includes('保存'), 'unsaved changes must disable retry with an explanation')
+    retry().click()
+    check(window.retries.length === 0, 'unsaved changes must never submit a retry')
     window.openedSession = null
     execution().querySelector('.auto-run-link').click()
     check(window.openedSession === null, 'unsaved edits must keep the session link protected')
@@ -326,12 +341,45 @@ try {
       window.notifyAutomations()
       await wait(() => execution().querySelector('.auto-run-summary > span').textContent === label)
       check(!execution().querySelector('.auto-run-error-detail'), 'non-error execution states must omit stale errors: '+status)
+      check(!retry(), 'non-error execution states must not offer retry: '+status)
     }
     Object.assign(window.tasks[0], {lastRunStatus:'error',lastRunError:'未能创建执行会话',lastSessionId:undefined})
     window.notifyAutomations()
     await wait(() => execution().textContent.includes('未能启动'))
     check(!execution().querySelector('.auto-run-link') && execution().querySelector('.auto-run-error-detail p').textContent === '未能创建执行会话',
       'failure before session creation must show its reason without an invalid session link')
+    check(retry() && !retry().disabled, 'failure before session creation must allow retry')
+    window.retryError = 'Agent 验证失败'
+    retry().click()
+    await wait(() => document.querySelector('.auto-detail-error')?.textContent.includes('Agent 验证失败') && !retry().disabled)
+    check(window.retries.length === 1 && execution().textContent.includes('未能启动'), 'a rejected retry must preserve the failure and release the button')
+    window.retryError = null
+    window.retryWait = true
+    const failedRun = structuredClone(window.tasks[0])
+    retry().click()
+    retry().click()
+    await wait(() => retry().textContent === '重试中…')
+    await wait(() => window.tasks[0].lastRunStatus === 'running')
+    check(retry().disabled && window.retries.length === 2, 'repeated clicks must submit only one retry')
+    check(execution().textContent.includes('未能启动'), 'the previous failure must stay visible while submitting')
+    check(button('保存修改').textContent === '保存修改', 'retry must not relabel the save action as saving')
+    window.releaseRetry()
+    await wait(() => execution().textContent.includes('正在执行') && !retry())
+    check(window.retries[1].id === failedRun.id && window.retries[1].lastRunAt === failedRun.lastRunAt,
+      'retry must submit the identity of the displayed failed execution')
+    check(window.tasks[0].nextRunAt === failedRun.nextRunAt && window.tasks[0].status === failedRun.status, 'retry must preserve the planned time and enable state')
+    execution().querySelector('.auto-run-link').click()
+    check(window.openedSession === 'retry-session', 'successful retry must expose the new execution session')
+    Object.assign(window.tasks[0], {lastRunStatus:'error',lastRunError:'再次执行失败'})
+    window.notifyAutomations()
+    await wait(() => retry() && !retry().disabled)
+    Object.assign(window.tasks[0], {source:undefined,path:'/test/automation.toml'})
+    window.notifyAutomations()
+    button('返回').click()
+    await wait(() => document.querySelector('.auto-list'))
+    document.querySelector('.auto-task-row .auto-name').click()
+    await wait(() => execution()?.textContent.includes('再次执行失败'))
+    check(!retry(), 'CLI-owned schedules must not expose the UniAgent retry operation')
     button('返回').click()
     await wait(() => document.querySelector('.auto-list'))
     return { saved: window.saved, patches: window.patches }

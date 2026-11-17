@@ -7,6 +7,7 @@ import { AgentIcon } from './AgentIcon'
 import { UiIcon } from './Icons'
 import { AgentVersionWarning } from './AgentVersionWarning'
 import { usePickerMenuPlacement } from './usePickerMenuPlacement'
+import { ModelSourceLabel } from './ModelSourceLabel'
 
 type Field = 'agent' | 'model' | 'effort'
 export type SuperAgentChoice = Pick<SessionConfig, 'agentId' | 'model' | 'modelSource' | 'effort' | 'kimiThinking'>
@@ -84,7 +85,7 @@ export function SuperAgentConfigPicker({ agents, value, onChange, field, router 
           const selected = model === item
           return <button key={modelKey({ model: item.id, modelSource: item.modelSource })} type="button" role="option" aria-selected={selected} data-title-model={item.id} data-title-model-source={item.modelSource?.sourceId || ''} disabled={disabled || !!superAgentUnavailable(agent)} className={`superagent-picker-option${selected ? ' is-sel' : ''}`} title={item.label} onClick={() => choose({ agentId: value.agentId, model: item.id, modelSource: item.modelSource,
             effort: thinking ? undefined : resolveModelEffort(item, value.effort, router && item.efforts.includes('max') ? 'max' : item.efforts.includes('low') ? 'low' : undefined),
-            kimiThinking: thinking ? resolveModelThinking(item, value.kimiThinking) : undefined }, (thinking ? item.thinkingOptions?.length : item.efforts.length) ? 'effort' : undefined)}><span>{item.label}</span><UiIcon name="check" size={14}/></button>
+            kimiThinking: thinking ? resolveModelThinking(item, value.kimiThinking) : undefined }, (thinking ? item.thinkingOptions?.length : item.efforts.length) ? 'effort' : undefined)}><span><ModelSourceLabel model={item}/></span><UiIcon name="check" size={14}/></button>
         }) : ['默认', ...efforts].map(item => <button key={item} type="button" role="option" aria-selected={item === '默认' ? !explicitEffort : item === explicitEffort} data-title-effort={item} disabled={disabled || !model || !!superAgentUnavailable(agent)} className={`superagent-picker-option${(item === '默认' ? !explicitEffort : item === explicitEffort) ? ' is-sel' : ''}`} onClick={() => choose({ ...value, effort: !thinking && item !== '默认' ? item as SuperAgentChoice['effort'] : undefined, kimiThinking: thinking && item !== '默认' ? item : undefined })}><span>{effortLabel(item)}</span><UiIcon name="check" size={14}/></button>)}
         {tab === 'agent' && !agents.length || tab === 'model' && !models.length ? <span className="sb-menu-empty">暂无支持系统提示词与图片的可用选项</span> : null}
       </div>

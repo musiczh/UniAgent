@@ -6,7 +6,7 @@ import { codexModelKey } from '../shared/codexModelIdentity'
 import type { ModelDef, ReasoningEffort } from '../shared/types'
 import type { ClaudeConnection } from './claudeSourceRuntime'
 
-function ferryHome(): string {
+export function ferryHome(): string {
   if (process.env.FERRY_HOME) return process.env.FERRY_HOME
   if (process.platform === 'darwin') return join(homedir(), 'Library', 'Application Support', 'ferry')
   if (process.platform === 'win32') return join(process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local'), 'ferry')

@@ -24,6 +24,7 @@ export class ClaudeSdkSideRunner extends EventEmitter {
     if (resumeNativeId === sourceNativeId) throw new Error('侧边对话不能使用源会话 ID')
     this.nativeId = resumeNativeId
     this.runner = agent.adapter === 'qoder' ? new QoderRunner(sessionId, seqRef) : new TurnRunner(sessionId, seqRef)
+    this.runner.setMainContext(false)
     this.runner.on('event', event => this.emit('event', event))
     this.runner.on('done', result => { this.running = false; this.emit('done', result) })
   }

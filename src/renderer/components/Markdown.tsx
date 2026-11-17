@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, type MouseEvent, type KeyboardEvent } from 'react'
+import { Fragment, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, type MouseEvent, type KeyboardEvent } from 'react'
 import DOMPurify from 'dompurify'
 import { Streamdown, defaultRehypePlugins, type Components } from 'streamdown'
 import type { FileBrowserListResult } from '@shared/types'
@@ -354,7 +354,7 @@ function verifyLocalPaths(
  * `annotations` is provided, matching char ranges are re-highlighted with a
  * numbered badge after each reply re-render (选中即评论).
  */
-export function Markdown({
+function MarkdownView({
   text,
   onOpenFile,
   annotations,
@@ -481,3 +481,7 @@ export function Markdown({
     </div>
   )
 }
+
+// Historical replies keep identical props while a turn streams; skipping their
+// re-render keeps the assignment-card entrance and live streaming within frame budget.
+export const Markdown = memo(MarkdownView)

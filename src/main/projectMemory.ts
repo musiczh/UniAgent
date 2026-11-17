@@ -50,10 +50,6 @@ export class ProjectMemoryService {
   private async entry(project: Project, row: GlobalMemoryItem): Promise<ProjectMemoryEntry> {
     return { ...row, title:title(row), freshness: await this.verified(project, row).catch(() => false) ? 'verified' : 'needs-review' }
   }
-  async isCurrent(row: GlobalMemoryItem): Promise<boolean> {
-    const project = row.scope.kind === 'space' && this.deps.project(row.scope.projectId)
-    return !!project && await this.verified(project,row).catch(() => false)
-  }
 
   async request(projectId: string, raw: ProjectMemoryRequest, sessionId?: string, current: () => void = () => {}): Promise<ProjectMemoryPage> {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).some(key => !['action','projectId','id','query','category','offset','limit','includeHistory','expectedRevision','title','content','type','modules','source'].includes(key))) throw new Error('invalid_project_memory_request')

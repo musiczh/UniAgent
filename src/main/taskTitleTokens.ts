@@ -1,5 +1,6 @@
 import { Worker } from 'node:worker_threads'
 import { createRequire } from 'node:module'
+import { TASK_DESCRIPTION_TOKEN_LIMIT } from '../shared/taskTitle'
 import { join, resolve } from 'node:path'
 
 // The existing official assets and tokenizer library stay entirely off the main thread.
@@ -60,7 +61,7 @@ export class TaskTitleTokenCounter {
   }
 
   async validate(text: string): Promise<void> {
-    if (await this.count(text) > 200) throw Object.assign(new Error('任务描述超过 200 token'), { code: 'task_description_too_long' })
+    if (await this.count(text) > TASK_DESCRIPTION_TOKEN_LIMIT) throw Object.assign(new Error(`任务描述超过 ${TASK_DESCRIPTION_TOKEN_LIMIT} token`), { code: 'task_description_too_long' })
   }
   async close(): Promise<void> { await this.worker?.terminate() }
 }

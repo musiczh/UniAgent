@@ -1,6 +1,5 @@
-import { assistantPrompt } from './assistant/context'
-import { requirementInstructions } from './requirementRuntime'
-import { worktreeInstructions } from './worktreeService'
+import { prepareAssistantMessage, prepareAssistantInitializationForSession, reconcileAssistantText, serializeAssistantInput, type AssistantMessage } from './assistant/context'
+import { sessionInstructions } from './sessionInstructions'
 import { execFile } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { isAbsolute, join } from 'node:path'
@@ -112,6 +111,7 @@ export class GrokACPRunner extends EventEmitter {
   private turn = 0
   private activeTurn = 0
   private running = false
+  private inputDelivery?: AssistantMessage
   private cancelling = false
   private disposed = false
   private includeMcp = true
@@ -174,13 +174,15 @@ export class GrokACPRunner extends EventEmitter {
     }
     this.running = true; this.cancelling = false; this.activeTurn = ++this.turn
     const turn = this.activeTurn; this.resetText(); this.toolStateById.clear()
+    let delivery: AssistantMessage | undefined, submitted = false
     try {
       await this.ensureReady()
       if (!this.ownsTurn(turn) || this.cancelling) return
       if (this.goalState?.autonomous || this.goalUnknown) throw new Error('恢复的 Grok 目标仍在活动或状态未确认，请先核对并暂停目标')
       const slash = prompt.trimStart().startsWith('/')
       if (slash && attachments?.length) throw new Error('slash 命令不能与附件同时发送')
-      const effective = slash ? prompt.trimStart() : await assistantPrompt(this.sessionId, this.config, prompt, [worktreeInstructions(this.config),requirementInstructions(this.config)].filter(Boolean).join('\n\n'))
+      delivery = await prepareAssistantMessage(this.sessionId, this.config, prompt, sessionInstructions(this.config, this.sessionId), false)
+      const effective = delivery.text
       const blocks = await buildTextPromptBlocks(effective, attachments, { provider:this.provider, imageAttachments:this.contract?.imageAttachments === true, fileAttachments:this.contract?.fileAttachments === true,env:typeof this.extraEnv === 'function' ? this.extraEnv() : this.extraEnv })
       if (this.provider === 'grok') assertGrokPromptSize(blocks,this.nativeSessionId!)
       if (!this.ownsTurn(turn) || this.cancelling || !this.connection || !this.nativeSessionId) return
@@ -189,16 +191,19 @@ export class GrokACPRunner extends EventEmitter {
       // `session/prompt`; a turn driven by the agent itself (for example a
       // native goal kickoff) is not steerable.
       this.promptTurnId = turn
+      this.inputDelivery = delivery; submitted = true
       const result = await this.connection.request('session/prompt', { sessionId:this.nativeSessionId,prompt:blocks },0)
       this.promptTurnId = undefined
       if (!this.ownsTurn(turn)) return
       if (!record(result) || !STOP_REASONS.has(result.stopReason)) throw new Error('session/prompt 返回了无效 stopReason')
+      delivery.accepted()
       if (this.native?.confirmed) {
         this.emitGrokUsage(result._meta?.promptId, result._meta?.usage)
         this.emitGrokPromptContext(result._meta)
       }
       this.finish(this.cancelling || result.stopReason === 'cancelled' ? 'cancelled' : 'success',turn)
     } catch (error: any) {
+      delivery?.failed(!submitted)
       if (!this.ownsTurn(turn)) return
       if (this.cancelling) { this.finish('cancelled',turn); return }
       const detail = error instanceof ACPRemoteError && typeof error.data === 'string' ? `${error.message}: ${error.data}` : error?.message || String(error)
@@ -563,6 +568,9 @@ export class GrokACPRunner extends EventEmitter {
   async inventory(): Promise<unknown> { throw unsupported() }
   async pluginAction(_request: Record<string,unknown>): Promise<any> { throw unsupported() }
   async steer(prompt: string, attachments?: Attachment[]): Promise<{appendedToTurn:boolean;nativePromptId?:string} | void> {
+    return serializeAssistantInput(this.sessionId, () => this.steerInput(prompt, attachments))
+  }
+  private async steerInput(prompt: string, attachments?: Attachment[]): Promise<{appendedToTurn:boolean;nativePromptId?:string} | void> {
     if (this.provider === 'mcode') {
       // The local turn state is checked first: "no turn to steer into" is a far
       // more actionable message than "this provider has no steering support".
@@ -570,22 +578,26 @@ export class GrokACPRunner extends EventEmitter {
       if (!mcodeSupportsExtension(this.initializeResult, 'mcode/session/steer')) throw unsupported()
       const connection = this.connection
       if (!connection || !this.nativeSessionId) throw new Error('ACP 尚未连接')
-      const blocks = await buildTextPromptBlocks(prompt, attachments, { provider: this.provider, imageAttachments: this.contract?.imageAttachments === true, fileAttachments: this.contract?.fileAttachments === true })
+      const delivery = await prepareAssistantMessage(this.sessionId, this.config, prompt, sessionInstructions(this.config, this.sessionId), false)
+      const blocks = await buildTextPromptBlocks(delivery.text, attachments, { provider: this.provider, imageAttachments: this.contract?.imageAttachments === true, fileAttachments: this.contract?.fileAttachments === true })
       const text = blocks.filter((block: any) => block?.type === 'text').map((block: any) => String(block.text || '')).join('\n')
       if (!text) throw new Error('插话内容为空')
       const result = await connection.request('mcode/session/steer', { sessionId: this.nativeSessionId, text })
       const turnId = typeof result?.turnId === 'string' ? result.turnId : undefined
       const mode = typeof result?.mode === 'string' ? result.mode : undefined
       if (mode !== 'steered') throw new Error('MiniMax Code 未接受插话，已改由本地队列发送')
+      delivery.accepted()
       return { appendedToTurn: true, nativePromptId: turnId }
     }
     this.requireNative('steer')
     if (!this.running || this.cancelling || !prompt.trim() || attachments?.length) throw new Error('Grok 引导仅支持活动父回合中的纯文本')
     const connection = this.connection!, turn = this.activeTurn, nativePromptId = this.nativePromptId
     try {
-      const result = await connection.request('_x.ai/interject',{sessionId:this.nativeSessionId,text:prompt})
+      const delivery = await prepareAssistantMessage(this.sessionId, this.config, prompt, sessionInstructions(this.config, this.sessionId), false)
+      const result = await connection.request('_x.ai/interject',{sessionId:this.nativeSessionId,text:delivery.text})
       if (result?.result?.status !== 'queued') throw new Error('Grok 未确认接收引导消息')
       if (connection !== this.connection || turn !== this.activeTurn || !this.running || this.cancelling) throw new ACPTimeoutError('Grok 引导送达未确认：原回合已结束，请核对后再重试')
+      delivery.accepted()
       return {appendedToTurn:true,...(nativePromptId ? {nativePromptId} : {})}
     } catch (error) { this.nativeFailure('steer',error); throw error }
   }
@@ -671,6 +683,7 @@ export class GrokACPRunner extends EventEmitter {
         this.config = resolveAgentWorkspaceConfig(this.config, { additionalDirectoriesNew: false, additionalDirectoriesResume: false }, !!requestedId)
       }
       this.replayingHistory = method === 'session/load'
+      if (!requestedId) await prepareAssistantInitializationForSession(this.sessionId, this.config)
       const response = await connection.request(method,{...(requestedId ? {sessionId:requestedId} : {}),cwd:this.config.workdir,mcpServers:this.includeMcp ? handoffMcpServers(this.sessionId) : [],...(this.config.additionalDirectories?.length ? {additionalDirectories:this.config.additionalDirectories} : {})})
       const returnedId = typeof response?.sessionId === 'string' ? response.sessionId : undefined
       if (!record(response) || (!requestedId && !returnedId) || (returnedId && requestedId && returnedId !== requestedId)) throw new Error('ACP 返回了无效或跨会话的 sessionId')
@@ -961,6 +974,9 @@ export class GrokACPRunner extends EventEmitter {
     }
     if (message.params.sessionId !== this.nativeSessionId) return
     const update = message.params.update
+    if (this.promptTurnId !== undefined && ['agent_message_chunk', 'agent_thought_chunk', 'tool_call', 'tool_call_update'].includes(update.sessionUpdate)) {
+      this.inputDelivery?.accepted(); this.inputDelivery = undefined
+    }
     if (update.sessionUpdate === 'available_commands_update') { this.commands = Array.isArray(update.availableCommands) ? [...new Set<string>(update.availableCommands.map((x: any) => typeof x?.name === 'string' ? x.name.replace(/^\//,'') : '').filter(Boolean))] : []; this.updateContract({}); this.emit('contract',cloneContract(this.contract)); return }
     if (update.sessionUpdate === 'config_option_update') { this.updateContract({configOptions:update.configOptions}); if (!this.applyingConfig) this.syncNativeConfig(); this.emit('contract',cloneContract(this.contract)); return }
     if (update.sessionUpdate === 'current_mode_update' && typeof update.currentModeId === 'string') { if (this.response.modes) this.response.modes.currentModeId = update.currentModeId; this.updateContract({}); if (!this.applyingConfig) this.syncNativeConfig(); this.emit('contract',cloneContract(this.contract)); this.emit('collaborationModeChanged',update.currentModeId === 'plan' ? 'plan' : 'default'); return }
@@ -1082,7 +1098,11 @@ export class GrokACPRunner extends EventEmitter {
     this.authLoginUnsubscribes.add(unsubscribe)
   }
 
-  private emitEvent(event: Omit<UAEvent,'sessionId' | 'seq' | 'ts'>): void { this.emit('event',{...event,sessionId:this.sessionId,seq:this.seqRef.n++,ts:Date.now()} satisfies UAEvent) }
+  private emitEvent(event: Omit<UAEvent,'sessionId' | 'seq' | 'ts'>): void {
+    if (event.type === 'user_message' && typeof event.payload.text === 'string') reconcileAssistantText(this.sessionId, event.payload.text, this.nativeSessionId)
+    if (this.promptTurnId !== undefined && ['agent_message', 'reasoning', 'command_exec'].includes(event.type)) { this.inputDelivery?.accepted(); this.inputDelivery = undefined }
+    this.emit('event',{...event,sessionId:this.sessionId,seq:this.seqRef.n++,ts:Date.now()} satisfies UAEvent)
+  }
 }
 export async function probeGrokACP(
   bin = 'grok',

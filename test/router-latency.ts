@@ -25,7 +25,6 @@ test('known IDs reach requirements, task briefs and details without directory pr
   const f = await routerFixture(objects(), { now })
   try {
     const requestId = await f.submit({ prompt: '继续原分配链路' })
-    await f.call('router_query', { requestId, mode: 'bootstrap' })
     for (const args of [
       { mode: 'catalog', kind: 'requirement', projectId: 'space' },
       { mode: 'task_detail', taskId: 'task' },
@@ -50,7 +49,6 @@ test('a space ID filters the space catalog and preserves target type and hard sc
   const f = await routerFixture(objects(), { now })
   try {
     const requestId = await f.submit({ prompt: '查询项目' })
-    await f.call('router_query', { requestId, mode: 'bootstrap' })
     const result = await f.call('router_query', { requestId, mode: 'catalog', kind: 'space', projectId: 'space' })
     assert.deepEqual(result.value.items.map((row: any) => row.id), ['space'])
     assert.equal(result.value.total, 1)
@@ -59,7 +57,6 @@ test('a space ID filters the space catalog and preserves target type and hard sc
     }
     await f.end()
     const restricted = await f.submit({ prompt: '查询本项目', scope: { kind: 'space', projectId: 'space' } })
-    await f.call('router_query', { requestId: restricted, mode: 'bootstrap' })
     for (const args of [{ mode: 'catalog', kind: 'requirement', projectId: 'other-space' }, { mode: 'object_detail', objectId: 'other-requirement' }]) {
       assert.equal((await f.call('router_query', { requestId: restricted, ...args })).error, 'hard_scope_conflict')
     }
@@ -72,7 +69,6 @@ test('expired scan and source cursors recover by direct reading of the same targ
   const f = await routerFixture(objects(), { now })
   try {
     const requestId = await f.submit({ prompt: '继续原分配链路' })
-    await f.call('router_query', { requestId, mode: 'bootstrap' })
     for (const args of [{ mode: 'task_detail', taskId: 'task', scanId: 'expired' }, { mode: 'object_detail', objectId: 'requirement', sourceRef: 'document:0', cursor: 'expired' }]) {
       const failed = await f.call('router_query', { requestId, ...args })
       assert.equal(failed.ok, false)
@@ -93,7 +89,6 @@ test('default detail paginates source metadata within budget and explicit reads 
   const rows = objects(), f = await routerFixture(rows, { now }), tokenizer = await loadRouterTokenizer()
   try {
     const requestId = await f.submit({ prompt: '检查需求范围' })
-    await f.call('router_query', { requestId, mode: 'bootstrap' })
     const refs: string[] = []
     let cursor: string | undefined
     do {
@@ -126,7 +121,6 @@ test('source cursors reject another request, object, source and changed revision
   const rows = objects(), f = await routerFixture(rows, { now })
   try {
     const requestId = await f.submit({ prompt: '检查来源分页' })
-    await f.call('router_query', { requestId, mode: 'bootstrap' })
     const first = await f.call('router_query', { requestId, mode: 'object_detail', objectId: 'requirement', sourceRef: 'document:0' })
     assert.ok(first.value.nextCursor)
     for (const args of [{ objectId: 'requirement', sourceRef: 'document:1' }, { objectId: 'other-requirement', sourceRef: 'document:0' }, { objectId: 'requirement' }]) {
@@ -140,18 +134,21 @@ test('source cursors reject another request, object, source and changed revision
   } finally { await f.close() }
 })
 
-test('direct task reads retain the 72-hour window, explicit reference and parent eligibility', async () => {
+test('the 72-hour window limits automatic candidates, not direct old or archived reads', async () => {
   const rows = objects(), f = await routerFixture(rows, { now })
   try {
     const requestId = await f.submit({ prompt: '继续 old-task 原目标' })
-    await f.call('router_query', { requestId, mode: 'bootstrap' })
-    assert.equal((await f.call('router_query', { requestId, mode: 'task_detail', taskId: 'old-task' })).error, 'task_not_eligible')
-    assert.equal((await f.call('router_query', { requestId, mode: 'resolve_reference', reference: { sessionId: 'old-task' } })).ok, true)
-    assert.equal((await f.call('router_query', { requestId, mode: 'task_detail', taskId: 'old-task' })).ok, true)
+    const old = await f.call('router_query', { requestId, mode: 'task_detail', taskId: 'old-task' })
+    assert.equal(old.ok, true, 'an explicitly located old task is readable regardless of the candidate window')
+    assert.equal(old.value.item.id, 'old-task')
+    assert.equal((await f.call('router_query', { requestId, mode: 'task_briefs', selectedScope: { kind: 'requirement', requirementId: 'requirement' } })).value.items.some((row: any) => row.id === 'old-task'), false)
     rows.find(row => row.id === 'requirement')!.archived = true
-    assert.equal((await f.call('router_query', { requestId, mode: 'task_detail', taskId: 'task' })).error, 'task_not_eligible')
+    assert.equal((await f.call('router_query', { requestId, mode: 'task_detail', taskId: 'task' })).ok, true, 'material under an archived requirement remains readable')
     assert.equal((await f.call('router_query', { requestId, mode: 'object_detail', objectId: 'requirement' })).ok, true, 'archived requirement metadata remains readable')
-    assert.equal(f.journal.length, 0)
+    const count = f.journal.length
+    const assignment = await f.call('router_assign_task', { requestId, version: f.db.request(requestId)!.version, action: 'reuse_task', taskId: 'task', reason: '继续原任务' })
+    assert.equal(assignment.errorDetails.code, 'task_not_eligible', 'an archived parent cannot be delivered')
+    assert.equal(f.journal.length, count)
     await f.end()
   } finally { await f.close() }
 })
@@ -160,7 +157,6 @@ test('large recent updates cannot inflate a candidate beyond the page budget', a
   const f = await routerFixture(objects(), { now }), tokenizer = await loadRouterTokenizer()
   try {
     const requestId = await f.submit({ prompt: '查询近期任务' })
-    await f.call('router_query', { requestId, mode: 'bootstrap' })
     const result = await f.call('router_query', { requestId, mode: 'task_briefs', selectedScope: { kind: 'requirement', requirementId: 'requirement' } })
     assert.equal(result.ok, true, JSON.stringify(result))
     assert.deepEqual(result.value.items.map((row: any) => row.id), ['task'])

@@ -68,6 +68,28 @@ server.listen(0,'127.0.0.1',() => console.log('Kimi server: http://127.0.0.1:' +
   const bin = join(home, 'kimi')
   const childProcess = require('node:child_process') as typeof import('node:child_process')
   const execFile = childProcess.execFile
+  const ownedClose = KimiWebServer.prototype.closeAndWait
+  let cleaning = false, cleanupTimeout = false
+  KimiWebServer.prototype.closeAndWait = function () {
+    cleaning = true
+    return ownedClose.call(this).finally(() => { cleaning = false })
+  }
+  childProcess.execFile = function (file: string, ...args: any[]) {
+    if (file !== '/bin/ps' || !args[0]?.includes('-p') || !cleaning || cleanupTimeout) return Reflect.apply(execFile, childProcess, [file, ...args])
+    cleanupTimeout = true
+    const callback = args.pop()
+    const failure = Object.assign(new Error('fixture cleanup inspection deadline'), { code: null, killed: true, signal: 'SIGTERM' })
+    return Reflect.apply(execFile, childProcess, [process.execPath, ['-e', ''], args[1], () => callback(failure, '', '')])
+  } as typeof execFile
+  syncBuiltinESMExports()
+  try {
+    assert.equal((await probeKimiWeb(bin, home, { HOME: home, KIMI_CODE_HOME: home })).status, 'ready',
+      'a single cleanup inspection timeout must be freshly revalidated before detection completes')
+    assert.equal(cleanupTimeout, true)
+  } finally {
+    KimiWebServer.prototype.closeAndWait = ownedClose
+    childProcess.execFile = execFile; syncBuiltinESMExports()
+  }
   const inspectionFailure = new Error('fixture process inspection unavailable')
   let injected = false
   childProcess.execFile = function (file: string, ...args: any[]) {

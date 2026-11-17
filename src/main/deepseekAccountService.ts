@@ -17,6 +17,9 @@ interface Options {
   authenticated: () => void
 }
 const active = new Set(['initializing', 'waiting-browser', 'exchanging', 'committing'])
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
 
 /** Uses the native PKCE flow. Neither account grants nor authorization URLs cross IPC. */
 export class DeepSeekAccountService {
@@ -80,9 +83,19 @@ export class DeepSeekAccountService {
     try { if (this.busy) await this.cancel() }
     finally { this.#lifetime?.abort(); await this.#flight?.catch(() => undefined); this.#view = undefined }
   }
+  private watchView(update: unknown): AccountView {
+    if (!record(update)) throw new Error('DeepSeek 登录状态无效，请重试')
+    // rc.4 wraps every progress and credential update; earlier Hosts stream AccountView directly.
+    if ('type' in update || 'state' in update) {
+      if (update.type !== 'snapshot' && update.type !== 'credentials-changed') throw new Error('DeepSeek 登录状态无效，请重试')
+      return update.state as AccountView
+    }
+    return update as unknown as AccountView
+  }
   private accept(view: AccountView): void {
-    if (!view || !['signed-out', 'credential-stored'].includes(view.status)
-      || (view.attempt && (typeof view.attempt.id !== 'string' || !['initializing', 'waiting-browser', 'exchanging', 'committing', 'succeeded', 'cancelled', 'expired', 'failed'].includes(view.attempt.phase)))) {
+    if (!record(view) || !['signed-out', 'credential-stored'].includes(view.status)
+      || (view.attempt !== null && (!record(view.attempt) || typeof view.attempt.id !== 'string'
+        || !['initializing', 'waiting-browser', 'exchanging', 'committing', 'succeeded', 'cancelled', 'expired', 'failed'].includes(view.attempt.phase)))) {
       throw new Error('DeepSeek 登录状态无效，请重试')
     }
     this.#view = view
@@ -129,8 +142,8 @@ export class DeepSeekAccountService {
       }, signal)
       if (await observe(initial)) return this.snapshot()
       // Native watch replays the current state; a fast callback between start and subscribe is not lost.
-      for await (const view of client.stream<AccountView>('account/watch', {}, AbortSignal.any([signal, AbortSignal.timeout(11 * 60_000)]))) {
-        if (await observe(view)) return this.snapshot()
+      for await (const update of client.stream<unknown>('account/watch', {}, AbortSignal.any([signal, AbortSignal.timeout(11 * 60_000)]))) {
+        if (await observe(this.watchView(update))) return this.snapshot()
       }
       throw new Error('DeepSeek 登录连接已断开，请重新登录')
     } catch (error) {

@@ -26,9 +26,12 @@
 .task-board-indicator>.ui-icon { display:block; }.task-board-indicator .si-spinner { display:block; width:12px; height:12px; border-width:1.5px; }
 .task-board-indicator.decision { color:var(--amber); }.task-board-card.high .task-board-indicator.decision { color:var(--orange); }
 .task-board-unread { width:6px; height:6px; flex:none; margin-top:6px; border-radius:50%; background:var(--blue); }
+.task-board-attention { display:flex; flex:none; margin-top:3px; color:var(--amber); }
 .task-board-group { margin-bottom:15px; }.task-board-group-head { display:flex; align-items:center; gap:5px; min-width:0; margin-bottom:7px; font-size:10px; color:var(--text-dim); }
 .task-board-group-head>.ui-icon { flex:none; }.task-board-group-head.requirement>.ui-icon { color:var(--purple); }.task-board-group-head.space>.ui-icon { color:var(--blue); }
 .task-board-group-head>span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+button.task-board-group-head { width:100%; padding:2px 0; margin-top:-2px; margin-bottom:5px; border:0; border-radius:4px; background:none; font:inherit; font-size:10px; color:var(--text-dim); text-align:left; cursor:pointer; }
+button.task-board-group-head:hover { background:var(--bg-elev2); color:var(--text); }
 .task-board-card-actions { display:flex; position:absolute; right:9px; bottom:8px; gap:3px; padding:2px; border:1px solid var(--border); border-radius:7px; background:var(--bg-elev1); opacity:0; pointer-events:none; }
 .task-board-card:hover .task-board-card-actions,.task-board-card:focus-within .task-board-card-actions { opacity:1; pointer-events:auto; }
 .task-board-card-action { display:grid; place-items:center; width:24px; height:24px; padding:0; border:0; border-radius:5px; background:var(--bg-elev2); color:var(--text-dim); cursor:pointer; }

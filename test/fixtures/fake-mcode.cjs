@@ -495,7 +495,9 @@ createInterface({ input: process.stdin }).on('line', (line) => {
         pendingMode = undefined
         update(params.sessionId, { sessionUpdate: 'current_mode_update', currentModeId: mode })
       }
-      const text = contentText(params.prompt)
+      // Interpret the business request while retaining the complete submitted native history.
+      const submittedText = contentText(params.prompt)
+      const text = submittedText.replace(/^(?:<uniagent_(?:initial|channel)_context>[\s\S]*?<\/uniagent_(?:initial|channel)_context>\n\n)+/, '')
       if (text === 'fail-turn') {
         setTimeout(() => fail(frame.id, -32603, 'fixture turn failed'), 100)
         return
@@ -588,7 +590,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       const stored = state.sessions.find((session) => session.sessionId === params.sessionId)
       if (stored) {
         stored.transcript = [...(stored.transcript || []),
-          { role: 'user', text },
+          { role: 'user', text: submittedText },
           { role: 'thought', text: 'Inspecting' },
           { role: 'assistant', text: 'MiniMax Code reply' }
         ]

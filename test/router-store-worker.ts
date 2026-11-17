@@ -4,7 +4,8 @@ import { join, resolve } from 'node:path'
 import { Worker } from 'node:worker_threads'
 import { randomUUID } from 'node:crypto'
 import { build } from 'esbuild'
-import { DEFAULT_ROUTER_CONFIG } from '../src/shared/router'
+import { DEFAULT_ROUTER_CONFIG, routerInitialRequirementContext } from '../src/shared/router'
+import { loadRouterTokenizer } from '../src/main/router/tokenizer'
 import { RouterController } from '../src/main/router/controller'
 import type { RouterStore } from '../src/main/router/store'
 import type { AgentDef, Session } from '../src/shared/types'
@@ -26,6 +27,14 @@ const ready = new Promise<void>((resolveReady, rejectReady) => {
 const request = (method: string, args: unknown[] = []) => new Promise<any>((resolve, reject) => { const id = ++sequence; pending.set(id, { resolve, reject }); worker.postMessage({ id, method, args }) })
 try {
   await ready
+  const tokenizer = await loadRouterTokenizer()
+  let tokens = 2000 - tokenizer.count(routerInitialRequirementContext(''))
+  while (tokenizer.count(routerInitialRequirementContext(' a'.repeat(tokens))) < 2000) tokens++
+  const exact = ' a'.repeat(tokens)
+  assert.equal(tokenizer.count(routerInitialRequirementContext(exact)), 2000)
+  await request('validateInitialRequirementContext', [exact])
+  assert.equal(tokenizer.count(routerInitialRequirementContext(exact + ' a')), 2001)
+  await assert.rejects(request('validateInitialRequirementContext', [exact + ' a']), /router_initial_context_too_large/)
   const image={kind:'image',path:'/fixture/worker-draft.png',name:'worker-draft.png',previewDataUrl:'data:image/png;base64,preview'}
   await request('draftImages',['save',[image]])
   assert.deepEqual(await request('draftImages',['read']),[image],'actual worker dispatch supports image drafts')
@@ -38,6 +47,7 @@ try {
   await request('index', [[{ id: 'images', title: '历史图片', summary: '图片漏显', kind: 'task', version: '1', projectId: 'ua', lastBusinessUpdatedAt: Date.now() },
     { id: 'ua', title: 'UniAgent', summary: '应用', kind: 'space', version: '1', projectId: 'ua' }]])
   const catalog=await request('catalog',[input.requestId,'space'])
+  assert.equal(catalog.catalogRevision, await request('catalogRevision'), 'catalog revision is served through the real worker')
   const reading=await request('update',[input.requestId,rows[0].version,{context:{objects:catalog.objects,memories:[],reading:{scannedTaskIds:[],details:[],catalogs:[{key:'requirement:ua',complete:true}]}}}])
   assert.equal((await request('taskBriefs',[input.requestId,{kind:'space',projectId:'ua'}])).items[0].id,'images')
   assert.equal((await request('requests')).length, 1)

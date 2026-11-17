@@ -57,7 +57,7 @@ try {
     assert.deepEqual(launch.args.slice(0, resumeId ? 3 : 1), resumeId ? ['exec', 'resume', resumeId] : ['exec'])
     assert.equal(launch.args[launch.args.indexOf('-i') + 1], image.path)
     assert.deepEqual(launch.args.slice(-2), ['--', 'route'], 'the variadic native image flag must not consume the prompt as another image')
-    assert.equal(launch.appendedPrompt, ROUTER_SYSTEM_PROMPT)
+    assert.ok(launch.appendedPrompt!.startsWith(ROUTER_SYSTEM_PROMPT))
     assert.ok(!launch.args.includes('--ignore-rules'))
     assert.ok(!launch.args.includes('--allowed-tool'), 'TraeX allowed-tool is a Bash permission, not a tool allowlist')
     assert.ok(!launch.args.includes('--disallowed-tool'))
@@ -111,7 +111,7 @@ try {
       const item = phase < 2 ? {
         id: 'fc-' + replyIndex, type: 'function_call', status: 'completed', call_id: 'call-' + replyIndex,
         name: phase === 0 ? 'mcp__uniagent_router__router_query' : 'mcp__uniagent_router__router_assign_task',
-        arguments: JSON.stringify(phase === 0 ? { requestId: 'fixture-request', mode: 'bootstrap' }
+        arguments: JSON.stringify(phase === 0 ? { requestId: 'fixture-request', mode: 'catalog', kind: 'space' }
           : { requestId: 'fixture-request', version: 1, action: 'clarify', reason: '缺少归属', clarification: '请选择归属' })
       } : { id: 'msg-' + replyIndex, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: routing ? '已完成路由协议验证' : '辅助模型请求已完成', annotations: [] }] }
       response.writeHead(200, { 'content-type': 'text/event-stream' })
@@ -144,7 +144,7 @@ try {
         assert.equal(resumed.nativeSessionId, initial.nativeSessionId)
         assert.equal(captures.length, 6, `${model.slug}: initial and resumed turns must each execute query and assignment`)
         assert.deepEqual(calls.map(call => call.tool), ['router_query', 'router_assign_task', 'router_query', 'router_assign_task'])
-        assert.deepEqual(calls[0].args, { requestId: 'fixture-request', mode: 'bootstrap' })
+        assert.deepEqual(calls[0].args, { requestId: 'fixture-request', mode: 'catalog', kind: 'space' })
         for (const request of captures) {
           const tools = request.tools.flatMap((tool: any) => tool.type === 'namespace' ? tool.tools.map((row: any) => tool.name + row.name) : [tool.name || tool.type])
           assert.ok(tools.some((name: string) => /(?:exec|Read|Bash)$/.test(name)), 'native tools remain available')

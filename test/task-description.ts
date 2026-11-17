@@ -120,18 +120,19 @@ try {
   service.responded(value.id, '新轮次首段', 'late-new')
   await until(() => value.taskMetadata?.generatedInputId === 'late-new')
 
-  const exactly200 = ' a'.repeat(200), over200 = ' a'.repeat(201)
-  assert.equal(await counter.count(exactly200), 200)
-  assert.equal(await counter.count(over200), 201)
-  await counter.validate(exactly200)
-  await assert.rejects(counter.validate(over200), /200 token/)
+  const exactly300 = ' a'.repeat(300), over300 = ' a'.repeat(301)
+  assert.equal(await counter.count(exactly300), 300)
+  assert.equal(await counter.count(over300), 301)
+  await counter.validate(' a'.repeat(299))
+  await counter.validate(exactly300)
+  await assert.rejects(counter.validate(over300), /300 token/)
   await counter.validate('中文、English、emoji 😀，保留用户目标。')
   assert.throws(() => parseTaskTitleResult('{"title":"任务","needsClarification":false}'), /描述/)
   assert.throws(() => parseTaskTitleResult('{"title":"任务","description":"","needsClarification":false}'), /描述/)
   assert.throws(() => parseTaskTitleResult('{"title":"任务","description":"password=secret-fixture","needsClarification":false}'), /凭据/)
 
   const saved = result.description
-  result = { ...result, description: over200 }
+  result = { ...result, description: over300 }
   service.accepted(value.id, '超长描述回归', { inputId: 'over-limit' }); service.responded(value.id, '首段', 'over-limit')
   await until(() => value.taskMetadata?.generationState === 'failed')
   assert.equal(value.taskMetadata?.description, saved, 'over-limit description never replaces the valid pair')

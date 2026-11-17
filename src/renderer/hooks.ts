@@ -114,13 +114,18 @@ export function useAutoResize(
       if (el.style.overflowY !== overflow) el.style.overflowY = overflow
     }
     resize()
+    let resizeFrame = 0
     const observer = new ResizeObserver(() => {
-      if (el.getBoundingClientRect().width !== width) resize()
+      if (el.getBoundingClientRect().width !== width) {
+        cancelAnimationFrame(resizeFrame)
+        resizeFrame = requestAnimationFrame(resize)
+      }
     })
     observer.observe(el)
     window.addEventListener('resize', resize)
     return () => {
       observer.disconnect()
+      cancelAnimationFrame(resizeFrame)
       window.removeEventListener('resize', resize)
     }
   }, [ref, value, maxRatio, minPx])

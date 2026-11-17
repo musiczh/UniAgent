@@ -25,10 +25,10 @@ const controller = new RouterController(store, { agents: () => [agent], config: 
 const source = { botAppId: 'fixture', chatId: 'fixture-chat', rootMessageId: 'root', cardMessageId: 'card' }
 try {
   const request = database.register({ requestId: randomUUID(), prompt: 'route', feishu: source }, config)
-  const failed = database.update(request.requestId, request.version, { state: 'failed', error: 'connection lost', context: { objects: [], memories: [] } })
+  const failed = database.update(request.requestId, request.version, { state: 'failed', error: 'connection lost', context: { objects: [{ id: 'stale', version: '1' }], reading: { scannedTaskIds: ['stale'], details: [], catalogs: [{ key: 'space', complete: true, catalogRevision: 'old-catalog', asOf: 1 }] } } })
   await assert.rejects(controller.retry(failed.requestId, failed.version - 1), /不能重新路由/)
   const retry = await controller.retry(failed.requestId, failed.version)
-  assert.equal(retry.state, 'queued'); assert.equal(retry.context, undefined); assert.equal(retry.error, undefined)
+  assert.equal(retry.state, 'queued'); assert.deepEqual(retry.context?.objects, [{ id: 'stale', version: '1' }], 'the same requestId retains prior reading as a fast entry'); assert.deepEqual(retry.context?.reading, { scannedTaskIds: ['stale'], details: [], catalogs: [{ key: 'space', complete: true, catalogRevision: 'old-catalog', asOf: 1 }] }, 'old reading keeps its original catalog revision and asOf'); assert.equal(retry.error, undefined)
   assert.deepEqual(retry.feishu, source)
   for (let i = 0; i < 205; i++) database.register({ requestId: randomUUID(), prompt: 'newer' }, config)
   assert.ok(!database.requests().some(row => row.requestId === retry.requestId))

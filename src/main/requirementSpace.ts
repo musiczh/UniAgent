@@ -116,7 +116,12 @@ export async function requirementRoutingSources(r: Requirement): Promise<import(
     return { ...doc, content, contentHash: doc.contentHash || await digest(content) }
   }))
   const revision = await digest({ id: r.id, name: r.name, projectId: r.projectId, status: r.status, documents: documents.map(({ content: _content, ...doc }) => doc) })
-  return { revision, documents }
+  const references = Object.values(snapshot.documents).flatMap(doc => {
+    if (!['source', 'artifact'].includes(doc.kind)) return []
+    const uris = [...new Set(doc.sources.filter(source => source.kind === 'reference').map(source => source.uri!))]
+    return uris.length ? [{ id: doc.id, title: doc.title, kind: doc.kind, status: doc.status, freshness: doc.freshness, uris }] : []
+  }).sort((a, b) => a.id.localeCompare(b.id))
+  return { revision, documents, references }
 }
 export async function readRequirementRouting(r: Requirement): Promise<{ snapshot: import('../shared/requirementTypes').RequirementRoutingSnapshot; sources: import('../shared/requirementTypes').RequirementRoutingSources }> {
   const sources = await requirementRoutingSources(r)

@@ -340,9 +340,11 @@ export function claimModelNotification(keys: Set<string>, key: string): boolean 
 export function buildInput(
   prompt: string,
   attachments?: Attachment[],
-  nativeContext?: ResolvedNativeTurnContext
+  nativeContext?: ResolvedNativeTurnContext,
+  hostContext?: string
 ): any[] {
   const input: any[] = prompt ? [{ type: 'text', text: prompt, text_elements: [] }] : []
+  if (hostContext) input.unshift({ type: 'text', text: hostContext, text_elements: [] })
   for (const a of attachments || []) {
     input.push(
       a.kind === 'image'
@@ -363,11 +365,12 @@ export function buildTurnStartParams(
   threadId: string | undefined,
   prompt: string,
   attachments?: Attachment[],
-  nativeContext?: ResolvedNativeTurnContext
+  nativeContext?: ResolvedNativeTurnContext,
+  hostContext?: string
 ): Record<string, any> {
   return {
     threadId,
-    input: buildInput(prompt, attachments, nativeContext),
+    input: buildInput(prompt, attachments, nativeContext, hostContext),
     ...(config.model ? { model: config.model } : {}),
     ...(config.effort ? { effort: config.effort } : {}),
     ...(agent.adapter === 'codex'

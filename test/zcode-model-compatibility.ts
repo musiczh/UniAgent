@@ -42,6 +42,30 @@ try {
   assert.equal(resolveZCodeSelection({}, models, configuredDefault).options?.reasoningLevel, 'disabled')
   const defaultCatalog = await readZCodeConfiguredModels(personal, builtin, configuredDefault)
   assert.equal(defaultCatalog.find(model => model.id === native.id)?.defaultThinking, 'disabled')
+  const managedPersonal = join(root, 'managed-personal.json')
+  const managedDefault = { providerId: 'personal:uniagent-zcode-bigmodel-api', modelId: 'GLM-5.3' }
+  const arkSelection = { providerId: 'personal:uniagent-ark-fixture', modelId: 'glm-5.3-flash' }
+  const extraProviders = [arkSelection.providerId, 'personal:uniagent-trae-fixture']
+  const managedDocument = { schemaVersion: 1, config: {
+    defaultModelSelection: managedDefault,
+    providerConfigRules: { providerRules: [
+      ...['bigmodel-api', 'bigmodel-coding'].map(id => ({ providerId: `personal:uniagent-zcode-${id}`, config: { personalModelIds: ['GLM-5.3'] } })),
+      ...extraProviders.map(providerId => ({ providerId, config: { personalModelIds: [arkSelection.modelId] } })),
+      { providerId: 'personal:disabled', enabled: false, config: { personalModelIds: ['disabled'] } },
+      { providerId: 'personal:hidden', config: { visibility: 'hidden', personalModelIds: ['hidden'] } }
+    ] },
+    modelConfigRules: { providerModelRules: [{ ...arkSelection, config: { optionSpecs: { reasoningLevel: { values: ['low', 'high', 'max'] } } } }] }
+  } }
+  await writeFile(managedPersonal, JSON.stringify(managedDocument), { mode: 0o600 })
+  const managedCatalog = await readZCodeConfiguredModels(managedPersonal, builtin, managedDefault)
+  assert.deepEqual(managedCatalog.map(model => model.zcodeSelection?.providerId), [managedDefault.providerId, ...extraProviders],
+    'selecting a native service must retain independent third-party providers and exclude inactive service choices')
+  assert.deepEqual(resolveZCodeSelection({ model: zcodeModelKey(arkSelection), effort: 'low' }, managedCatalog, managedDefault),
+    { ...arkSelection, options: { reasoningLevel: 'low' } }, 'a listed Ark model starts with its own provider and chosen depth')
+  assert.throws(() => resolveZCodeSelection({ model: arkSelection.modelId }, managedCatalog, managedDefault), /同名/,
+    'retaining multiple providers must not bypass ambiguous legacy model checks')
+  assert.deepEqual(resolveZCodeSelection({ model: arkSelection.modelId, zcodeModelSelection: arkSelection, effort: 'high' }, managedCatalog, managedDefault),
+    { ...arkSelection, options: { reasoningLevel: 'high' } })
   const agent: AgentDef = { id: 'zcode', name: 'ZCode', bin: '/fixture/zcode', adapter: 'zcode', icon: 'zcode', builtin: true, installed: true,
     models, defaultModel: native.id, capabilities: { streaming: true, modelSelect: true, reasoningEffort: true, permissionModes: ZCODE_PERMISSION_MODES } }
   const role: AgentRole = { id: 'zcode-fixture', name: 'Fixture', agentId: agent.id, model: native.id, zcodeThinking: 'disabled', permissionMode: 'ask' }

@@ -8,6 +8,7 @@ import { kimiWebContract } from '../src/main/kimiWebContract.ts'
 import { assertKimiWebConfig } from '../src/main/kimiRoleConfig.ts'
 import { buildKimiWebContent, projectKimiWebUsage } from '../src/main/kimiWebEventProjection.ts'
 import { resolveAgentModel } from '../src/shared/agentChoices.ts'
+import { Orchestrator } from '../src/main/orchestrator.ts'
 
 const config: any = { agentId: 'kimi', workdir: '/tmp', permissionMode: 'ask' }
 const agent: any = { id: 'kimi', name: 'Kimi', bin: 'unused', adapter: 'kimi', capabilities: {}, models: [] }
@@ -143,12 +144,35 @@ runner.runtime.setProfile = async (profile: any) => {
 await assert.rejects(runner.updateConfig({ ...config, permissionMode: 'unattended' }), /profile_not_applied/)
 assert.equal(runner.config.permissionMode, 'full-access', 'a rejected switch must preserve the saved permission')
 assert.equal(profiles.at(-1).permission_mode, 'yolo', 'a rejected switch must restore the native permission')
+runner.runtime.models = async () => ({ items: [{ model: 'native-k3', display_name: 'kimi-k3.1-pro', support_efforts: ['low','high','max'], default_effort: 'max' }] })
+runner.runtime.status = async () => ({ model: 'native-k3', permission: profiles.at(-1)?.permission_mode })
+for (const thinking of ['low','high','max']) {
+  await runner.updateConfig({ ...config, model: 'native-k3', permissionMode: 'full-access', kimiThinking: thinking })
+  assert.equal(profiles.at(-1).thinking, thinking, 'the selected native thinking level must reach the applied profile')
+  assert.deepEqual(runner.contract.models[0].thinkingOptions, ['low','high','max'])
+  assert.equal(runner.contract.models[0].defaultThinking, 'max')
+}
 await runner.disposeAndWait()
 const directory = await mkdtemp(join(tmpdir(), 'kimi-home-binding-'))
 try {
   const store = new SessionStore(join(directory, 'sessions.json'))
   store.saveOrThrow([{ id: 'bound', title: 'Bound native identity', config: { ...config, kimiDataHome: join(directory, 'native-home') }, nativeSessionId: 'same-id', status: 'idle', createdAt: 1 }])
   assert.equal(new SessionStore(join(directory, 'sessions.json')).load()[0].config.kimiDataHome, join(directory, 'native-home'), 'storage identity must survive a cold load, independent of default HOME')
+  const contract = kimiWebContract([{ model: 'native-k3', display_name: 'kimi-k3.1-pro', support_efforts: ['low','high','max'], default_effort: 'max' }], { model: 'native-k3' })
+  for (const adapter of ['kimi','zcode']) {
+    const sourceAgent: any = { ...agent, id: adapter, adapter, installed: true, models: contract.models, capabilities: { permissionModes: contract.permissionModes } }
+    const host: any = new Orchestrator(() => sourceAgent, new SessionStore(join(directory, `${adapter}-sessions.json`)), undefined, undefined, undefined, undefined, undefined,
+      (_agentId, models) => models.map(model => ({ ...model, label: `方舟 · ${model.label}`, modelSource: { kind: 'third-party', sourceId: 'fixture-ark' } })))
+    const session = host.createSessionRecord({ agentId: adapter, workdir: '/tmp', model: 'native-k3', permissionMode: 'ask', kimiThinking: 'max' }, 'source projection').session
+    if (adapter === 'kimi') host.protocolRunners.set(session.id, { updateConfig: async target => ({ config: target, contract }) })
+    else host.ensureZCodeRunner = async () => ({ updateConfig: async () => contract })
+    await host.updateSessionConfig(session.id, { permissionMode: 'full-access' })
+    assert.equal(session.agentContract.models[0].label, '方舟 · kimi-k3.1-pro', `${adapter} native configuration updates must retain the source prefix`)
+    assert.equal(session.agentContract.models[0].modelSource.sourceId, 'fixture-ark')
+    assert.deepEqual(session.agentContract.models[0].thinkingOptions, ['low','high','max'])
+    assert.equal(session.config.model, 'native-k3')
+    host.protocolRunners.clear(); host.disposeAll(); await host.closeSessionLogs()
+  }
 } finally { await rm(directory, { recursive: true, force: true }) }
 console.log('Kimi Web runner: applied profile, policy rejection, typed question, plan decision mapping and steer receipt passed')
 

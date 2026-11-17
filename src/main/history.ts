@@ -32,6 +32,7 @@ import {
 } from './acp/acpRunner'
 import { listKimiWebSessions as listKimiSessions } from './kimiHistory.ts'
 import { readHistoryFile, trackHistoryWork, type HistoryProgressCallback } from './historyProgress'
+import { isCompressedRollout, withDecodedHistoryFile } from './historyCompression'
 import { claudeFileChange } from './claudeFileChanges'
 import { updateClaudeTaskPlan } from './claudeTaskPlan'
 import { filesFromTurnChanges } from './turnFileChanges'
@@ -296,7 +297,7 @@ async function readSessionIndexTitles(file: string): Promise<Map<string, string>
 }
 
 /** Recursively collect every `rollout-*.jsonl` under a root (sessions is nested YYYY/MM/DD; archived_sessions is flat). */
-export async function collectRolloutFiles(dir: string, out: string[]): Promise<void> {
+export async function collectRolloutFiles(dir: string, out: string[], includeCompressed = false): Promise<void> {
   let entries: { name: string; isDir: boolean }[] = []
   try {
     entries = (await readdir(dir, { withFileTypes: true })).map((d) => ({
@@ -310,8 +311,8 @@ export async function collectRolloutFiles(dir: string, out: string[]): Promise<v
     if (e.name.startsWith('.')) continue
     const full = join(dir, e.name)
     if (e.isDir) {
-      await collectRolloutFiles(full, out)
-    } else if (e.name.startsWith('rollout-') && e.name.endsWith('.jsonl')) {
+      await collectRolloutFiles(full, out, includeCompressed)
+    } else if (e.name.startsWith('rollout-') && (e.name.endsWith('.jsonl') || includeCompressed && isCompressedRollout(e.name))) {
       out.push(full)
     }
   }
@@ -722,11 +723,11 @@ async function findRollouts(baseDir: string, ids: Iterable<string>): Promise<Map
   const files: string[] = []
   for (const sub of ['sessions', 'archived_sessions']) {
     const root = join(baseDir, sub)
-    if (existsSync(root)) await collectRolloutFiles(root, files)
+    if (existsSync(root)) await collectRolloutFiles(root, files, true)
   }
   for (const file of files) {
     for (const id of remaining) {
-      if (!file.endsWith(`-${id}.jsonl`)) continue
+      if (!file.replace(/\.(zst|zstd)$/, '').endsWith(`-${id}.jsonl`)) continue
       found.set(id, file)
       remaining.delete(id)
       break
@@ -742,6 +743,13 @@ async function findRollouts(baseDir: string, ids: Iterable<string>): Promise<Map
  * valid bound for an earlier generation.
  */
 export async function rolloutGenerationEndTimestamp(
+  file: string,
+  startedAt: number | undefined
+): Promise<number | undefined> {
+  return withDecodedHistoryFile(file, path => plainRolloutGenerationEndTimestamp(path, startedAt))
+}
+
+async function plainRolloutGenerationEndTimestamp(
   file: string,
   startedAt: number | undefined
 ): Promise<number | undefined> {
@@ -793,6 +801,11 @@ async function walkFind(dir: string, id: string, strict = false): Promise<string
   const suffix = '-' + id + '.jsonl'
   for (const name of entries) {
     if (name.endsWith(suffix)) return join(dir, name)
+  }
+  for (const extension of ['.zst', '.zstd']) {
+    for (const name of entries) {
+      if (name.endsWith(suffix + extension)) return join(dir, name)
+    }
   }
   for (const name of entries) {
     if (name.endsWith('.jsonl')) continue
@@ -1295,7 +1308,7 @@ export async function forkSameSession(
   }
   let text = ''
   try {
-    text = await readFile(srcFile, 'utf8')
+    text = (await readHistoryFile(srcFile)).toString('utf8')
   } catch {
     return null
   }
@@ -1348,7 +1361,7 @@ export async function forkSameSession(
   // left the fork's blobs unresolvable, so thread/resume's history
   // materialization failed with "No such file". Copy the sidecar too so the
   // fork is genuinely lossless.
-  const srcArtifacts = `${srcFile.replace(/\.jsonl$/, '')}.artifacts`
+  const srcArtifacts = `${srcFile.replace(/\.jsonl(?:\.zst|\.zstd)?$/, '')}.artifacts`
   if (existsSync(srcArtifacts)) {
     try {
       await cp(srcArtifacts, `${file.replace(/\.jsonl$/, '')}.artifacts`, { recursive: true })
@@ -2057,7 +2070,8 @@ export async function loadCodexLikeEvents(
   if (text === undefined) {
     try {
       text = (await readHistoryFile(file, onProgress)).toString('utf8')
-    } catch {
+    } catch (error) {
+      if (isCompressedRollout(file)) throw error
       return { events: [] }
     }
   }
@@ -3434,7 +3448,7 @@ export async function loadCodexLikeEvents(
     const childFile = childFiles.get(agent.agentThreadId)
     if (!childFile) return
     try {
-      await forEachHeadLine(childFile, 64 * 1024, line => {
+      await withDecodedHistoryFile(childFile, path => forEachHeadLine(path, 64 * 1024, line => {
         let record: any
         try { record = JSON.parse(line) } catch { return true }
         if (record.type !== 'session_meta') return true
@@ -3445,7 +3459,7 @@ export async function loadCodexLikeEvents(
         const name = nativeSubAgentName(meta)
         if (name) names.set(agent.agentThreadId, name)
         return false
-      })
+      }))
     } catch { /* Missing child metadata leaves the existing fallback intact. */ }
   }))
   for (const event of events) {

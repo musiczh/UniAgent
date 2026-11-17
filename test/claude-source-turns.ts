@@ -9,6 +9,7 @@ import { codexModelKey } from '../src/shared/codexModelIdentity'
 import { claudeSourceEffort } from '../src/shared/claudeSources'
 import { Orchestrator } from '../src/main/orchestrator'
 import { SessionStore } from '../src/main/sessionStore'
+import { configureAssistantContextRuntime } from '../src/main/assistant/context'
 import type { AgentDef, Session, SessionConfig, UAEvent } from '../src/shared/types'
 
 const directory = await mkdtemp(join(tmpdir(), 'ua-claude-source-turn-'))
@@ -18,18 +19,19 @@ configureClaudeSourceRuntime(async () => connection)
 const bin = join(directory, 'cli.cjs')
 await writeFile(bin, `#!${process.execPath}
 const fs=require('node:fs');const args=process.argv.slice(2);const file=args[args.indexOf('--settings')+1];
-const settings=JSON.parse(fs.readFileSync(file,'utf8'));fs.writeFileSync('capture.json',JSON.stringify({args,settings,env:process.env.ANTHROPIC_API_KEY,auth:process.env.ANTHROPIC_AUTH_TOKEN}));
+const settings=JSON.parse(fs.readFileSync(file,'utf8')),capture={args,settings,env:process.env.ANTHROPIC_API_KEY,auth:process.env.ANTHROPIC_AUTH_TOKEN};fs.writeFileSync('capture.json',JSON.stringify(capture));
 const send=value=>process.stdout.write(JSON.stringify(value)+'\\n');
 require('node:readline').createInterface({input:process.stdin}).on('line',line=>{
  const input=JSON.parse(line);if(input.type==='control_request'){send({type:'control_response',response:{subtype:'success',request_id:input.request_id,response:{commands:[],models:[]}}});return}if(input.type!=='user')return;
- const mode=input.message.content;
+ fs.writeFileSync('capture.json',JSON.stringify({...capture,input:input.message.content}));
+ const mode=typeof input.message.content==='string'?input.message.content:input.message.content.filter(block=>block.type==='text').at(-1).text;
  send({type:'system',subtype:'init',session_id:'fixture-session',model:'k3'});
  if(mode==='wait')return;
  if(mode.startsWith('retry-')){const status=Number(mode.slice(6));send({type:'system',subtype:'api_retry',attempt:1,max_retries:10,retry_delay_ms:10000,error_status:status,error:'authentication_failed'});if([401,402,403].includes(status))return;}
- send({type:'assistant',message:{content:[{type:'text',text:'answer'}]},context_usage:{raw_max_tokens:200000},usage_report:{session:{total_cost_usd:123}}});
+ send({type:'assistant',parent_tool_use_id:null,user_message_uuid:input.uuid,session_id:'fixture-session',message:{content:[{type:'text',text:'answer'}]},context_usage:{raw_max_tokens:200000},usage_report:{session:{total_cost_usd:123}}});
  send({type:'rate_limit_event',rate_limit_info:{status:'allowed',rateLimitType:'five_hour',utilization:0.3}});
  if(mode==='fail')process.stderr.write('failed '+settings.env.ANTHROPIC_API_KEY);
- send({type:'result',subtype:mode==='fail'?'error_during_execution':'success',is_error:mode==='fail',errors:mode==='fail'?[settings.env.ANTHROPIC_API_KEY]:[],usage:{input_tokens:10,output_tokens:2},total_cost_usd:123,modelUsage:{k3:{contextWindow:200000}},result:mode==='fail'?settings.env.ANTHROPIC_API_KEY:'answer'});
+ send({type:'result',user_message_uuid:input.uuid,session_id:'fixture-session',subtype:mode==='fail'?'error_during_execution':'success',is_error:mode==='fail',errors:mode==='fail'?[settings.env.ANTHROPIC_API_KEY]:[],usage:{input_tokens:10,output_tokens:2},total_cost_usd:123,modelUsage:{k3:{contextWindow:200000}},result:mode==='fail'?settings.env.ANTHROPIC_API_KEY:'answer'});
 });
 `, { mode: 0o700 })
 const agent: AgentDef = { id: 'claude', name: 'Claude', adapter: 'claude', bin, builtin: true, installed: true, icon: '', version: '2.1.300', models: [],
@@ -38,9 +40,14 @@ const config: SessionConfig = { agentId: 'claude', workdir: directory, permissio
 const emptyRuntimes = async (): Promise<void> => { assert.deepEqual(await readdir(join(directory, 'claude-sources/runtime')), []) }
 try {
   for (const prompt of ['success', 'fail']) {
+    const owned: Session = { id: prompt, title: prompt, status: 'idle', createdAt: 1, config }
+    configureAssistantContextRuntime(id => id === owned.id ? owned : undefined, () => {})
     const runner = new TurnRunner(prompt, { n: 0 }), events: UAEvent[] = []
     let quotaEvents = 0, doneEvents = 0
-    runner.on('event', value => events.push(value)); runner.on('rateLimits', () => quotaEvents++); runner.on('done', () => doneEvents++)
+    runner.on('event', value => {
+      events.push(value)
+      if (value.type === 'turn_started' && typeof value.payload.sessionId === 'string') owned.nativeSessionId = value.payload.sessionId
+    }); runner.on('rateLimits', () => quotaEvents++); runner.on('done', () => doneEvents++)
     const done = once(runner, 'done'); runner.start(agent, config, prompt)
     const [result] = await done
     assert.equal(result.failed, prompt === 'fail')
@@ -54,9 +61,21 @@ try {
     assert.equal(usage.inputTokens, 10); assert.equal(usage.outputTokens, 2)
     assert.equal(usage.contextWindow, undefined); assert.equal(usage.cost, null)
     const capture = JSON.parse(await readFile(join(directory, 'capture.json'), 'utf8'))
+    assert.deepEqual(capture.input, [
+      { type: 'text', text: '<uniagent_channel_context>\n当前消息通道：UniAgent App\n</uniagent_channel_context>' },
+      { type: 'text', text: prompt }
+    ], 'the SDK receives the first channel and the unchanged provider request in separate text blocks')
     assert.ok(capture.args.includes('--model=k3') || capture.args[capture.args.indexOf('--model') + 1] === 'k3', 'the SDK must select the provider wire model')
     assert.ok(!capture.args.join(' ').includes(connection.apiKey))
     assert.equal(capture.env, connection.apiKey)
+    if (prompt === 'success') {
+      const followupDone = once(runner, 'done')
+      runner.start(agent, config, 'success-followup', owned.nativeSessionId)
+      assert.equal((await followupDone)[0].failed, false)
+      const followup = JSON.parse(await readFile(join(directory, 'capture.json'), 'utf8'))
+      assert.equal(followup.input, 'success-followup', 'the confirmed same-channel followup reaches the SDK without repeated host context')
+      assert.equal(doneEvents, 2)
+    }
     await runner.disposeClaudeSdk(); await emptyRuntimes()
   }
   const previousConnection = connection
@@ -68,6 +87,10 @@ try {
     ferryRunner.start(agent, ferryConfig, 'success')
     assert.equal((await done)[0].failed, false)
     const capture = JSON.parse(await readFile(join(directory, 'capture.json'), 'utf8'))
+    assert.deepEqual(capture.input, [
+      { type: 'text', text: '<uniagent_channel_context>\n当前消息通道：UniAgent App\n</uniagent_channel_context>' },
+      { type: 'text', text: 'success' }
+    ])
     assert.ok(capture.args.includes('--model=claude-gpt-6-1-sol') || capture.args[capture.args.indexOf('--model') + 1] === 'claude-gpt-6-1-sol')
     assert.equal(capture.settings.env.ANTHROPIC_BASE_URL, connection.baseUrl)
     assert.equal(capture.env, '')
@@ -156,4 +179,4 @@ try {
     assert.equal(session.config.model, deepseek.model, 'a session without native history can still choose its initial provider')
   } finally { orchestrator.disposeAll() }
   console.log('claude-source-turns: wire model, secret redaction, usage isolation, failed result, spawn failure, cancellation and next-turn provider selection passed')
-} finally { configureClaudeSourceRuntime(undefined); await rm(directory, { recursive: true, force: true }) }
+} finally { configureClaudeSourceRuntime(undefined); configureAssistantContextRuntime(() => undefined, () => {}); await rm(directory, { recursive: true, force: true }) }

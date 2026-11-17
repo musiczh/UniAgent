@@ -28,10 +28,11 @@ export default defineConfig({
           performanceWorker: resolve(__dirname, 'src/main/performanceWorker.ts'),
           cloudMonitorWorker: resolve(__dirname, 'src/main/cloudMonitorWorker.ts'),
           nativeTokenUsageWorker: resolve(__dirname, 'src/main/nativeTokenUsageWorker.ts'),
-          codexSourceRouter: resolve(__dirname, 'src/main/codexSourceRouter.ts')
+          codexSourceRouter: resolve(__dirname, 'src/main/codexSourceRouter.ts'),
+          modelSourceGateway: resolve(__dirname, 'src/main/model-source-gateway/worker.ts')
         },
         output: { chunkFileNames: '[name]-[hash].js' },
-        external: ['better-sqlite3', '@anthropic-ai/claude-agent-sdk', '@qoder-ai/qoder-agent-sdk', '@qodercn-ai/qodercn-agent-sdk']
+        external: ['better-sqlite3', '@anthropic-ai/claude-agent-sdk', '@qoder-ai/qoder-agent-sdk', '@qodercn-ai/qodercn-agent-sdk', ]
       }
     }
   },

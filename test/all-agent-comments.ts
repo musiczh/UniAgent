@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { buildComposerDelivery } from '../src/renderer/components/Composer.tsx'
+import { buildComposerDelivery, dispatchComposerDelivery } from '../src/renderer/components/Composer.tsx'
 import type { AgentDef } from '../src/shared/types.ts'
 import { renderEventStream } from './regression/render-event-stream.mjs'
 
@@ -22,15 +22,34 @@ for (const provider of ['codex', 'traex'] as const) {
   assert.match(delivery?.prompt || '', /\{"text":"shared answer","annotation":"clarify this"\}/)
 }
 
-for (const provider of ['zcode', 'deepseek', 'claude', 'kimi', 'grok'] as const) {
+for (const provider of ['zcode', 'deepseek', 'claude', 'kimi', 'grok', 'mcode', 'qoder', 'nika'] as const) {
   const delivery = buildForProvider(null, 'Apply it', [], [], comment, provider)
   assert.equal(
     delivery?.prompt,
-    '\n# Response comments:\nEach item quotes text selected from an earlier agent response and may include a user comment. Use every selection as context and address every comment.\n<response-comments>\n[{"quote":"shared answer","comment":"clarify this"}]\n</response-comments>\n\n## My request:\nApply it\n',
+    '\n# Response comments:\n以下各项包含引用原文及可选评论；结合所有引用逐项回应评论。\n<response-comments>\n[{"quote":"shared answer","comment":"clarify this"}]\n</response-comments>\n\n## My request:\nApply it\n',
     `${provider} must receive comments as a provider-neutral prompt`
   )
   assert.doesNotMatch(delivery?.prompt || '', /Codex|codex-annotation|response-annotations/)
   assert.deepEqual(delivery?.comments, comment, 'the sent bubble keeps the original selected quote and comment')
+}
+
+for (const provider of ['codex', 'traex', 'zcode', 'deepseek', 'claude', 'kimi', 'grok', 'mcode', 'qoder', 'nika'] as const) {
+  const instruction = provider === 'codex' || provider === 'traex' ? '以下各项包含引用原文及可选批注' : '以下各项包含引用原文及可选评论'
+  const delivery = buildForProvider(null, 'Apply it', [], [], comment, provider)!
+  for (const force of [false, true]) {
+    const submitted: unknown[][] = []
+    await dispatchComposerDelivery(delivery, force, {
+      runNativeAction: () => { throw new Error('comments cannot become a native action') },
+      send: (...args) => { assert.equal(force, false); submitted.push(args) },
+      forceSend: (...args) => { assert.equal(force, true); submitted.push(args) }
+    })
+    assert.equal(submitted.length, 1)
+    const [prompt, , , fourth, fifth] = submitted[0]
+    assert.equal(prompt, delivery.prompt)
+    assert.equal(String(prompt).split(instruction).length, 2, `${provider} sends the comment instruction exactly once`)
+    assert.deepEqual(force ? fourth : fifth, { comments: comment, displayText: 'Apply it' }, 'comment instructions stay out of the displayed bubble')
+  }
+  assert.equal(buildForProvider(null, '普通消息', [], [], [], provider)?.prompt, '普通消息', 'ordinary messages do not acquire comment instructions')
 }
 
 const selectionActions = `{

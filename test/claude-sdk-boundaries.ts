@@ -23,7 +23,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
  if(v.type==='control_response' && v.response.request_id==='elicit'){result(active,{result:JSON.stringify(v.response.response)});return;}
  if(v.type!=='user')return;
  send({...v,isReplay:true,session_id:'boundary-native'});
- const text=v.message.content;
+ const text=Array.isArray(v.message.content)?v.message.content.filter(block=>block.type==='text').at(-1)?.text:v.message.content;
  if(text==='wait'){waiting=v.uuid;return;}
  if(text==='steer'){
   result('unrelated-background');result(waiting,{queued_turn_count:1});setTimeout(()=>result(v.uuid),40);return;

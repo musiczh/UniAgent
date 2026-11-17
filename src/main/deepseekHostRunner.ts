@@ -3,9 +3,8 @@ import { randomUUID } from 'node:crypto'
 import { open } from 'node:fs/promises'
 import type { AgentDef, Attachment, SessionAgentContract, SessionConfig, TurnUsage, UAEvent } from '../shared/types.ts'
 import type { GoalState, NativeGoalUpdate } from '../shared/nativeCapabilities.ts'
-import { assistantPrompt } from './assistant/context'
-import { requirementInstructions } from './requirementRuntime'
-import { worktreeInstructions } from './worktreeService'
+import { prepareAssistantMessage, prepareAssistantInitializationForSession, type AssistantMessage } from './assistant/context'
+import { sessionInstructions } from './sessionInstructions'
 import { DeepSeekHostClient, DeepSeekHostError } from './deepseekHostClient.ts'
 import { DeepSeekHostEvents, type DeepSeekRemoteRequest } from './deepseekHostEvents.ts'
 import { assertDeepSeekHostConfig, deepseekHostContract, deepseekHostPermissionModes, DEEPSEEK_HOST_PERMISSION_VALUES } from './deepseekHostContract.ts'
@@ -29,6 +28,7 @@ export class DeepSeekHostRunner extends EventEmitter {
   private running = false
   private cancelling = false
   private submitted = false
+  private systemContext = false
   private turnCompleted = false
   private broken = false
   private failedClient?: DeepSeekHostClient
@@ -116,7 +116,8 @@ export class DeepSeekHostRunner extends EventEmitter {
       if (created?.sessionId !== id) throw new DeepSeekHostError('invalid-session-identity')
     }
     this.adopted = true
-    await bindDeepSeekHostContext(client, id, this.sessionId, this.config.workdir, initializing)
+    await prepareAssistantInitializationForSession(this.sessionId, this.config)
+    this.systemContext = await bindDeepSeekHostContext(client, id, this.sessionId, this.config.workdir, initializing, sessionInstructions(this.config, this.sessionId))
     initializing.throwIfAborted()
     this.hub = DeepSeekHostEvents.for(client)
     this.detach = await this.hub.attach(id, { request: request => this.request(request), cancel: id => this.resolve(id, 'cancelled'), failed: error => this.connectionFailed(error) }, initializing)
@@ -237,23 +238,31 @@ export class DeepSeekHostRunner extends EventEmitter {
     this.running = true; this.cancelling = false; this.submitted = false; this.segments.clear()
     this.turnCompleted = false; this.context.turnId = undefined
     const done = new Promise<void>(resolve => { this.finishTurn = resolve })
+    let delivery: AssistantMessage | undefined
     try {
       await this.ensureReady()
+      await prepareAssistantInitializationForSession(this.sessionId, this.config)
+      if (this.systemContext) await bindDeepSeekHostContext(this.client!, this.nativeSessionId!, this.sessionId, this.config.workdir, undefined, sessionInstructions(this.config, this.sessionId))
       if (this.cancelling) { this.finish('cancelled'); return }
-      if (prompt.trimStart().startsWith('/')) {
+      delivery = await prepareAssistantMessage(this.sessionId, this.config, prompt, sessionInstructions(this.config, this.sessionId), this.systemContext)
+      if (delivery.userText.trimStart().startsWith('/')) {
         if (attachments?.length) throw new Error('slash 命令不能与附件同时发送')
-        const result = await this.command(prompt.trimStart())
+        const result = await this.command(delivery.userText.trimStart())
+        delivery.accepted()
         if (result.text) this.event({ type: 'system_notice', payload: { message: result.text } })
         this.finish('success'); return
       }
-      const effective = await assistantPrompt(this.sessionId, this.config, prompt, [worktreeInstructions(this.config), requirementInstructions(this.config)].filter(Boolean).join('\n\n'))
+      const effective = delivery.text
       const content = await this.content(effective, attachments)
+      if (delivery.context) content.unshift({ type: 'text', text: delivery.context })
       if (this.cancelling) { this.finish('cancelled'); return }
       this.submitted = true
       const accepted = await this.client!.call<any>('session/prompt', { request: { sessionId: this.nativeSessionId, requestId: randomUUID(), mode: 'queue', content } })
       if (accepted?.accepted !== true) throw new DeepSeekHostError('invalid-prompt-acknowledgement')
+      delivery.accepted()
       await done
     } catch (error) {
+      delivery?.failed(!this.submitted)
       if (this.cancelling || this.disposed) { this.finish('cancelled'); return }
       if (error instanceof DeepSeekHostError && ['transport-failed', 'closed', 'invalid-response'].includes(error.code)) {
         this.connectionFailed(error)

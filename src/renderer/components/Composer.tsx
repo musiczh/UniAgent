@@ -16,6 +16,7 @@ import type {
   TurnBubbleInput
 } from '@shared/types'
 import { isSessionBusy, type SessionActivityStatus } from '@shared/sessionStatus'
+import { RESPONSE_ANNOTATION_INSTRUCTION, RESPONSE_COMMENT_INSTRUCTION } from '@shared/promptContext'
 import type {
   ComposerCommand,
   NativeCapabilitySnapshot,
@@ -37,7 +38,7 @@ import { ComposerCapabilityChips, replaceComposerCommand } from './SkillChips'
 import { NativeActionMenu } from './NativeActionMenu'
 import { ReviewStartDialog } from './ReviewStartDialog'
 import { PlanModeBadge } from './PlanModeBadge'
-import { LoadBadge } from './ModelPicker'
+import { LoadBadge, ModelMenuOption } from './ModelPicker'
 import { AgentIcon } from './AgentIcon'
 import { AttachmentImagePreview, AttachmentThumbnail } from './AttachmentThumbnail'
 import { SendIcon, StopIcon, UiIcon, Chevron } from './Icons'
@@ -47,7 +48,7 @@ import { MarkdownEditor } from './MarkdownEditor'
 import { QuickReplyComposerContext } from './QuickReplyComposerContext'
 import type { ComposerPasteEvent, MarkdownInputHandle } from '../markdownInput'
 import type { Annotation } from '../textAnnotations'
-import { animateSentContent, cancelSendOrigin, captureSendOrigin } from '../conversationMotion'
+import { QueuedSendCard, QueuedSendStack, cancelSendOrigin, captureSendOrigin } from '../conversationMotion'
 
 const EFFORT_LABEL: Record<ReasoningEffort, string> = {
   off: '关闭',
@@ -120,7 +121,7 @@ export function Composer({
   onRunNativeAction: (action: NativeThreadAction) => void | Promise<void>
   queue: QueueItem[]
   onDequeue: (id: string) => void | Promise<void>
-  onPromoteQueue: (id: string) => void
+  onPromoteQueue: (id: string) => void | Promise<void>
   onEditQueueItem: (id: string, prompt: string, attachments?: Attachment[], selection?: NativeTurnSelectionRequest) => void | Promise<void>
   onQueueEditingChange?: (itemId: string | null) => void
   capabilities: NativeCapabilitySnapshot
@@ -722,8 +723,8 @@ export function Composer({
     <>
       {/* Codex-style: queued messages are a standalone stack ABOVE the input
           card, not inside its border. */}
-      {pendingQueue.length > 0 && (
-        <div className="queue-stack">
+      <QueuedSendStack queue={queue}>
+      {pendingQueue.length > 0 && (<>
           <div className="queue-head">
             <span className="queue-title">等待队列 · {pendingQueue.length}</span>
             <span className="queue-hint">
@@ -740,9 +741,10 @@ export function Composer({
             const optimistic = q.id.startsWith('optimistic-queue-')
             const isEditing = editingQueueId === q.id
             return (
-            <div
+            <QueuedSendCard
               key={q.clientTurnKey || q.id}
-              ref={node => { animateSentContent(node, q.clientTurnKey) }}
+              sendKey={q.clientTurnKey}
+              data-queue-send-key={q.clientTurnKey || q.id}
               className={`queue-card${optimistic ? ' is-entering' : ''}${isEditing ? ' is-editing' : ''}`}
               title={q.prompt}
             >
@@ -762,7 +764,13 @@ export function Composer({
                 {canSteer && !config.managedPurpose && (
                   <button
                     className="queue-act queue-steer"
-                    onClick={() => { if (!compacting && !switchBusy) onPromoteQueue(q.id) }}
+                    onClick={async event => {
+                      if (compacting || switchBusy) return
+                      setSendError(undefined)
+                      const key = captureSendOrigin(event.currentTarget.closest<HTMLElement>('.queue-card'), q.clientTurnKey || q.id)
+                      try { await onPromoteQueue(q.id) }
+                      catch (error) { cancelSendOrigin(key); setSendError(error instanceof Error ? error.message : String(error)) }
+                    }}
                     disabled={compacting || switchBusy}
                     title={compacting ? '上下文正在压缩，完成后可直接发送' : switchBusy ? '正在切换模型，请等待准备完成' : '直接发送'}
                     aria-label="直接发送"
@@ -780,18 +788,18 @@ export function Composer({
                 </button>}
                 <button
                   className="queue-act queue-del"
-                  onClick={() => void dequeueQueueItem(q.id)}
+                  onClick={() => { cancelSendOrigin(q.clientTurnKey || q.id); void dequeueQueueItem(q.id) }}
                   title="删除"
                   aria-label="删除等待消息"
                 >
                   <UiIcon name="close" size={16} />
                 </button>
               </div>}
-            </div>
+            </QueuedSendCard>
             )
           })}
-        </div>
-      )}
+      </>)}
+      </QueuedSendStack>
     <div
       className={`composer-wrap${composerLocked ? ' is-session-occupied' : ''}${toolSessionReadOnly ? ' is-tool-session' : ''}${editingQueueId ? ' is-editing-queue' : ''}`}
       ref={composerRef}
@@ -1090,6 +1098,7 @@ export function Composer({
                 <span className="sb-effort-model">{modelLabel}</span>
               )}
               {typeof modelDef?.loadPercent === 'number' && <LoadBadge percent={modelDef.loadPercent} />}
+              {agent.adapter === 'nika' && config.nikaPinnedModel && <UiIcon name="lock" size={12} />}
               {(nativeThinking || agent.capabilities.reasoningEffort) && selectedEffort && (
                 <span className="sb-effort-lvl">{effortLabel(selectedEffort)}</span>
               )}
@@ -1117,30 +1126,22 @@ export function Composer({
                   {activeSub === 'model' && (
                     <SubmenuPopover wide>
                       <div className="sb-menu-label sb-sub-title">模型</div>
-                      {agent.models.map((m) => (
-                        <button
-                          key={m.id}
-                          type="button"
-                          role="option"
-                          aria-selected={m.id === modelDef?.id}
-                          className={`sb-menu-item sb-sub-opt ${m.id === modelDef?.id ? 'is-sel' : ''}`}
-                          disabled={!canSelectModel}
-                          onClick={(e) => {
+                      {agent.models.map((m) => <ModelMenuOption key={m.id} model={m} selected={m.id === modelDef?.id}
+                          disabled={!canSelectModel} pinnedModel={config.nikaPinnedModel}
+                          onSelect={(e) => {
                             e.currentTarget.closest('details')?.removeAttribute('open')
                             setActiveSub(null)
                             onUpdateConfig({ model: m.id, modelSource: m.modelSource,
+                              ...(agent.adapter === 'nika' ? { nikaPinnedModel: config.nikaPinnedModel === m.id ? config.nikaPinnedModel : null } : {}),
                               ...(agent.adapter === 'qoder' ? { qoderContextWindow: m.qoderContextWindows?.includes(config.qoderContextWindow || 0) ? config.qoderContextWindow : undefined, qoderThinkingDisabled: m.qoderThinkingDisabled ? config.qoderThinkingDisabled : undefined } : {}),
                               effort: !nativeThinking && agent.capabilities.reasoningEffort ? resolveModelEffort(m, config.effort, pref?.defaultEffort) : undefined,
                               ...(kimi ? { kimiThinking: resolveModelThinking(m, config.kimiThinking, pref?.defaultThinking, pref?.defaultEffort) } : {}),
                               ...(zcode ? { zcodeModelSelection: m.zcodeSelection && { ...m.zcodeSelection, options: { ...m.zcodeSelection.options, reasoningLevel: resolveModelThinking(m, config.zcodeModelSelection?.options?.reasoningLevel, pref?.defaultThinking, pref?.defaultEffort) } } } : {}) })
                           }}
-                        >
-                          <span className="sb-sub-radio" aria-hidden />
-                          <span className="sb-entry-body">{m.label}</span>
-                          <LoadBadge percent={m.loadPercent} />
-                          <UiIcon name="check" size={13} className="sb-sub-check" />
-                        </button>
-                      ))}
+                          onTogglePin={agent.adapter === 'nika' ? () => onUpdateConfig({ model: m.id,
+                            nikaPinnedModel: config.nikaPinnedModel === m.id ? null : m.id,
+                            effort: resolveModelEffort(m, config.effort, pref?.defaultEffort) }) : undefined}
+                        />)}
                     </SubmenuPopover>
                   )}
                 </div>
@@ -1525,9 +1526,6 @@ export function NativeGoalOptions({ provider = 'deepseek', value, disabled, onCh
 // 选中即评论 — the fallback shown in the user bubble when the composer is empty.
 // Codex leaves `## My request:` empty on the wire in this case.
 export const DEFAULT_COMMENT_INSTRUCTION = '解决一下这些注释'
-
-const RESPONSE_ANNOTATION_INSTRUCTION = 'Each item contains text selected from an earlier Codex response and may include a user comment. Treat items as Annotation 1, Annotation 2, and so on in array order. Use every selection as context and address every comment. For every annotation you address, include its inline directive `:codex-annotation{index="N"}`, where N is its one-based array position (for example, `:codex-annotation{index="1"}`). Do not use unstructured annotation labels.'
-const RESPONSE_COMMENT_INSTRUCTION = 'Each item quotes text selected from an earlier agent response and may include a user comment. Use every selection as context and address every comment.'
 
 export function buildComposerDelivery(
   command: ComposerCommand | null,

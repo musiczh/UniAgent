@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import ts from 'typescript'
-import { exportPublic, publicPackage, publicSource, stripInternalRegions } from '../scripts/export-public.mjs'
+import { exportPublic, publicPackage, publicLockfile, publicSource, stripInternalRegions } from '../scripts/export-public.mjs'
 
 assert.equal(stripInternalRegions('a/* @internal:start x */secret/* @internal:end x */b'), 'ab')
 assert.equal(stripInternalRegions('a{/* @internal:start x */}secret{/* @internal:end x */}b'), 'ab')
@@ -15,6 +15,12 @@ for (const source of ['/* @internal:start x */', '/* @internal:end x */', '/* @i
 }
 const privateUrl = 'https://' + 'code.byted.org/private'
 assert.throws(() => publicSource(`const url=${JSON.stringify(privateUrl)}`, 'src/main/new-private.ts'), /Private runtime dependency/)
+assert.throws(() => publicSource("import sdk from '@bytedance-dev/bytecloud-auth-sdk'", 'src/main/new-auth.ts'), /Private runtime dependency/)
+const publicAuthPackage = publicPackage({ version: '1.2.0', keywords: [], scripts: {}, dependencies: { '@bytedance-dev/bytecloud-auth-sdk': '0.0.47', react: '19' }, build: { asarUnpack: ['node_modules/@bytedance-dev/bytecloud-auth-rpc-*/bin/**/*', 'node_modules/better-sqlite3/**/*'] } })
+assert.deepEqual(publicAuthPackage.dependencies, { react: '19' })
+assert.deepEqual(publicAuthPackage.build.asarUnpack, ['node_modules/better-sqlite3/**/*'])
+const publicAuthLock = publicLockfile("lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      '@bytedance-dev/bytecloud-auth-sdk': {specifier: 0.0.47, version: 0.0.47}\n      react: {specifier: '19', version: '19'}\npackages:\n  '@bytedance-dev/bytecloud-auth-sdk@0.0.47': {}\n  react@19: {}\nsnapshots:\n  '@bytedance-dev/bytecloud-auth-sdk@0.0.47':\n    optionalDependencies:\n      '@bytedance-dev/bytecloud-auth-rpc-darwin-arm64': 0.0.47\n  '@bytedance-dev/bytecloud-auth-rpc-darwin-arm64@0.0.47': {}\n  react@19: {}\n")
+assert.ok(!publicAuthLock.includes('bytecloud-auth')); assert.ok(publicAuthLock.includes('react@19'))
 assert.equal(publicSource("const file='.uniagent-public/manifest.json'", 'src/main/requirementSpace.ts'), "const file='.uniagent-public/manifest.json'", 'project metadata format is shared by both editions')
 assert.equal(publicSource("renameSync(join(legacy.dir,'.uniagent-public'),join(legacy.dir,'.saved-format'))", 'test/workspace-browser-data.ts'), "renameSync(join(legacy.dir,'.uniagent-public'),join(legacy.dir,'.saved-format'))", 'workspace legacy fixtures preserve the shared requirement metadata format')
 assert.equal(publicSource("const home=resolveUserDataHome(join(homedir(), '.uniagent-public'))", 'src/main/requirementStore.ts'), "const home=resolveUserDataHome(join(homedir(), '.uniagent-public'))", 'application profiles remain isolated')

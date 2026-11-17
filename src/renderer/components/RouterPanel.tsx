@@ -2,9 +2,8 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, type Mutable
 import type { AgentDef, Session, UAEvent } from '@shared/types'
 import { isSessionBusy } from '@shared/sessionStatus'
 import { mergeHydratedEvents } from '@shared/eventSnapshots'
-import { DEFAULT_ROUTER_CONFIG, compareRouterQueue, routerAssignmentCall, type RouterSnapshot, type RouterConversationSession } from '@shared/router'
+import { DEFAULT_ROUTER_CONFIG, compareRouterQueue, routerAssignmentCall, routerRequestInSession, type RouterSnapshot, type RouterConversationSession, type RouterRequest } from '@shared/router'
 import { routerCardViews } from '@shared/routerClarification'
-import { ROUTER_FEEDBACK_PROMPT_DURATION_MS, type RouterReviewPrompt } from '@shared/routerReview'
 import { NewTaskPanel } from './NewTaskPanel'
 import { SessionConversation } from './SessionConversation'
 import { SessionHeader } from './SessionHeader'
@@ -12,7 +11,6 @@ import { RouterRunConfig } from './RouterRunConfig'
 import { EventStream, ReadOnlyConversationContext, TurnStatusBar } from './EventStream'
 import { RouterAssignmentCard, RouterAssignmentContext } from './RouterAssignmentCard'
 import { UiIcon } from './Icons'
-import { RouterReviewPanel, RouterQuickFeedback } from './RouterReviewPanel'
 import './router.css'
 import { retireRouterSubmissions, useRouterSubmissions } from '../routerSubmissions'
 import { animateSentContent, useLayoutMotion } from '../conversationMotion'
@@ -41,15 +39,13 @@ export function RouterPanel({agents,enabledAgentIds,requirementsEnabled,focusReq
   const historySessions=useRef(new Set(segments.filter(row=>row.sessionId!==session?.id).map(row=>row.sessionId)))
   const loading=useRef(0),refreshing=useRef(0),creatingRef=useRef(false)
   const [creating,setCreating]=useState(false)
-  const [review, setReview] = useState<string>(), [prompt, setPrompt] = useState<RouterReviewPrompt>()
   const [detail,setDetail]=useState<{requestId?:string;sessionId?:string}>(),[detailLoading,setDetailLoading]=useState(false),[detailError,setDetailError]=useState(''),[detailRetry,setDetailRetry]=useState(0),[detailLocated,setDetailLocated]=useState(false)
-  useLayoutMotion(motionRef,!!session&&!review&&!detail,'.router-assignment[data-motion-key]')
+  useLayoutMotion(motionRef,!!session&&!detail,'.router-assignment[data-motion-key]',false)
   const listRef=useRef<HTMLDivElement>(null),listScroll=useRef<number>()
   const detailRequest=snapshot?.requests.find(row=>row.requestId===detail?.requestId)
   const detailSessionId=detail?.sessionId||detailRequest?.routerSessionId||detailRequest?.failure?.sessionId||detailRequest?.recovery?.previousSessionId
   const detailSessionRef=useRef(detailSessionId)
   detailSessionRef.current=detailSessionId
-  const dismissed = useRef(new Set<string>())
   function openDetails(requestId?:string,sessionId?:string):void{
     listScroll.current=listRef.current?.querySelector('.event-stream, .router-unavailable')?.scrollTop
     setDetailLocated(false);setDetailRetry(0);setDetailError('');setDetail({requestId,sessionId})
@@ -78,9 +74,6 @@ export function RouterPanel({agents,enabledAgentIds,requirementsEnabled,focusReq
   useEffect(()=>{
     if(viewState)viewState.current={snapshot,session,events,history,segments}
   },[viewState,snapshot,session,events,history,segments])
-  useEffect(() => {
-    if (!prompt) setPrompt(snapshot?.feedbackPrompts?.find(row => !dismissed.current.has(row.attemptId) && row.endedAt + ROUTER_FEEDBACK_PROMPT_DURATION_MS > Date.now()))
-  }, [snapshot?.feedbackPrompts, prompt])
   const refresh=useCallback(async()=>{
     const version=++refreshing.current
     try{const next=await window.uniagent.getRouterSnapshot();if(alive.current&&version===refreshing.current)setSnapshot(current=>{
@@ -165,9 +158,11 @@ export function RouterPanel({agents,enabledAgentIds,requirementsEnabled,focusReq
   const conversationEvents=withOriginalInput([...events,...localInputs.map(row=>({sessionId:session?.id||'router-pending',seq:-row.createdAt,ts:row.createdAt,type:'user_message' as const,
     payload:{text:row.prompt,displayText:row.prompt,attachments:row.attachments,optimistic:true,clientTurnKey:row.requestId,routedInputId:row.requestId}}))])
   const submissionError=submissions.at(-1)?.error?`创建任务失败：${submissions.at(-1)!.error}`:undefined
-  const orphaned=requests.filter(row=>row.requestId===focusRequestId||row.state==='needs_input'||!row.routerSessionId||row.routerSessionId===session?.id||row.clarifications?.some(round=>round.snapshot.routerSessionId===session?.id))
+  const inSession=(row:RouterRequest,id:string|undefined,rows:UAEvent[]):boolean=>routerRequestInSession(row,id,rows)||!!row.clarifications?.some(round=>routerRequestInSession(round.snapshot,id,rows))
+  const orphaned=requests.filter(row=>row.requestId===focusRequestId||row.state==='needs_input'||!row.routerSessionId&&!['bound','cancelled'].includes(row.state)||inSession(row,session?.id,events))
   const focusedRequest=requests.find(row=>row.requestId===focusRequestId)||requests.find(row=>row.state==='needs_input')
-  const conversationRequest=focusedRequest||requests.findLast(row=>row.routerSessionId===session?.id)||(!session?requests.at(-1):undefined)
+  const conversationRequest=focusedRequest||requests.findLast(row=>inSession(row,session?.id,events))||(!session?requests.at(-1):undefined)
+  const conversationSessionId=conversationRequest?conversationRequest.routerSessionId||[...(session?[session.id]:[]),...Object.keys(history)].find(id=>routerRequestInSession(conversationRequest,id,id===session?.id?events:history[id]||[])):session?.id||snapshot?.sessionId
   const unavailable=!!(snapshot&&!session&&(!snapshot.config.enabled||!snapshot.available))
   const detailEvents:UAEvent[]=detailSessionId?withOriginalInput(detailSessionId===session?.id?conversationEvents:history[detailSessionId]||[])
     :detailRequest?[{sessionId:'router-pending',seq:0,ts:detailRequest.createdAt,type:'user_message',payload:{text:detailRequest.prompt,attachments:detailRequest.attachments}}]:[]
@@ -177,7 +172,7 @@ export function RouterPanel({agents,enabledAgentIds,requirementsEnabled,focusReq
   const resolve=async(input:Parameters<typeof window.uniagent.resolveRouterInput>[0])=>{try{return await window.uniagent.resolveRouterInput(input)}finally{await refresh()}}
   const previousConversation=segments.slice(0,-1).map((row,index)=>{
     const rows=history[row.sessionId]||[],next=segments[index+1]
-    const cards=loadedHistory.current.has(row.sessionId)?requests.filter(request=>request.routerSessionId===row.sessionId||request.clarifications?.some(round=>round.snapshot.routerSessionId===row.sessionId)):[]
+    const cards=loadedHistory.current.has(row.sessionId)?requests.filter(request=>inSession(request,row.sessionId,rows)):[]
     return <div key={row.sessionId}>
       <ReadOnlyConversationContext.Provider value><div className="router-history-segment" data-router-history-session={row.sessionId}>
         <EventStream sessionId={row.sessionId} events={withOriginalInput(rows)} status="idle" onJumpToSession={onOpenTask} onOpenFile={onOpenFile}
@@ -195,9 +190,9 @@ export function RouterPanel({agents,enabledAgentIds,requirementsEnabled,focusReq
       <div className="queue-card-acts"><button type="button" className="queue-act queue-del" disabled={!request.version} aria-label="取消待分配任务" title="取消待分配任务" onClick={()=>void cancelInput(request.requestId,request.version)}><UiIcon name="close" size={16}/></button></div>
     </div>)}
   </div>
-  return <><div className="session-view" data-router-conversation ref={motionRef} style={{ display: review ? 'none' : undefined }}>
+  return <div className="session-view" data-router-conversation ref={motionRef}>
     <SessionHeader session={headerSession} agents={agents} onSettings={onSettings} onNewSession={()=>void newSession()}
-      onViewConversation={detail?undefined:()=>openDetails(conversationRequest?.requestId,conversationRequest?conversationRequest.routerSessionId:session?.id||snapshot?.sessionId)}
+      onViewConversation={detail?undefined:()=>openDetails(conversationRequest?.requestId,conversationSessionId)}
       onReturn={detail?()=>setDetail(undefined):undefined} returnLabel="返回分配列表"
       titleConfiguration={<RouterRunConfig agents={agents} config={snapshot?.config}/>}
       newSessionBusy={creating||snapshot?.switchingSession} newSessionDisabled={!session||!snapshot?.config.enabled||!snapshot.available||isSessionBusy(session.status)||requests.some(row=>row.state==='routing'||row.state==='committing')}/>
@@ -211,8 +206,8 @@ export function RouterPanel({agents,enabledAgentIds,requirementsEnabled,focusReq
         focusSeq={detailLocated?undefined:detailInput?.seq} onFocusLocated={()=>setDetailLocated(true)} onJumpToSession={onOpenTask} onOpenFile={onOpenFile}/>
     </div>}
     <div className="router-list-view" hidden={!!detail} ref={listRef}>
-    {unavailable?<div className="router-unavailable"><div className={`router-disabled ${requests.length?'has-requests':''}`}><h2>{snapshot!.config.enabled?'正在准备 RouterAgent…':'RouterAgent 尚未启用'}</h2><p>{snapshot!.reason||'配置一个可用的 Agent 后启用，新的自动归属输入会在这里排队，分配记录保存在同一段对话中。'}</p><button type="button" className="set-mini-btn primary" onClick={onSettings}><UiIcon name="settings" size={14}/>前往配置</button></div>{requests.flatMap(routerCardViews).map(view=><RouterAssignmentCard key={view.key} request={view.request} clarification={view.clarification} agents={agents} resolve={resolve} openTask={onOpenTask} openFeedback={setReview}/>)}</div>:
-      <RouterAssignmentContext.Provider value={{requests,sessionIds:segments.map(row=>row.sessionId),agents,resolve,openTask:onOpenTask,openFeedback:setReview}}>
+    {unavailable?<div className="router-unavailable"><div className={`router-disabled ${requests.length?'has-requests':''}`}><h2>{snapshot!.config.enabled?'正在准备 RouterAgent…':'RouterAgent 尚未启用'}</h2><p>{snapshot!.reason||'配置一个可用的 Agent 后启用，新的自动归属输入会在这里排队，分配记录保存在同一段对话中。'}</p><button type="button" className="set-mini-btn primary" onClick={onSettings}><UiIcon name="settings" size={14}/>前往配置</button></div>{requests.flatMap(routerCardViews).map(view=><RouterAssignmentCard key={view.key} request={view.request} clarification={view.clarification} agents={agents} resolve={resolve} openTask={onOpenTask}/>)}</div>:
+      <RouterAssignmentContext.Provider value={{requests,sessionIds:segments.map(row=>row.sessionId),agents,resolve,openTask:onOpenTask}}>
         <SessionConversation sessionId={session?.id||'router-pending'} events={conversationEvents} status={session?.status||'idle'} loading={!session&&!localInputs.length&&!loadError} loadError={!session?loadError:undefined} onRetryLoad={()=>setHistoryRetry(value=>value+1)} onJumpToSession={onOpenTask} onOpenFile={onOpenFile} focusRouterRequestId={focusedRequest?.requestId}
           requestDockRef={requestDockRef} onRespond={async(requestId,answer)=>{if(!session||sessionRef.current?.id!==session.id)throw new Error('Router 会话已切换，请重新打开提问后回答');await window.uniagent.respondRequest(session.id,requestId,answer)}}
           beforeConversation={previousConversation}
@@ -222,13 +217,13 @@ export function RouterPanel({agents,enabledAgentIds,requirementsEnabled,focusReq
     </div>
     {unavailable&&inputQueue}
     {!unavailable&&<>
-      <TurnStatusBar events={conversationEvents} status={session?.status||'idle'}/>
-      {session&&isSessionBusy(session.status)&&<div className="router-input-actions"><button type="button" aria-label="停止当前分配" onClick={()=>{void window.uniagent.interruptRouter().catch(reason=>setError(String(reason)))}}><span aria-hidden="true"/>停止当前分配</button></div>}
       {inputQueue}
       <div className="interaction-dock-slot" ref={requestDockRef}/>
+      <div className="router-input-actions">
+        <TurnStatusBar events={conversationEvents} status={session?.status||'idle'}/>
+        {session&&isSessionBusy(session.status)&&<button type="button" aria-label="停止当前分配" onClick={()=>{void window.uniagent.interruptRouter().catch(reason=>setError(String(reason)))}}><span aria-hidden="true"/>停止当前分配</button>}
+      </div>
       {snapshot&&<NewTaskPanel agents={agents} enabledAgentIds={enabledAgentIds} requirementsEnabled={requirementsEnabled} routerMode={snapshot} onRouterSubmitted={()=>void refresh()} onOpenSettings={onSettings}/>}
     </>}
-    {prompt && <RouterQuickFeedback key={prompt.attemptId} requestId={prompt.requestId} attemptId={prompt.attemptId} endedAt={prompt.endedAt} onDismissError={setError} onClose={() => { dismissed.current.add(prompt.attemptId); setPrompt(undefined); void refresh() }} />}
   </div>
-  {review && <RouterReviewPanel key={review} initialRequestId={review} returnLabel="返回对话" onBack={() => setReview(undefined)} onOpenTask={onOpenTask} conversation/>}</>
 }

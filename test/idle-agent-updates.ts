@@ -209,6 +209,24 @@ test('update guards cover idle-looking sessions with branch work or pending disp
   }
 })
 
+test('model source apply guards match the main and side connection independently', () => {
+  const session = { id: 's', config: { agentId: 'codex', modelSource: { sourceId: 'source-a' } }, status: 'running' }
+  const side = { agentId: 'claude', modelSource: { sourceId: 'source-b' } }
+  const internals = { sessions: new Map([['s', session]]), queues: new Map(), editingQueueItems: new Map(), activeQueueItems: new Map(),
+    nativeActionReservations: new Set(), rewinding: new Set(), pendingSends: new Map(),
+    teamQuestions: new Map(), protocolPendingStarts: new Map(), deferredDispatches: new Map(), sideStatus: new Map([['s', 'running']]),
+    sideQueues: new Map(), sideConfigs: new Map([['s', side]]), detailStatus: new Map() }
+  const orchestrator = Object.assign(Object.create(Orchestrator.prototype), internals) as Orchestrator
+  const source = (id: string) => (config: any) => config.modelSource?.sourceId === id
+  assert.equal(orchestrator.hasActiveAgentSessions('codex', source('source-a')), true)
+  assert.equal(orchestrator.hasActiveAgentSessions('codex', source('source-b')), false, 'another source must not block Codex apply')
+  assert.equal(orchestrator.hasActiveAgentSessions('claude', source('source-b')), true, 'side work belongs to its own Agent and source')
+  session.status = 'idle'
+  assert.equal(orchestrator.hasActiveAgentSessions('codex', source('source-a')), false, 'an unrelated busy side panel must not pin the main source')
+  side.agentId = 'codex'
+  assert.equal(orchestrator.hasActiveAgentSessions('codex', source('source-b')), true)
+})
+
 test('queued or blocked team assignments count as work before an agent session starts', () => {
   const project = { archivedAt: undefined as number | undefined, status: 'waiting_members', runId: 2, assignments: [{ runId: 2, status: 'queued' }] }
   const teams = Object.assign(Object.create(TeamService.prototype), {

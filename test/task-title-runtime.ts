@@ -4,6 +4,9 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { generateTaskTitleText, TASK_TITLE_SYSTEM_PROMPT } from '../src/main/taskTitleRuntime'
+import { generateRouterContext } from '../src/main/router/summary'
+import { generateDeepSeekTitle } from '../src/main/taskTitleDeepSeek'
+import { DEFAULT_ROUTER_CONFIG } from '../src/shared/router'
 import { configureCodexAppServerArgsProvider } from '../src/main/appServerAdapter'
 import { parseCodexConfig } from '../src/main/codexSourceConfig'
 import type { AgentDef } from '../src/shared/types'
@@ -101,6 +104,30 @@ try {
   await assert.rejects(readFile(join(options.env.CODEX_HOME, 'config.toml')), { code: 'ENOENT' }, 'own provider config cleaned')
   assert.ok(rpcClosed > 0)
 
+  await assert.rejects(generateDeepSeekTitle(config, 'router fixture', new AbortController().signal, async () => { throw Error('must reject before contacting DeepSeek') }, () => {}), /DeepSeek 标题模型来源无效/,
+    'the previous Router wiring rejects a native model name before generation')
+  requests.length = 0
+  await generateRouterContext([agent('codex')], { ...DEFAULT_ROUTER_CONFIG, ...config }, 'router context fixture', new AbortController().signal, true, deps)
+  assert.equal(requests.find(request => request.method === 'thread/start').params.model, 'small', 'Router context generation uses the selected native model')
+  assert.equal(requests.find(request => request.method === 'turn/start').params.outputSchema, undefined, 'Router JSON is not constrained to a task title result')
+  assert.deepEqual(requests.find(request => request.method === 'thread/start').params.dynamicTools, [])
+  await assert.rejects(generateRouterContext([], { ...DEFAULT_ROUTER_CONFIG, ...config }, 'fixture', new AbortController().signal), /router_context_agent_unavailable/)
+  const deepseekModel = JSON.stringify(['fixture', 'small'])
+  const deepseekAgent = { ...agent('deepseek'), capabilities: { startupSystemPrompt: true, protocol: 'web' }, models: [{ id: deepseekModel, label: 'Small', efforts: ['high'] }] } as AgentDef
+  let deepseekRequest: any
+  const deepseekOutput = await generateRouterContext([deepseekAgent], { ...DEFAULT_ROUTER_CONFIG, agentId: 'deepseek', model: deepseekModel, effort: 'high' }, 'routing fragment fixture', new AbortController().signal, true, {
+    deepseekHost: async () => ({ async *stream(_method: string, input: any) {
+      deepseekRequest = input.request
+      yield { type: 'title-config', provider: 'fixture', model: 'small', effort: 'high' }
+      yield { type: 'text-delta', text: '{"features":[],"exclusions":[],"conflicts":[]}' }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    } }) as any
+  })
+  assert.deepEqual(JSON.parse(deepseekOutput), { features: [], exclusions: [], conflicts: [] })
+  assert.equal(deepseekRequest.maxTokens, 16384, 'DeepSeek routing extraction keeps its separate output budget')
+  assert.equal(deepseekRequest.model, 'small')
+  assert.equal(deepseekRequest.effort, 'high')
+
   requests.length = 0
   await generateTaskTitleText(agent('codex'), { ...config, effort: 'high' }, 'explicit high effort', new AbortController().signal, deps)
   assert.equal(requests.find(r => r.method === 'turn/start').params.effort, 'high', 'title runtime preserves the selected effort')
@@ -129,6 +156,9 @@ try {
   assert.equal(launch.options.env.UNRELATED_RULES, undefined)
   assert.equal(usage[0].inputTokens, 10)
   assert.ok(sdkClosed > 0)
+  await generateRouterContext([agent('claude')], { ...DEFAULT_ROUTER_CONFIG, ...config, agentId: 'claude' }, 'router scope fixture', new AbortController().signal, false, deps)
+  assert.equal(launch.options.model, 'small')
+  assert.deepEqual(launch.options.tools, [])
   await generateTaskTitleText(agent('claude'), { ...config, agentId: 'claude', effort: 'high' }, 'explicit high effort', new AbortController().signal, deps)
   assert.equal(launch.options.effort, 'high', 'Claude receives the selected effort instead of a fixed low setting')
   await generateTaskTitleText(agent('claude'), { ...config, agentId: 'claude', effort: 'off' }, 'explicit thinking off', new AbortController().signal, deps)

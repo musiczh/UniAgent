@@ -61,6 +61,31 @@ export function browserAttention(sessions: Session[], requirements: Requirement[
 
 export interface RequirementTaskCounts { running: number; acceptance: number; waiting: number; unread: number }
 
+function taskAttentionLabel(session: Session, activity: SessionActivityStatus, pending: boolean): string | undefined {
+  if (session.archived || session.status === 'archived' || session.taskState?.phase === 'archived' || session.config.managedPurpose || isToolSession(session) || isAssistantConversation(session)) return undefined
+  if (pending || activity === 'awaiting-approval' || session.taskState?.decisionHint?.count) return '需要回答或授权'
+  if (session.taskState?.error) return '状态待确认：' + session.taskState.error
+  if (session.recovery && session.recovery.phase !== 'stopped') return undefined
+  if (activity === 'error') return '任务执行异常'
+  if (activity === 'interrupted') return '任务执行已中断'
+  if (activity === 'cancelled') return '任务执行已取消'
+  return undefined
+}
+
+export function browserTaskAttentionBySession(sessions: Session[], status: Record<string, SessionActivityStatus>, pending: Record<string, boolean>): Record<string, string> {
+  const unique = new Map<string, Session>()
+  for (const session of sessions) {
+    const previous = unique.get(session.id)
+    if (!previous || (session.updatedAt ?? session.createdAt) >= (previous.updatedAt ?? previous.createdAt)) unique.set(session.id, session)
+  }
+  const result: Record<string, string> = {}
+  for (const session of unique.values()) {
+    const label = taskAttentionLabel(session, status[session.id] || session.status, !!pending[session.id])
+    if (label) result[session.id] = label
+  }
+  return result
+}
+
 export function browserRequirementTaskCounts(sessions: Session[], status: Record<string, SessionActivityStatus>, pending: Record<string, boolean>, unread: Record<string, unknown>): Map<string, RequirementTaskCounts> {
   const unique = new Map<string, Session>()
   for (const session of sessions) {
@@ -70,12 +95,11 @@ export function browserRequirementTaskCounts(sessions: Session[], status: Record
   const result = new Map<string, RequirementTaskCounts>()
   for (const session of unique.values()) {
     const requirementId = session.config.requirementId
-    if (!requirementId || session.archived || session.status === 'archived' || session.taskState?.phase === 'archived' || isToolSession(session) || isAssistantConversation(session)) continue
+    if (!requirementId || session.archived || session.status === 'archived' || session.taskState?.phase === 'archived' || session.config.managedPurpose || isToolSession(session) || isAssistantConversation(session)) continue
     const activity = status[session.id] || session.status
     const recovering = !!session.recovery && session.recovery.phase !== 'stopped'
     const running = activity !== 'awaiting-approval' && (isSessionBusy(activity) || recovering || !!session.pendingQueue?.some(item => item.state === 'pending'))
-    const waiting = !!pending[session.id] || activity === 'awaiting-approval' || !!session.taskState?.decisionHint?.count || !!session.taskState?.error ||
-      !recovering && ['error', 'interrupted', 'cancelled'].includes(activity)
+    const waiting = !!unread[session.id] && !!taskAttentionLabel(session, activity, !!pending[session.id])
     const acceptance = unread[session.id] === 'main' && !running && !waiting && session.taskState?.phase !== 'standby' &&
       (!!session.taskState?.awaitingAcceptance || taskHasEndedRound({ ...session, status: activity as Session['status'] }))
     const progress = !waiting && !acceptance && !!unread[session.id]

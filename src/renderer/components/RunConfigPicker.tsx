@@ -7,6 +7,7 @@ import { SubmenuPopover } from './SubmenuPopover'
 import { PickerMenuPlacement } from './usePickerMenuPlacement'
 import { AgentVersionWarning } from './AgentVersionWarning'
 import { SuperAgentConfigPicker } from './SuperAgentConfigPicker'
+import { ModelSourceLabel } from './ModelSourceLabel'
 
 export type RunChoice = Pick<SessionConfig,'agentId'|'model'|'modelSource'|'effort'|'permissionMode'>
 export function RunConfigPicker({agents,value,onChange,router=false,settings=false,label='选择 Agent、模型与思考参数',compact=false,summaryValue,disabled=false,onOpen,footer}:{agents:AgentDef[];value:RunChoice;onChange:(value:RunChoice)=>void;router?:boolean;settings?:boolean;label?:string;compact?:boolean;summaryValue?:RunChoice;disabled?:boolean;onOpen?:()=>void;footer?:ReactNode}):JSX.Element {
@@ -41,7 +42,7 @@ export function RunConfigPicker({agents,value,onChange,router=false,settings=fal
             }}><span className="sb-sub-radio"/><span className="sb-agent-name"><AgentIcon agentId={row.id} adapter={row.adapter} size={14}/>{row.name}</span><UiIcon name="check" size={13} className="sb-sub-check"/></button>
           }):key==='model'?models.map(row=><button key={row.id+JSON.stringify(row.modelSource)} type="button" role="option" aria-selected={row===model} disabled={disabled} className={`sb-menu-item sb-sub-opt ${row===model?'is-sel':''}`} onClick={()=>{
             onChange({...value,model:row.id,modelSource:row.modelSource,effort:row.efforts.includes(value.effort!)?value.effort:router&&row.efforts.includes('max')?'max':undefined});if(row.efforts.length)setSub('effort');else close()
-          }}><span className="sb-sub-radio"/><span className="sb-entry-body">{row.label}</span><UiIcon name="check" size={13} className="sb-sub-check"/></button>):(model?.efforts||[]).map(effort=><button key={effort} type="button" role="option" aria-selected={effort===value.effort} disabled={disabled} className={`sb-menu-item sb-sub-opt ${effort===value.effort?'is-sel':''}`} onClick={()=>{onChange({...value,effort});close()}}><span className="sb-sub-radio"/><span className="sb-entry-body">{effortLabel(effort)}</span><UiIcon name="check" size={13} className="sb-sub-check"/></button>)}
+          }}><span className="sb-sub-radio"/><span className="sb-entry-body"><ModelSourceLabel model={row}/></span><UiIcon name="check" size={13} className="sb-sub-check"/></button>):(model?.efforts||[]).map(effort=><button key={effort} type="button" role="option" aria-selected={effort===value.effort} disabled={disabled} className={`sb-menu-item sb-sub-opt ${effort===value.effort?'is-sel':''}`} onClick={()=>{onChange({...value,effort});close()}}><span className="sb-sub-radio"/><span className="sb-entry-body">{effortLabel(effort)}</span><UiIcon name="check" size={13} className="sb-sub-check"/></button>)}
         </SubmenuPopover>}
       </div>)}
       <AgentVersionWarning agent={agent}/>

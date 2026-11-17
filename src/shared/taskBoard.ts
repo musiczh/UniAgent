@@ -14,6 +14,7 @@ export interface TaskBoardQuery { pages?: Partial<Record<TaskBoardColumn, number
 export interface TaskBoardEntry {
   id: string; title: string; column: TaskBoardColumn | 'archived'; status: string; priority: 'high' | 'medium' | 'normal'
   description?: string
+  attentionDetail?: string
   decisionCount: number; projectId?: string; requirementId?: string; updatedAt: number
   agentId?: string; executionStatus?: Session['status']; readOnly?: boolean; canPause?: boolean; canDecide?: boolean; canDelete?: boolean; teamTask?: boolean
   routerRequestId?: string; routerRequestVersion?: number
@@ -55,11 +56,12 @@ export function projectTaskBoard(sessions: Session[], decisions: (id: string) =>
     const priority = pending.some(d => d.priority === 'high') || stale && hint?.priority === 'high' ? 'high' : count ? 'medium' : 'normal'
     const blocked = session.status === 'awaiting-approval' || native.some(d => d.blocking) || stale && !running
     const column = archived ? 'archived' : blocked || session.taskState?.error ? 'decision' : running ? 'active' : native.length || outcome ? 'decision' : standby ? 'standby' : 'active'
+    const focusDecision = pending.find(d => d.priority === 'high') || pending[0]
     let status: string
     if (archived) status = '已归档'
     else if (session.taskState?.error) status = '状态待确认'
     else if (stale) status = '需处理 · 待读取核对'
-    else if (pending.length) { const focus = pending.find(d => d.priority === 'high') || pending[0]; status = focus.status !== 'open' ? '响应结果待确认' : focus.type === 'question' && !focus.blocking ? '需回答 · 执行继续' : focus.title }
+    else if (focusDecision) status = focusDecision.status !== 'open' ? '响应结果待确认' : focusDecision.type === 'question' && !focusDecision.blocking ? '需回答 · 执行继续' : focusDecision.title
     else if (session.status === 'awaiting-approval') status = '需处理 · 待读取核对'
     else if (column === 'standby') status = '暂缓推进'
     else if (column === 'decision') status = '待你决定'
@@ -67,6 +69,7 @@ export function projectTaskBoard(sessions: Session[], decisions: (id: string) =>
     const readOnly = !!(session.readOnly || session.teamBinding || session.config.assistantSnapshot)
     const item: TaskBoardEntry = { id: session.id, title: sessionDisplayTitle(session), column: !archived && session.status === 'awaiting-approval' && !count ? 'decision' : column,
       description: session.taskMetadata?.description?.trim() || undefined,
+      attentionDetail: focusDecision?.detail,
       status, priority: !archived && session.status === 'awaiting-approval' ? 'high' : priority, decisionCount: !archived && session.status === 'awaiting-approval' ? Math.max(1, count) : count,
       projectId: session.config.projectId, requirementId: session.config.requirementId, updatedAt: session.updatedAt || session.createdAt,
       agentId: session.config.agentId, executionStatus: session.status, readOnly, canDelete: true, teamTask: !!session.teamBinding,

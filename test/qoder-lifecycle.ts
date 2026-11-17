@@ -35,8 +35,10 @@ const { QoderRunner } = await import('../src/main/qoderRunner.ts')
 const resourceRunner = new QoderRunner('resource-fixture', { n: 0 }) as any
 const resourceAgent = { bin: '/fixture/qoderclicn', version: '1', adapter: 'qoder' } as any
 const resourceConfig = { agentId: 'qoder', workdir: '/repo', permissionMode: 'ask' } as any
+const { prepareAssistantInitializationForSession, assistantInitialization } = await import('../src/main/assistant/context.ts')
+await prepareAssistantInitializationForSession('resource-fixture', resourceConfig)
 const refreshCalls: string[] = []
-resourceRunner.key = JSON.stringify([resourceAgent.bin, resourceAgent.version, resourceConfig, false])
+resourceRunner.key = JSON.stringify([resourceAgent.bin, resourceAgent.version, resourceConfig, false, assistantInitialization('resource-fixture')])
 resourceRunner.sdk = { ready: Promise.resolve({ skills: ['updated'] }), request: async (method: string) => { refreshCalls.push(method) } }
 assert.deepEqual(await resourceRunner.initialize(resourceAgent, resourceConfig), { skills: ['updated'] })
 assert.deepEqual(refreshCalls, ['reloadPlugins', 'reloadSkills'], 'reused native sessions refresh resources before another turn')

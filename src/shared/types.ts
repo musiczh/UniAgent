@@ -115,6 +115,7 @@ export type SessionStatus =
 
 /** A selectable model with its real per-model reasoning-effort support. */
 export interface ModelDef {
+  nikaHealth?: { status: 'available' | 'degraded' | 'service_down' | 'admin_disabled' | 'unknown'; checkedAt?: number }
   /** Selection key; supplemental Codex keys are decoded before protocol calls. */
   id: string
   /** Human-facing label (may differ from id, e.g. codex display_name). */
@@ -853,6 +854,8 @@ export interface SessionConfig {
   /** Creation-only business ownership, resolved and removed by the host. */
   taskScope?: import('./task').TaskScope
   nikaBinding?: NikaBinding
+  /** Confirmed native session pin. undefined leaves native ownership unchanged. */
+  nikaPinnedModel?: string | null
   /** Creation request only; the host supplies the immutable snapshot. */
   useAssistant?: boolean
   assistantSnapshot?: import('./assistant').PersonalAssistantSnapshot
@@ -1019,6 +1022,10 @@ export interface ClaudeForkOrigin {
 }
 
 export interface Session {
+  /** Host initialization and delivery receipts, independent of user messages. */
+  promptContext?: import('./promptContext').SessionPromptContext
+  /** Router's bounded, immutable first-initialization supplement. */
+  initialRequirementContext?: string
   quickReplies?: import('./quickReplies').QuickReply[]
   taskState?: import('./taskLifecycle').TaskStateSummary
   taskMetadata?: TaskTitleMetadata
@@ -1161,7 +1168,13 @@ export function agentForSession(agent: AgentDef, session?: Session | null): Agen
   if (!contract) return agent
   return {
     ...agent,
-    models: contract.models,
+    models: agent.adapter === 'nika' ? contract.models.map(model => {
+      if (model.id === 'nika-auto') return model
+      const current = agent.models.find(candidate => candidate.id === model.id)?.nikaHealth
+      const health = current && (!model.nikaHealth || current.checkedAt !== undefined && model.nikaHealth.checkedAt !== undefined &&
+        current.checkedAt > model.nikaHealth.checkedAt) ? current : model.nikaHealth
+      return health === model.nikaHealth && health ? model : { ...model, nikaHealth: health ?? { status: 'unknown' } }
+    }) : contract.models,
     defaultModel: contract.currentModelId,
     capabilities: {
       ...agent.capabilities,
@@ -1738,6 +1751,11 @@ export interface PlanStep {
  * lazy-loading via `thread/items/list`.
  */
 export interface UASubAgent {
+  requestedModel?: string
+  servedModel?: string
+  modelVariant?: string
+  fallbackReasons?: string[]
+  executionPhase?: string
   /** The child agent's thread id — the stable identity + detail-fetch key. */
   agentThreadId: string
   nativeHistoryId?: string
@@ -2100,6 +2118,7 @@ export const IPC = {
   // Doc4 需求4: scheduled/automation tasks.
   listAutomations: 'automations:list',
   createAutomation: 'automations:create',
+  retryAutomation: 'automations:retry',
   automationsChanged: 'automations:changed',
   setAutomationStatus: 'automations:setStatus',
   // 需求1（定时任务详情/编辑/删除）: lazy detail load + edit + delete.

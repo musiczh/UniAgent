@@ -12,6 +12,7 @@ import { FRAME_HEALTH_PROBE, FRAME_HEALTH_REPLY } from '../shared/frameHealth'
 import { createFrameProbe } from './frameHealth'
 import { ZCODE_IPC, type ZCodeInstallationSnapshot, type ZCodeConfigurationInput, type ZCodeConfigurationSnapshot, type ZCodeEventsSnapshot, type ZCodeQuotaSnapshot, type ZCodeRuntimeConfig, type ZCodeRuntimeSnapshot } from '../shared/zcode'
 import { CODEX_SOURCE_IPC, type CodexSourceInput, type CodexSourceModelQueryInput, type CodexSourcesSnapshot } from '../shared/codexSources'
+import { MODEL_SOURCE_IPC, type ModelSourceSave, type ModelSourceInput, type ModelSourcesSnapshot } from '../shared/modelSources'
 import type { AgentQuotaSnapshot } from '../shared/agentQuota'
 import { LOCAL_MODEL_IPC, type LocalModelsSnapshot } from '../shared/localModels'
 import { TEAM_IPC, type TeamCatalog, type TeamCreateProjectInput, type TeamDefinition, type TeamDefinitionInput, type TeamProject, type TeamArtifact } from '../shared/teamTypes'
@@ -20,7 +21,7 @@ import { WORKTREE_ARCHIVE_IPC, type WorktreeArchiveAction, type WorktreeArchiveR
 import type { TaskDecisionInput, TaskLifecycleSnapshot } from '../shared/taskLifecycle'
 import type { TaskBoardQuery, TaskBoardSnapshot } from '../shared/taskBoard'
 import type { TaskTitleResult } from '../shared/taskTitle'
-import { ROUTER_IPC, type RouterConfig, type RouterInput, type RouterRequest, type RouterResolution, type RouterSnapshot, type GlobalMemoryRequest, type GlobalMemoryItem } from '../shared/router'
+import { ROUTER_IPC, type RouterConfig, type RouterInput, type RouterRequest, type RouterResolution, type RouterSnapshot } from '../shared/router'
 import { PROJECT_MEMORY_IPC, PROJECT_MEMORY_CHANGED, type ProjectMemoryRequest, type ProjectMemoryPage } from '../shared/projectMemory'
 import { ROUTER_REVIEW_IPC, type RouterFeedbackInput, type RouterReviewDetail, type RouterReviewQuery, type RouterReviewPage, type RouterReviewTarget, type RouterReviewDeletionItem, type RouterReviewDeletionPlan, type RouterReviewDeleteResult } from '../shared/routerReview'
 import type { TaskTitleGenerationConfig } from '../shared/types'
@@ -286,7 +287,6 @@ const api = {
   resolveRouterInput: (input: RouterResolution): Promise<RouterRequest> => invoke(ROUTER_IPC.resolve,input),
   cancelRouterInput: (id: string,version:number): Promise<RouterRequest> => invoke(ROUTER_IPC.cancel,id,version),
   interruptRouter: (): Promise<void> => invoke(ROUTER_IPC.interrupt),
-  globalMemory: (input: GlobalMemoryRequest): Promise<GlobalMemoryItem[]> => invoke(ROUTER_IPC.memory,input),
   projectMemory: (projectId: string, input: ProjectMemoryRequest): Promise<ProjectMemoryPage> => invoke(PROJECT_MEMORY_IPC,projectId,input),
   onProjectMemoryChanged: (callback:()=>void): (()=>void) => {
     const listener=()=>callback();ipcRenderer.on(PROJECT_MEMORY_CHANGED,listener)
@@ -675,6 +675,7 @@ const api = {
   // Doc4 需求4: automations
   listAutomations: (): Promise<AutomationTask[]> => invoke(IPC.listAutomations),
   createAutomation: (input: NativeAutomationInput): Promise<AutomationDetail> => invoke(IPC.createAutomation, input),
+  retryAutomation: (task: AutomationDetail): Promise<AutomationDetail> => invoke(IPC.retryAutomation, task),
   onAutomationsChanged: (cb: () => void): (() => void) => {
     const handler = (): void => cb()
     ipcRenderer.on(IPC.automationsChanged, handler)
@@ -716,6 +717,17 @@ const api = {
     return () => { ipcRenderer.removeListener(LOCAL_MODEL_IPC.changed, listener) }
   },
   getCodexSources: (): Promise<CodexSourcesSnapshot> => invoke(CODEX_SOURCE_IPC.get),
+  getModelSources: (): Promise<ModelSourcesSnapshot> => invoke(MODEL_SOURCE_IPC.get),
+  saveModelSourceQuota: (input: import('../shared/modelSourceQuota').ModelSourceQuotaSave): Promise<ModelSourcesSnapshot> => invoke(MODEL_SOURCE_IPC.saveQuota, input),
+  refreshModelSourceQuotas: (sourceId?: string, force = false): Promise<ModelSourcesSnapshot> => invoke(MODEL_SOURCE_IPC.quota, sourceId, force),
+  discoverModelSourceImports: (): Promise<{ candidates: import('../shared/modelSources').ModelSourceImport[]; errors: string[] }> => invoke(MODEL_SOURCE_IPC.import),
+  connectEnterpriseModelSource: (): Promise<ModelSourceInput> => invoke(MODEL_SOURCE_IPC.login),
+  saveModelSource: (input: ModelSourceSave): Promise<ModelSourcesSnapshot> => invoke(MODEL_SOURCE_IPC.save, input),
+  applyModelSources: (sourceId?: string): Promise<ModelSourcesSnapshot> => invoke(MODEL_SOURCE_IPC.apply, sourceId),
+  queryModelSource: (input: ModelSourceInput, endpointId: string): Promise<ModelSourceInput['models']> => invoke(MODEL_SOURCE_IPC.query, input, endpointId),
+  testModelSource: (input: ModelSourceInput, endpointId: string, modelId: string): Promise<import('../shared/modelSources').SourceConnectionTest> => invoke(MODEL_SOURCE_IPC.test, input, endpointId, modelId),
+  revealModelSourceCredential: (sourceId: string, endpointId: string, expectedConnection: string): Promise<string> => invoke(MODEL_SOURCE_IPC.reveal, sourceId, endpointId, expectedConnection),
+  onModelSourcesChanged: (callback: (snapshot: ModelSourcesSnapshot) => void): (() => void) => { const listener = (_event: unknown, value: ModelSourcesSnapshot) => callback(value); ipcRenderer.on(MODEL_SOURCE_IPC.changed, listener); return () => ipcRenderer.removeListener(MODEL_SOURCE_IPC.changed, listener) },
   getClaudeSources: (): Promise<CodexSourcesSnapshot> => invoke(CLAUDE_SOURCE_IPC.get),
   saveClaudeSource: (input: CodexSourceInput): Promise<CodexSourcesSnapshot> => invoke(CLAUDE_SOURCE_IPC.save, input),
   queryClaudeSourceModels: (input: CodexSourceModelQueryInput): Promise<string[]> => invoke(CLAUDE_SOURCE_IPC.queryModels, input),

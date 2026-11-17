@@ -26,13 +26,16 @@ export function assertDeepSeekHostConfig(config: SessionConfig): void {
   if (config.permissionMode && !Object.hasOwn(DEEPSEEK_HOST_PERMISSION_VALUES, config.permissionMode)) throw new Error('DeepSeek Host 不支持所选权限模式')
   if (config.fastMode || config.maxMode) throw new Error('DeepSeek Host 不支持 Fast / Max 模式')
 }
-export function deepseekHostContract(catalog: any, config: SessionConfig, permissions: unknown, commands: string[] = []): SessionAgentContract {
+export function deepseekHostModels(catalog: any): SessionAgentContract['models'] {
   if (!Array.isArray(catalog?.groups)) throw new Error('DeepSeek Host 模型目录无效')
-  const models = catalog.groups.flatMap((group: any) => (group.models || []).map((model: any) => {
+  return catalog.groups.flatMap((group: any) => (group.models || []).map((model: any) => {
     const efforts = (model.reasoning?.efforts || []).map((row: any) => row.id).filter((id: any) => ALL_EFFORTS.includes(id))
     return { id: JSON.stringify([group.id, model.id]), label: model.name || model.id, efforts,
       defaultEffort: efforts.includes(model.reasoning?.defaultEffort) ? model.reasoning.defaultEffort : undefined }
   }))
+}
+export function deepseekHostContract(catalog: any, config: SessionConfig, permissions: unknown, commands: string[] = []): SessionAgentContract {
+  const models = deepseekHostModels(catalog)
   return {
     models, currentModelId: config.model || (catalog.default ? JSON.stringify([catalog.default.provider, catalog.default.model]) : undefined),
     permissionModes: deepseekHostPermissionModes(permissions), currentPermissionMode: config.permissionMode || 'ask',

@@ -98,6 +98,9 @@ await test('Codex/TraeX receive merge policy, preserve source drafts and refresh
       assert.match(rpc.instructions, /提交后由你合并回本机源分支/, id)
       assert.match(rpc.instructions, /验证源分支包含本次提交/, id)
       assert.match(rpc.instructions, /允许.*源仓库.*Git 操作/, id)
+      assert.match(rpc.instructions, /有输出即停止.*其他 Session.*稍后/)
+      assert.match(rpc.instructions, /不得 stash、代提交、reset\/clean 或覆盖源改动/)
+      assert.match(rpc.instructions, /不自动 pull\/push/)
       const start = rpc.requests.find(request => request.method === 'thread/start')!.params
       const roots = id === 'codex' ? start.config['sandbox_workspace_write.writable_roots'] : JSON.parse(launchArgs.find(arg => arg.startsWith('sandbox_workspace_write.writable_roots='))!.split('=').slice(1).join('='))
       assert.deepEqual(roots, [tree.repositoryRoot, tree.gitCommonDirectory])
@@ -112,6 +115,7 @@ await test('Codex/TraeX receive merge policy, preserve source drafts and refresh
       const second = await commit(tree.workdir, 'second.txt')
       await runner.startTurn('关闭回源后继续提交')
       assert.match(rpc.instructions, /不自动合并回源分支/)
+      assert.doesNotMatch(rpc.instructions, /提交后由你合并回本机源分支/)
       assert.equal(await git(cwd, 'rev-parse', 'HEAD'), first, 'disabled setting must reach the existing native thread')
       rpc.finish()
       config = { ...config, worktree: { ...tree, autoSyncBack: true } }; runner.updateConfig(config)

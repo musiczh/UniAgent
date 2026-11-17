@@ -364,7 +364,9 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       })
       return
     case 'session/prompt': {
-      const text = contentText(params.prompt)
+      // Interpret the business request while preserving the full submitted text in native history.
+      const submittedText = contentText(params.prompt)
+      const text = submittedText.replace(/^(?:<uniagent_(?:initial|channel)_context>[\s\S]*?<\/uniagent_(?:initial|channel)_context>\n\n)+/, '')
       if(scenario.native && text.startsWith('/goal ')) {
         const objective=text.slice(6)
         if(['pause','resume','clear'].includes(objective)){goalUpdate(params.sessionId,objective==='pause'?'user_paused':objective==='resume'?'active':'cleared');reply(frame.id,{stopReason:'end_turn'});return}
@@ -510,7 +512,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       const stored = state.sessions.find((session) => session.sessionId === params.sessionId)
       if (stored) {
         stored.transcript = [...(stored.transcript || []),
-          { role: 'user', text },
+          { role: 'user', text: submittedText },
           { role: 'thought', text: 'Inspecting' },
           { role: 'assistant', text: 'Grok reply' }
         ]

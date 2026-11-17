@@ -17,12 +17,13 @@ const result = await renderEventStream([], 'idle', 'router-task-input-ui', {
     const prefs={lastAgentId:'codex',lastByAgent:{codex:{model:'codex-model',effort:'high',permissionMode:'bypassPermissions'},claude:{model:'claude-model',effort:'high',permissionMode:'ask'}}};
     let session={id:'router-session',title:'RouterAgent',createdAt:1,status:'running',config:{agentId:'deepseek',model:'deepseek-model',workdir:'/fixture',managedPurpose:'router'}};
     let snapshot={config:{enabled:true,agentId:'deepseek',model:'deepseek-model',version:1},available:true,sessionId:session.id,activeRequestId:'previous-input',requests:[]};
-    const errors=[],submitted=[],cancelled=[],forbidden=[],listeners=new Set();let picked=[],interrupts=0,cancelFails=false,statusChange=()=>{};
+    const now=Date.now(),events=[{sessionId:session.id,seq:0,ts:now-21000,type:'user_message',payload:{text:'正在分配的任务'}},{sessionId:session.id,seq:1,ts:now-1000,type:'system_notice',payload:{id:'router-speed',kind:'token_speed',speed:{outputTokens:731,durationMs:10000,metric:'request',source:'router'}}}];
+    const errors=[],submitted=[],cancelled=[],forbidden=[],listeners=new Set();let picked=[],interrupts=0,cancelFails=false,statusChange=()=>{},eventListener=()=>{};
     const changed=()=>listeners.forEach(callback=>callback());
     window.addEventListener('error',event=>errors.push(event.message));window.addEventListener('unhandledrejection',event=>errors.push(String(event.reason)));
     window.uniagent=new Proxy({homeDir:'/fixture',getPrefs:async()=>prefs,setPrefs:async()=>prefs,getAppSettings:async()=>({defaultTaskWorktree:false}),listProjects:async()=>projects,listRequirements:async()=>requirements,listPresets:async()=>[],
-      getPersonalAssistant:async()=>({assistant:{enabled:true}}),getRouterSnapshot:async()=>snapshot,openRouter:async()=>session,getEvents:async()=>[],
-      onRouterChanged:callback=>{listeners.add(callback);return()=>listeners.delete(callback)},onStatusChange:callback=>{statusChange=callback;return()=>{}},
+      getPersonalAssistant:async()=>({assistant:{enabled:true}}),getRouterSnapshot:async()=>snapshot,openRouter:async()=>session,getEvents:async()=>events,
+      onRouterChanged:callback=>{listeners.add(callback);return()=>listeners.delete(callback)},onStatusChange:callback=>{statusChange=callback;return()=>{}},onEvent:callback=>{eventListener=callback;return()=>{}},
       getProjectGitInfo:async()=>({canCreateWorktree:false,branches:[],inspectionFailed:true,unavailableReason:'Git 或主目录检测失败，请检查后重试'}),getNativeCapabilities:async input=>({...emptyNativeCapabilitySnapshot(input.agentId,input.workdir),actions:{goal:true,plan:null,review:true}}),pickFiles:async()=>picked,
       submitRouterInput:input=>new Promise((resolve,reject)=>submitted.push({input,resolve:()=>{snapshot={...snapshot,requests:[...snapshot.requests,{...input,config:snapshot.config,state:'queued',version:1,createdAt:submitted.length,updatedAt:submitted.length}]};changed();resolve()},reject})),
       cancelRouterInput:async(id,version)=>{cancelled.push({id,version});if(cancelFails)throw Error('取消失败，输入仍在队列');snapshot={...snapshot,requests:snapshot.requests.map(row=>row.requestId===id?{...row,state:'cancelled',version:row.version+1}:row)};changed()},
@@ -33,10 +34,11 @@ const result = await renderEventStream([], 'idle', 'router-task-input-ui', {
     root.render(React.createElement(RouterPanel,props));
     window.taskInputFixture={host,errors,submitted,cancelled,forbidden,pick:file=>picked=[file],cancelFailure:value=>cancelFails=value,interrupts:()=>interrupts,renderAgents:agents=>root.render(React.createElement(RouterPanel,{...props,agents})),
       availability:value=>{snapshot={...snapshot,available:value,reason:value?undefined:'路由连接暂不可用'};changed()},
-      finishRequests:()=>{snapshot={...snapshot,activeRequestId:undefined,requests:snapshot.requests.map(row=>({...row,state:'bound',delivery:'accepted',version:row.version+1}))};changed()},
-      requestState:(id,state,activeRequestId,queuedAt)=>{snapshot={...snapshot,activeRequestId,requests:snapshot.requests.map(row=>row.requestId===id?{...row,state,version:row.version+1,...(queuedAt===undefined?{}:{queuedAt})}:row)};changed()},
+      finishRequests:()=>{snapshot={...snapshot,activeRequestId:undefined,requests:snapshot.requests.map(row=>({...row,state:'bound',routerSessionId:session.id,delivery:'accepted',version:row.version+1}))};changed()},
+      requestState:(id,state,activeRequestId,queuedAt)=>{snapshot={...snapshot,activeRequestId,requests:snapshot.requests.map(row=>row.requestId===id?{...row,state,version:row.version+1,...(['routing','bound'].includes(state)?{routerSessionId:session.id}:{}),...(queuedAt===undefined?{}:{queuedAt})}:row)};changed()},
       running:()=>{session={...session,status:'running'};statusChange({sessionId:session.id,status:'running'})},
-      idle:()=>{session={...session,status:'idle'};statusChange({sessionId:session.id,status:'idle'})}};
+      idle:()=>{session={...session,status:'idle'};statusChange({sessionId:session.id,status:'idle'})},
+      finishTurn:()=>{eventListener({sessionId:session.id,seq:2,ts:now,type:'turn_completed',state:'success',payload:{}});session={...session,status:'idle'};statusChange({sessionId:session.id,status:'idle'})}};
   `,
   inspect: `(async()=>{
     const f=window.taskInputFixture,tick=()=>new Promise(resolve=>setTimeout(resolve,15));
@@ -54,6 +56,19 @@ const result = await renderEventStream([], 'idle', 'router-task-input-ui', {
     checks.emptyInputBlocked=send().disabled;
     checks.noHomeHero=!f.host.querySelector('.hero');
     checks.noChatControls=!f.host.querySelector('.composer-wrap');
+    const timer=()=>f.host.querySelector('[data-router-conversation] .turn-timer'),stop=()=>f.host.querySelector('[aria-label="停止当前分配"]'),box=()=>f.host.querySelector('.router-task-composer .composer-box');
+    await wait(()=>timer()?.textContent.includes('73.1'));
+    const layouts=[];
+    for(const width of [740,1000,1280]){
+      f.host.style.width=width+'px';await tick();
+      const capsule=timer().getBoundingClientRect(),button=stop().getBoundingClientRect(),input=box().getBoundingClientRect();
+      layouts.push({width,timerGap:input.top-capsule.bottom,stopGap:input.top-button.bottom,centerOffset:(capsule.left+capsule.right-input.left-input.right)/2,overlap:capsule.right>button.left});
+    }
+    f.host.style.width='';await tick();
+    checks.timerAndStopShareInputGap=layouts.every(row=>row.timerGap>0&&Math.abs(row.timerGap-row.stopGap)<1);
+    checks.timerCenteredWithoutStopOverlap=layouts.every(row=>Math.abs(row.centerOffset)<1&&!row.overlap);
+    const speedLabel=timer().querySelector('.turn-speed-label');
+    checks.timerKeepsSpeedStyle=getComputedStyle(speedLabel).backgroundColor==='rgba(0, 0, 0, 0)'&&speedLabel.getBoundingClientRect().width>30;
     f.host.querySelector('.sb-add summary').click();await tick();checks.noNativeCommands=!f.host.querySelector('.sb-add').textContent.match(/Goal|Plan|Review|审查/);f.host.querySelector('.sb-add').removeAttribute('open');
     await fill('第一项新任务');await add('context.txt');await add('screenshot.png','image');
     if(send().disabled)throw Error('Git 检测失败不应阻止 RouterAgent 发送文字和图片');
@@ -86,6 +101,9 @@ const result = await renderEventStream([], 'idle', 'router-task-input-ui', {
     checks.independentWorktrees=f.submitted[2].input.execution.workspaceSelection.requestId!==f.submitted[1].input.execution.workspaceSelection.requestId;
     checks.queueOrder=[...f.host.querySelectorAll('.queue-text')].map(row=>row.textContent).join('|')==='第一项新任务|下一项草稿';
     checks.queueHasNoChatActions=!f.host.querySelector('[aria-label="直接发送"], [aria-label="编辑等待消息"]');
+    const queue=f.host.querySelector('.router-input-queue').getBoundingClientRect(),queuedTimer=timer().getBoundingClientRect(),queuedStop=stop().getBoundingClientRect(),queuedInput=box().getBoundingClientRect();
+    checks.queueAboveTimerAndStop=queue.bottom<=Math.min(queuedTimer.top,queuedStop.top);
+    checks.queuedTimerAndStopShareInputGap=Math.abs(queuedTimer.bottom-queuedStop.bottom)<1&&queuedInput.top-queuedTimer.bottom>0;
     await chooseScope('输入框需求');
     scope().click();await wait(()=>f.host.querySelector('.project-worktree-choice'));
     checks.manualNonGitStillBlocked=f.host.querySelector('.project-worktree-choice').disabled&&f.host.querySelector('.project-worktree-choice').getAttribute('aria-checked')==='false';
@@ -149,10 +167,13 @@ const result = await renderEventStream([], 'idle', 'router-task-input-ui', {
     checks.executorUnavailableKeepsComposer=!!f.host.querySelector('.router-task-composer')&&window.__markdownInput.text(f.host)==='执行方离线时保留草稿';
     shortcut();await tick();checks.executorUnavailableCannotSubmit=f.submitted.length===12;
     checks.noPlainChatOrDirectCreation=f.forbidden.length===0;
-    return {checks,errors:f.errors};
+    f.finishTurn();await wait(()=>timer()?.classList.contains('st-done')&&!stop());
+    const doneTimer=timer().getBoundingClientRect(),doneInput=box().getBoundingClientRect();
+    checks.completedTimerStaysAboveInput=Math.abs(doneInput.top-doneTimer.bottom-layouts[0].timerGap)<1&&Math.abs((doneTimer.left+doneTimer.right-doneInput.left-doneInput.right)/2)<1;
+    return {checks,layouts,errors:f.errors};
   })()`
 })
 
 assert.deepEqual(result.errors, [])
-assert.deepEqual(Object.entries(result.checks).filter(([, passed]) => !passed).map(([name]) => name), [])
+assert.deepEqual(Object.entries(result.checks).filter(([, passed]) => !passed).map(([name]) => name), [], JSON.stringify(result.layouts))
 console.log('PASS Router task input: shared new-task composer, execution choices, scoped FIFO inputs, retry identity, draft retention, cancellation and routing-only behavior')

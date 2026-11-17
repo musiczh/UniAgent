@@ -52,7 +52,7 @@ import { AgentIcon } from './AgentIcon'
 import { AttachmentImagePreview, AttachmentThumbnail } from './AttachmentThumbnail'
 import { AgentBetaBadge } from './AgentBetaBadge'
 import { SendIcon, UiIcon } from './Icons'
-import { LoadBadge } from './ModelPicker'
+import { LoadBadge, ModelMenuOption } from './ModelPicker'
 import { SubmenuPopover } from './SubmenuPopover'
 import { ProjectPicker } from './ProjectPicker'
 import { MarkdownEditor } from './MarkdownEditor'
@@ -178,6 +178,7 @@ export function NewTaskPanel({
     return () => { active = false; stop() }
   }, [routerOnly])
   const [model, setModel] = useState<string>('')
+  const [nikaPinnedModel, setNikaPinnedModel] = useState<string | null>(null)
   const [kimiThinking, setKimiThinking] = useState('')
   const [zcodeThinking, setZcodeThinking] = useState('')
   const [effort, setEffort] = useState<ReasoningEffort | ''>('')
@@ -507,6 +508,7 @@ export function NewTaskPanel({
     )
     handledQuickCreateSeedRef.current = claim.claimed
     if (!quickCreateSeed || !claim.shouldApply) return
+    setNikaPinnedModel(null)
     setRouteAutomatically(false)
     setRequirementId(quickCreateSeed?.requirementId)
     const requestedAgentId = quickCreateSeed?.agentId
@@ -559,6 +561,7 @@ export function NewTaskPanel({
     setExecutor('agent'); localStorage.setItem('uniagent.mode', 'session')
     if (nextAgentId === agentId) return true
     return guardNewTaskConfigurationMutation(submittingRef.current, () => {
+      setNikaPinnedModel(null)
       setAgentId(nextAgentId)
     })
   }
@@ -590,6 +593,9 @@ export function NewTaskPanel({
     () => agent?.models.find((m) => m.id === model),
     [agent, model]
   )
+  useEffect(() => {
+    if (agent?.adapter !== 'nika' || isTeam || nikaPinnedModel !== model) setNikaPinnedModel(null)
+  }, [agent?.adapter, isTeam, model, nikaPinnedModel])
 
   // When the agent changes, restore its valid defaults. A pending task template
   // wins once, after which the Settings defaults apply.
@@ -700,6 +706,14 @@ export function NewTaskPanel({
     const defaults = withLastAgentChoices(prefsRef.current?.lastByAgent[agent.id])
     const chosenModelDef = resolveAgentModel(agent, model, defaults?.defaultModel)
     const chosenModel = chosenModelDef?.id
+    if (chosenModelDef?.nikaHealth?.status === 'admin_disabled') {
+      setSubmitError('该模型已被管理员禁用，请选择其它模型。')
+      return null
+    }
+    if (chosenModelDef?.nikaHealth?.status === 'service_down' && nikaPinnedModel !== chosenModel) {
+      setSubmitError('模型服务暂时中断，请选择其它模型，或锁定该模型等待恢复。')
+      return null
+    }
     const chosenEffort = agent.capabilities.reasoningEffort ? resolveModelEffort(chosenModelDef, effort, defaults?.defaultEffort) : undefined
     const chosenThinking = resolveModelThinking(chosenModelDef, agent.adapter === 'zcode' ? zcodeThinking : kimiThinking, defaults?.defaultThinking, defaults?.defaultEffort)
     const chosenPerm = resolveNewTaskPermission(agent, perm)
@@ -723,6 +737,7 @@ export function NewTaskPanel({
         ...(useAssistant && !isTeam ? { useAssistant: true } : {}),
         model: chosenModel,
         modelSource: chosenModelDef?.modelSource,
+        ...(agent.adapter === 'nika' ? { nikaPinnedModel: chosenModel === nikaPinnedModel ? nikaPinnedModel : null } : {}),
         effort: agent.adapter === 'zcode' ? undefined : chosenEffort,
         ...(agent.adapter === 'qoder' ? { qoderContextWindow: chosenModelDef?.qoderContextWindows?.includes(defaults?.qoderContextWindow || 0) ? defaults?.qoderContextWindow : undefined, qoderThinkingDisabled: chosenModelDef?.qoderThinkingDisabled ? defaults?.qoderThinkingDisabled : undefined } : {}),
         ...(agent.adapter === 'kimi' ? { kimiThinking: chosenThinking } : {}),
@@ -782,13 +797,14 @@ export function NewTaskPanel({
       if (!router?.config.enabled || !router.available) { setSubmitError(router?.reason || '请先启用 RouterAgent'); return }
       if (useAssistant || delivery.kind !== 'turn' || selectedIds.length) { setSubmitError('自动归属支持普通任务输入，请先移除原生命令或能力选择'); return }
       submittingRef.current = true; setSubmitting(true); setSubmitError('')
+      const motionKey = captureSendOrigin(composerBoxRef.current)
       let submittedId: string | undefined
       try {
         const scope = routerOnly && !routeAutomatically ? resolved.config.taskScope! : { kind: 'global' as const }
         const input = { prompt, attachments: outgoingAttachments, execution: resolved.config, scope }
         const requestId = await pendingTaskRequest(localStorage, { kind: 'router', input })
         submittedId = requestId
-        captureSendOrigin(composerBoxRef.current, requestId)
+        associateSendOrigin(requestId, motionKey)
         stageRouterSubmission({ requestId, routerSessionId: router.sessionId, prompt, attachments: outgoingAttachments })
         animateSentContent(document.querySelector<HTMLElement>(`[data-client-turn-key="${requestId}"] .bubble`), requestId)
         onRouterSubmitting?.()
@@ -808,7 +824,8 @@ export function NewTaskPanel({
         onRouterSubmitted?.()
       } catch (error) {
         setSubmitError(errorMessage(error))
-        if (submittedId) { failRouterSubmission(submittedId, errorMessage(error)); cancelSendOrigin(submittedId) }
+        if (submittedId) failRouterSubmission(submittedId, errorMessage(error))
+        cancelSendOrigin(motionKey)
       }
       finally { submittingRef.current = false; setSubmitting(false) }
       return
@@ -831,10 +848,11 @@ export function NewTaskPanel({
     submittingRef.current = true
     setSubmitting(true)
     setSubmitError('')
+    const motionKey = captureSendOrigin(composerBoxRef.current)
     try {
       if (!onCreateNativeAction && delivery.kind === 'goal') throw new Error('当前无法创建 Goal')
       const taskRequestId = await pendingTaskRequest(localStorage, { config: resolved.config, delivery })
-      captureSendOrigin(composerBoxRef.current, taskRequestId)
+      associateSendOrigin(taskRequestId, motionKey)
       await completeNewTaskCreation({
         create: () => dispatchNewTaskDelivery(
           { ...resolved.config, taskRequestId },
@@ -845,7 +863,7 @@ export function NewTaskPanel({
               throw new Error('当前无法创建 Goal')
             })
           }
-        ).then(session => { associateSendOrigin(`session:${session.id}`, taskRequestId); return session }),
+        ).then(session => { associateSendOrigin(`session:${session.id}`, motionKey); return session }),
         kind: delivery.kind,
         submitted: submittedDraft,
         current: currentNewTaskDraft,
@@ -854,6 +872,7 @@ export function NewTaskPanel({
       finishTaskRequest(localStorage, taskRequestId)
     } catch (error: unknown) {
       setSubmitError(errorMessage(error))
+      cancelSendOrigin(motionKey)
       if (workspaceRequest) await refreshProjectGitInfo()
     } finally {
       submittingRef.current = false
@@ -1211,6 +1230,7 @@ export function NewTaskPanel({
                 <span className="sb-effort-model">{agent?.name || '选择 Agent'}</span>
               )}
               {typeof modelDef?.loadPercent === 'number' && <LoadBadge percent={modelDef.loadPercent} />}
+              {agent?.adapter === 'nika' && nikaPinnedModel === model && nikaPinnedModel && <UiIcon name="lock" size={12} />}
               {(nativeThinking || agent?.capabilities.reasoningEffort) && selectedEffort && (
                 <span className="sb-effort-lvl">{effortLabel(selectedEffort)}</span>
               )}
@@ -1287,25 +1307,17 @@ export function NewTaskPanel({
                   {activeSub === 'model' && (
                     <SubmenuPopover wide>
                       <div className="sb-menu-label sb-sub-title">模型</div>
-                      {agent.models.map((m) => (
-                        <button
-                          key={m.id}
-                          type="button"
-                          role="option"
-                          aria-selected={m.id === model}
-                          className={`sb-menu-item sb-sub-opt ${m.id === model ? 'is-sel' : ''}`}
-                          disabled={submitting}
-                          onClick={() => guardNewTaskConfigurationMutation(
+                      {agent.models.map((m) => <ModelMenuOption key={m.id} model={m} selected={m.id === model}
+                          disabled={submitting} pinnedModel={nikaPinnedModel}
+                          onSelect={() => guardNewTaskConfigurationMutation(
                             submittingRef.current,
                             () => setModel(m.id)
                           )}
-                        >
-                          <span className="sb-sub-radio" aria-hidden />
-                          <span className="sb-entry-body">{m.label}</span>
-                          <LoadBadge percent={m.loadPercent} />
-                          <UiIcon name="check" size={13} className="sb-sub-check" />
-                        </button>
-                      ))}
+                          onTogglePin={agent.adapter === 'nika' ? () => guardNewTaskConfigurationMutation(submittingRef.current, () => {
+                            setModel(m.id)
+                            setNikaPinnedModel(nikaPinnedModel === m.id ? null : m.id)
+                          }) : undefined}
+                        />)}
                     </SubmenuPopover>
                   )}
                 </div>

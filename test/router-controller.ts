@@ -5,7 +5,7 @@ import {join} from 'node:path'
 import {randomUUID} from 'node:crypto'
 import {RouterDatabase} from '../src/main/router/database'
 import {RouterController} from '../src/main/router/controller'
-import {routerMcpServers,globalMemoryMcpEnv} from '../src/main/router/mcp'
+import {routerMcpServers,projectMemoryMcpEnv} from '../src/main/router/mcp'
 import {routerTargetVersion} from '../src/main/router/target'
 import {DEFAULT_ROUTER_CONFIG, ROUTER_SYSTEM_PROMPT, routerRole, type RouterRequest} from '../src/shared/router'
 import type {RouterStore} from '../src/main/router/store'
@@ -32,7 +32,7 @@ const orchestrator={getSessionById:(id:string)=>sessions.get(id),managedSessions
   updateSessionConfig:(id:string,patch:Partial<Session['config']>)=>{Object.assign(sessions.get(id)!.config,patch);return sessions.get(id)!},
   sendMessage:async(id:string,...args:unknown[])=>{routerMessages.push([id,...args]);sends++;sessions.get(id)!.status='running'},acceptRoutedInput:async(...args:unknown[])=>{acceptedInputs.push(args);deliveryOrder.push('accept:'+args[5]);accepted++;return {status:'queued' as const}},
   appendSystemNotice:()=>{},interrupt:()=>{}}
-const controller=new RouterController(store,{agents:()=>[agent],config:()=>config,saveConfig:next=>{config=next},orchestrator:orchestrator as any,objects,
+const controller=new RouterController(store,{agents:()=>[agent],config:()=>config,saveConfig:next=>{config=next},orchestrator:orchestrator as any,objects,projectMemory:async(_id:string,args:any)=>args.action==='read'?{items:[] as unknown[]}:[],
   beforeDispatch:async(request,session)=>{assert.equal(session.id,target.id);deliveryOrder.push('prepare');if(request.feishu)assert.equal(request.feishu.botAppId,'fixture-bot');await beforeDelivery?.()},
   newTask:async(request)=>{createdInputs.push(request);newTasks++;return target},recoverTask:async()=>undefined,changed:()=>{},error:()=>{}},root)
 async function waitFor(check:()=>Promise<boolean>){for(let i=0;i<100;i++){if(await check())return;await new Promise(resolve=>setTimeout(resolve,10))}throw Error('router_timeout')}
@@ -47,6 +47,16 @@ try{
   const systemPrompt=routerRole(sessions.get((await controller.snapshot()).sessionId!)!.config)!.instructions
   assert.equal(systemPrompt, ROUTER_SYSTEM_PROMPT, 'the actual Router role receives the current routing instructions')
   assert.equal((routerMessages[0][5] as { displayText: string }).displayText, input.prompt, 'the shortened protocol message preserves the original business input')
+  const sentContext=JSON.parse((routerMessages[0][1] as string).split('本轮路由请求：\n')[1])
+  assert.equal(sentContext.requestId,id,'the model-facing data binds this input to its own request, even in a reused native Session')
+  assert.deepEqual(sentContext.hardScope,{kind:'global'},'the current explicit scope accompanies the input, not a previous execution config')
+  assert.equal(sentContext.input,input.prompt)
+  assert.equal(sentContext.inputSource,'new_input','a screenshot of an old question is still new business input')
+  assert.deepEqual(sentContext.clarificationHistory,[],'no clarification from a previous request is inherited')
+  assert.equal(sentContext.version,db.request(id)!.version,'the host provides the current request version without a bootstrap gate')
+  assert.equal(typeof sentContext.catalogRevision,'string')
+  assert.equal(typeof sentContext.asOf,'number')
+  assert.deepEqual(sentContext.attachments,[])
   await controller.submit(input)
   assert.equal(sends,1)
   assert.equal((await controller.snapshot()).activeRequestId,id,'snapshot identifies the input occupying the Router turn')
@@ -105,9 +115,8 @@ try{
   await controller.submit(clarificationInput)
   await waitFor(async()=>db.request(clarificationId)?.state==='routing')
   for (const [question,answer] of [['属于哪个空间？','UniAgent 空间'],['属于哪个需求？','uniagent日常迭代']] as const) {
-    await call('router_query',{requestId:clarificationId,mode:'bootstrap'})
     const row=db.request(clarificationId)!
-    const pending=await call('router_assign_task',{requestId:clarificationId,version:row.version,action:'clarify',reason:'需要用户补充',clarification:question})
+    const pending=await call('router_assign_task',{requestId:clarificationId,version:row.version,action:'clarify',reason:'需要用户补充',clarification:question,clarificationOptions:[{label:answer}]})
     assert.equal(pending.ok,true,JSON.stringify(pending))
     assert.equal(pending.value.state,'needs_input')
     const others=answer==='UniAgent 空间'?[randomUUID(),randomUUID()]:[]
@@ -124,8 +133,7 @@ try{
         'clarification joins the queue behind the existing waiting input')
       for (const requestId of others) {
         await waitFor(async()=>db.request(requestId)?.state==='routing')
-        await call('router_query',{requestId,mode:'bootstrap'})
-        await call('router_assign_task',{requestId,version:db.request(requestId)!.version,action:'clarify',reason:'保持夹具等待',clarification:'等待补充'})
+        await call('router_assign_task',{requestId,version:db.request(requestId)!.version,action:'clarify',reason:'保持夹具等待',clarification:'等待补充',clarificationOptions:[{label:'继续原任务'}]})
         await end()
         await controller.cancel(requestId,db.request(requestId)!.version)
       }
@@ -138,11 +146,13 @@ try{
   assert.equal(clarified.prompt,clarificationInput.prompt)
   assert.deepEqual(clarified.attachments,clarificationInput.attachments)
   assert.deepEqual(clarified.execution,clarificationInput.execution)
-  const bootstrap=await call('router_query',{requestId:clarificationId,mode:'bootstrap'})
-  assert.match(bootstrap.value.clarification,/UniAgent 空间[\s\S]*uniagent日常迭代/,'routed continuation reads both answers under the original request')
-  assert.deepEqual(bootstrap.value.clarificationHistory.map((row:any)=>[row.question,row.text]),[['属于哪个空间？','UniAgent 空间'],['属于哪个需求？','uniagent日常迭代']])
-  const routingData=JSON.parse(String(routerMessages.at(-1)![1]).split('\n\n本轮请求数据：\n')[1])
+  for (let i = 0; i < 100 && !String(routerMessages.at(-1)?.[1] || '').includes('uniagent日常迭代'); i++) await new Promise(resolve => setTimeout(resolve, 10))
+  const routingData=JSON.parse(String(routerMessages.at(-1)![1]).split('本轮路由请求：\n')[1])
+  assert.match(routingData.clarification,/UniAgent 空间[\s\S]*uniagent日常迭代/,'routed continuation reads both answers under the original request')
+  assert.deepEqual(routingData.clarificationHistory.map((row:any)=>[row.question,row.text]),[['属于哪个空间？','UniAgent 空间'],['属于哪个需求？','uniagent日常迭代']])
   assert.equal(routingData.input,clarificationInput.prompt)
+  assert.equal(routingData.inputSource,'clarification_reply','only a stored answer under this request is a clarification reply')
+  assert.equal(routingData.requestId,clarificationId)
   assert.deepEqual(routingData.clarificationHistory.map((row:any)=>[row.question,row.text]),[['属于哪个空间？','UniAgent 空间'],['属于哪个需求？','uniagent日常迭代']],
     'the next Router turn directly receives paired questions and answers')
   assert.equal((routerMessages.at(-1)![2] as any[]).length,2,'Router can still see the original and clarification attachments')
@@ -186,10 +196,12 @@ try{
     db.update(request.requestId, request.version, { state: 'cancelled' })
   }
   events.set(target.id,[{sessionId:target.id,seq:0,ts:1,type:'user_message',state:'success',payload:{text:'请记住：我偏好中文。',source:'app'}}])
-  await controller.memoryForSession(target.id,{action:'remember',content:'我偏好中文',scope:{kind:'global'}})
-  assert.equal((await controller.memoryContext(target.id,target.config)).includes('我偏好中文'),true)
-  await assert.rejects(controller.memoryForSession(target.id,{action:'propose',content:'越界内容',scope:{kind:'task',taskId:'other'}}),/scope_conflict/)
-  const env=globalMemoryMcpEnv(target.id);assert.ok(env.UNIAGENT_GLOBAL_MEMORY_TOKEN)
+  const guide=await controller.projectContext(target.id,target.config)
+  assert.match(guide,/project_memory/,'project memory remains available through the on-demand guide')
+  assert.doesNotMatch(guide,/我偏好中文/,'dynamic memory contents are read through tools, never injected')
+  const env=projectMemoryMcpEnv(target.id)
+  assert.ok(env.UNIAGENT_PROJECT_MEMORY_TOKEN)
+  assert.equal('UNIAGENT_GLOBAL_MEMORY_TOKEN' in env,false,'the removed global-memory capability is not exported')
   let refreshStarted=false,releaseRefresh!:()=>void,reads=0
   const refreshGate=new Promise<void>(resolve=>{releaseRefresh=resolve})
   beforeObjects=async()=>{reads++;if(reads===1){refreshStarted=true;await refreshGate}}

@@ -48,11 +48,25 @@ try {
   await store.context(r.id, 'source', { action: 'propose', expectedRevision: snapshot.revision, operationId: 'draft-only', documents: [{ id: 'draft-routing', kind: 'proposal', title: '未确认功能', content: '尚未确认的新要求', sources: proof }] })
   assert.equal((await store.readRouting(r.id)).snapshot.status, 'ready', 'draft additions do not rewrite or invalidate effective routing facts')
   assert.equal((await store.routingSources(r.id)).documents.some(doc => doc.id === 'draft-routing'), false)
+  const relationSnapshot = await store.context(r.id, 'source', { action: 'check' })
+  await store.context(r.id, 'source', { action: 'propose', expectedRevision: relationSnapshot.revision, operationId: 'draft-source-link', documents: [{ id: 'draft-source', kind: 'source', title: '需求成果说明入口',
+    content: '未确认资料正文不得升级为新要求。', sources: [...proof, { kind: 'reference', uri: 'https://fixture.invalid/article' }] }] })
+  const withReferences = await store.readRouting(r.id)
+  assert.equal(withReferences.snapshot.status, 'ready', 'draft material associations do not invalidate effective routing facts')
+  assert.equal(withReferences.sources.documents.some(doc => doc.id === 'draft-source'), false, 'draft bodies never enter routing extraction')
+  assert.ok(withReferences.sources.references?.some(doc => doc.id === 'draft-source' && doc.status === 'draft' && doc.uris.includes('https://fixture.invalid/article')), 'registered material links are independently discoverable')
   const ctx = new RouterContextService({ projects: () => [], requirements: async () => [r], overview: async () => { throw Error('Router must use routing context instead of the body endpoint') },
     routing: id => store.readRouting(id), sessions: () => [], events: async () => [], seed: () => undefined })
   const object = (await ctx.objects())[0]
-  assert.match(object.summary, /本需求承载/); assert.match(object.sources![0].text, /planned/)
-  await db.index([object]); assert.equal(db.object(r.id).description!.freshness, 'ready'); assert.equal((await db.descriptionJobs()).some(job => job.id === r.id), false)
+  const reference = object.sources!.find(source => source.ref.startsWith('reference:'))!
+  assert.equal(JSON.parse(reference.text).status, 'draft')
+  assert.ok(reference.text.includes('https://fixture.invalid/article'))
+  assert.equal(object.summary, text, 'core goal precedes the derived feature listing')
+  const facts = object.sources!.find(source => source.ref.startsWith('routing:'))!
+  assert.equal(JSON.parse(facts.text).features[0].implementation.status, 'planned', 'progress remains available separately from the scope summary')
+  await db.index([object])
+  assert.equal(db.object(r.id).description!.freshness, 'source_excerpt', 'a source prefix is not a semantic overview even when the routing view is ready')
+  assert.equal((await db.descriptionJobs()).some(job => job.id === r.id), true, 'the existing summary service compacts the core goal and routing facts')
   const current = await store.context(r.id, 'source', { action: 'check' })
   await store.context(r.id, 'source', { action: 'commit', expectedRevision: current.revision, operationId: 'change-source', documents: [{ id: 'core', kind: 'core', title: '范围', content: text + '\n新增明确的范围说明。', sources: proof }] })
   assert.equal((await store.readRouting(r.id)).snapshot.status, 'stale')
@@ -67,5 +81,5 @@ try {
   const escaped = await db.routingChunks('\\\n"\t'.repeat(10000))
   assert.ok(escaped.every(part => Buffer.byteLength(JSON.stringify(part.text)) <= 10000), 'serialized chunk must leave room for the extraction prompt and document metadata')
   assert.ok((await readFile(join(r.dir, '.uniagent/routing.json'), 'utf8')).includes('checksum'))
-  console.log('PASS requirement routing: cited ownership, independent progress/acceptance, active-only sources, cache, stale writes, original detail fallback, Unicode chunks and no double summary')
+  console.log('PASS requirement routing: cited ownership, independent progress/acceptance, active-only sources, cache, stale writes, core-first description job and Unicode chunks')
 } finally { await service.close(); db.close() }

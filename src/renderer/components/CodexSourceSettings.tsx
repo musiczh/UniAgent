@@ -26,13 +26,13 @@ function clock(value?: number): string {
 function quotaControl(source: CodexSource, refreshing: boolean): ReactNode {
   const quota = source.quota
   if (!source.hasKey || !source.enabled) return null
-  // MiMo 的额度接口只认控制台登录态，API Key 无法查询；额度区直接引导到控制台查看。
   const consoleUrl = CODEX_SOURCE_PRESETS[source.preset].consoleUrl
-  if (consoleUrl) return <div className="r-control set-quota-ctl">
+  if (consoleUrl && (!quota || quota.status !== 'ready' && !quota.stale)) return <div className="r-control set-quota-ctl">
     <button type="button" className="set-mini-btn" aria-label={`打开 ${CODEX_SOURCE_NAMES[source.id]} 控制台`} onClick={() => void window.uniagent.openExternal(consoleUrl)}><UiIcon name="external-link" size={12} />打开控制台</button>
   </div>
   if (!quota) return <div className="r-control set-quota-ctl"><span className="set-sub-r">{refreshing ? '正在查询额度…' : '额度待刷新'}</span></div>
   const stale = quota.stale && quota.capturedAt ? ` · 上次成功 ${clock(quota.capturedAt)}` : ''
+  if (quota.kind === 'credits' && quota.credits) return <div className="r-control set-quota-ctl"><span className="set-remain">剩余 {quota.credits.remaining.toLocaleString()} / {quota.credits.total.toLocaleString()} {quota.credits.unit}</span><span className="set-sub-r">{quota.stale ? quota.message : ''}{stale}</span></div>
   if (quota.kind === 'balance' && quota.balances?.length) {
     return <div className="r-control set-quota-ctl">
       {quota.balances.map(balance => <span className="set-remain" key={balance.currency}>余额 {money(balance)}</span>)}

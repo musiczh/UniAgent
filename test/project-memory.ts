@@ -8,7 +8,7 @@ import { RouterDatabase } from '../src/main/router/database'
 import { RouterController } from '../src/main/router/controller'
 import type { RouterStore } from '../src/main/router/store'
 import { ProjectMemoryService } from '../src/main/projectMemory'
-import { globalMemoryMcpEnv, projectMemoryCli, projectMemoryCliGuide } from '../src/main/router/mcp'
+import { projectMemoryMcpEnv, projectMemoryCli, projectMemoryCliGuide } from '../src/main/router/mcp'
 import { DEFAULT_ROUTER_CONFIG } from '../src/shared/router'
 import type { Project, Session, UAEvent } from '../src/shared/types'
 
@@ -29,7 +29,7 @@ let changed=0
 const service=new ProjectMemoryService(store,{project:id=>projects.find(p=>p.id===id),session:id=>id===session.id?session:undefined,events:async()=>events,changed:()=>changed++})
 let config={...DEFAULT_ROUTER_CONFIG,enabled:false}
 const controller=new RouterController(store,{agents:()=>[],config:()=>config,saveConfig:value=>{config=value},orchestrator:{getSessionById:id=>id===session.id?session:undefined,getEvents:async()=>events,managedSessions:()=>[session]} as any,
-  projectMemory:(id,args)=>service.forSession(id,args as any),currentProjectMemory:row=>service.isCurrent(row),objects:async()=>[],changed:()=>{},error:()=>{},newTask:async()=>session,recoverTask:async()=>undefined},root)
+  projectMemory:(id,args)=>service.forSession(id,args as any),objects:async()=>[],changed:()=>{},error:()=>{},newTask:async()=>session,recoverTask:async()=>undefined},root)
 try {
   const commit={action:'commit' as const,title:'工作目录接口',content:'目录通过 workspace.ts 处理。',type:'architecture' as const,modules:[{path:'workspace.ts'}],source:{seq:1,kind:'tool' as const,quote:'工作目录接口位于 workspace.ts'}}
   await service.forSession(session.id,commit)
@@ -85,29 +85,36 @@ try {
   assert.equal((await service.forSession(session.id,{action:'read'})).total,1)
   await assert.rejects(service.forSession(session.id,commit),/read_only/)
   delete session.config.permissionMode
-  const guided=await controller.memoryContext(session.id,session.config)
+  const guided=await controller.projectContext(session.id,session.config)
   assert.match(guided,/project_memory/)
   assert.doesNotMatch(guided,/目录通过|工作目录接口|workspace\.ts/,'project memory content, titles and code links are not injected')
-  const env=globalMemoryMcpEnv(session.id)
+  const env=projectMemoryMcpEnv(session.id)
   assert.ok(env.UNIAGENT_PROJECT_MEMORY_TOKEN&&env.UNIAGENT_PROJECT_MEMORY_ENDPOINT)
-  assert.equal(env.UNIAGENT_GLOBAL_MEMORY_TOKEN,'','disabled Router does not enable global-memory capability')
+  assert.equal('UNIAGENT_GLOBAL_MEMORY_TOKEN' in env,false,'the removed global-memory capability is not exported')
+  assert.equal(Object.keys(env).sort().join(','),'UNIAGENT_PROJECT_MEMORY_ENDPOINT,UNIAGENT_PROJECT_MEMORY_TOKEN')
   const response=await fetch(env.UNIAGENT_PROJECT_MEMORY_ENDPOINT,{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer '+env.UNIAGENT_PROJECT_MEMORY_TOKEN},body:JSON.stringify({name:'project_memory',arguments:{action:'read',id:row.id}})})
   const payload=await response.json()
   assert.equal(payload.ok,true)
   assert.equal(payload.value.document.content,commit.content,'on-demand MCP works while Router is off')
-  assert.equal((await controller.memory({action:'read',scope:{kind:'space',projectId:'a'}})).length,1,'Router consumes verified project memories from the same source service')
+  assert.equal((await service.request('a',{action:'read'})).total,1,'the independent project-memory service still reads verified project memories while Router is off')
+  const removed=await fetch(env.UNIAGENT_PROJECT_MEMORY_ENDPOINT,{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer '+env.UNIAGENT_PROJECT_MEMORY_TOKEN},body:JSON.stringify({name:'global_memory',arguments:{action:'read'}})})
+  assert.equal((await removed.json()).ok,false,'the project-memory endpoint rejects the removed global_memory tool')
   const cli=projectMemoryCli(session.id)!
   const cliResult=await promisify(execFile)(cli.command,[...cli.args,JSON.stringify({action:'read',id:row.id})],{env:process.env})
   assert.equal(JSON.parse(cliResult.stdout).document.content,commit.content,'Agents without session MCP use the same scoped on-demand service')
   const cliGuide=projectMemoryCliGuide(session.id)
   assert.doesNotMatch(cliGuide,/目录通过|工作目录接口|workspace\.ts/)
   assert.ok(!cliGuide.includes(env.UNIAGENT_PROJECT_MEMORY_TOKEN),'the guide never includes a capability token')
-  const fallback=await controller.memoryContext(session.id,{...session.config,agentId:'kimi'})
-  assert.ok(fallback.includes('ELECTRON_RUN_AS_NODE=1')&&fallback.includes('project-memory.cjs'))
+  assert.ok(!cliGuide.includes(cli.command) && cli.args.every(arg=>!cliGuide.includes(arg)), 'the project memory guide omits absolute program and binding paths')
+  const shortCommand=cliGuide.match(/`([^`]+)`/)?.[1]
+  assert.ok(shortCommand)
+  assert.equal(JSON.parse((await promisify(execFile)('/bin/sh',['-c',shortCommand!],{cwd:outside,env:process.env})).stdout).total,1,'the short project memory command works after changing directories')
+  const fallback=await controller.projectContext(session.id,{...session.config,agentId:'kimi'})
+  assert.match(fallback,/uniagent-context/)
   assert.doesNotMatch(fallback,/目录通过|工作目录接口|workspace\.ts/)
   config={...config,enabled:true}
-  const enabled=await controller.memoryContext(session.id,session.config)
-  assert.doesNotMatch(enabled,/目录通过|工作目录接口|workspace\.ts/,'the legacy global-memory path also excludes project memory')
+  const enabled=await controller.projectContext(session.id,session.config)
+  assert.doesNotMatch(enabled,/目录通过|工作目录接口|workspace\.ts/,'enabling Router does not inject project memory bodies')
   assert.ok(changed>=5)
   console.log('PASS project memory: scoped on-demand reads, source/code verification, revision history, candidates, read-only and Router-independent MCP without injection')
 } finally {await controller.close();db.close();await rm(root,{recursive:true,force:true});await rm(outside,{recursive:true,force:true})}

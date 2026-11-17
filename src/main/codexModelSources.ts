@@ -7,6 +7,7 @@ import { mergeCodexSourceModels } from './codexSourceService'
 import { atomicWrite } from './projectStore'
 import { resolveUserDataHome } from './userData'
 import { codexModelKey, codexWireModel, parseCodexModelKey } from '../shared/codexModelIdentity'
+import { CodexFerrySource } from './codexFerrySource'
 
 function sameSource(left?: CodexModelSourceRef, right?: CodexModelSourceRef): boolean {
   return left?.kind === right?.kind && left?.sourceId === right?.sourceId
@@ -36,7 +37,12 @@ export class CodexModelSources {
   private readonly localCatalogFile = join(resolveUserDataHome(), 'local-models', 'models.json')
   private localCatalog = ''
 
-  constructor(private readonly thirdParty: CodexSourceService) {}
+  constructor(private readonly thirdParty: CodexSourceService, private readonly ferry = new CodexFerrySource()) {}
+
+  async refreshModels(nativeModels: ModelDef[]): Promise<ModelDef[]> {
+    await this.ferry.refresh()
+    return this.mergeModels(nativeModels)
+  }
 
   updateLocal(snapshot: LocalModelsSnapshot): void {
     this.local = structuredClone(snapshot)
@@ -50,10 +56,10 @@ export class CodexModelSources {
   }
 
   mergeModels(nativeModels: ModelDef[]): ModelDef[] {
-    this.nativeIds = new Set(nativeModels.map(model => model.id))
-    const native = nativeModels.map(model => ({ ...model, modelSource: { kind: 'native' as const } }))
-    const ferry = native.filter(model => model.id.startsWith('ferry-'))
-    const subscription = native.filter(model => !model.id.startsWith('ferry-'))
+    // Native caches may retain Ferry rows after the gateway stops or removes a
+    // model. Only the live Ferry source can advertise and route those rows.
+    const subscription = nativeModels.filter(model => !model.id.startsWith('ferry-')).map(model => ({ ...model, modelSource: { kind: 'native' as const } }))
+    this.nativeIds = new Set(subscription.map(model => model.id))
     const thirdParty = this.thirdParty.supplementalModels()
     const local = this.local.availability === 'ready' && this.local.connection && this.local.activeModelId
       ? this.local.models
@@ -64,7 +70,7 @@ export class CodexModelSources {
             modelSource: { kind: 'local' as const, sourceId: 'bonsai' }
           })))
       : []
-    return mergeCodexSourceModels(subscription, [...thirdParty, ...local, ...ferry])
+    return mergeCodexSourceModels(subscription, [...thirdParty, ...local, ...this.ferry.models])
   }
 
   normalize(config: SessionConfig): SessionConfig {
@@ -73,6 +79,10 @@ export class CodexModelSources {
     if (encoded) {
       if (config.modelSource && !sameSource(config.modelSource, encoded.source)) throw new Error('模型与来源不匹配，请重新选择模型')
       return { ...config, modelSource: encoded.source }
+    }
+    if ((!config.modelSource || config.modelSource.kind === 'native') && config.model.startsWith('ferry-')) {
+      const source = { kind: 'third-party' as const, sourceId: 'ferry' }
+      return { ...config, model: codexModelKey(config.model, source), modelSource: source }
     }
     if (config.modelSource) {
       return { ...config, model: codexModelKey(config.model, config.modelSource) }
@@ -89,7 +99,7 @@ export class CodexModelSources {
     const source = normalized.modelSource
     const model = codexWireModel(normalized)
     if (!source || source.kind === 'native') return []
-    if (source.kind === 'third-party') return this.thirdParty.runtimeArgs(model, source)
+    if (source.kind === 'third-party') return source.sourceId === 'ferry' ? this.ferry.runtimeArgs(model!) : this.thirdParty.runtimeArgs(model, source)
     const connection = this.local.connection
     return codexLocalRuntimeArgs(connection!, this.localCatalogFile)
   }
@@ -103,6 +113,10 @@ export class CodexModelSources {
     const source = normalized.modelSource
     const modelId = codexWireModel(normalized)
     if (!source || source.kind === 'native') return
+    if (source.kind === 'third-party' && source.sourceId === 'ferry') {
+      this.ferry.assertReady(modelId!)
+      return
+    }
     if (config.permissionMode === 'approve-for-me') throw new Error('补充模型暂不支持自动审批模型，请选择请求批准或无需批准')
     if (source.kind === 'third-party') {
       this.thirdParty.assertModelReady(modelId, source)
@@ -118,6 +132,7 @@ export class CodexModelSources {
 
   private sourcesFor(model: string): CodexModelSourceRef[] {
     const sources: CodexModelSourceRef[] = this.nativeIds.has(model) ? [{ kind: 'native' }] : []
+    if (this.ferry.models.some(item => parseCodexModelKey(item.id)?.model === model)) sources.push({ kind: 'third-party', sourceId: 'ferry' })
     if (this.local.models.some(item => item.id === model)) {
       sources.push({ kind: 'local', sourceId: 'bonsai' })
     }

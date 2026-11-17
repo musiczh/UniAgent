@@ -71,6 +71,13 @@ export function mergeHydratedEvents(
 
 /** Replace cumulative streaming snapshots without moving their timeline position. */
 export function appendEventSnapshot(events: UAEvent[], event: UAEvent, preserveTimeline = true): number {
+  if (event.payload?.nikaSnapshot && event.payload.id) {
+    const index = events.findLastIndex(prior => prior.payload?.nikaSnapshot && prior.payload.id === event.payload.id && prior.type === event.type)
+    if (index >= 0) {
+      events[index] = { ...event, ...(preserveTimeline ? { seq: events[index].seq, ts: events[index].ts } : {}) }
+      return index
+    }
+  }
   const usageKey = usageSnapshotKey(event)
   if (usageKey !== undefined) {
     const index = events.findLastIndex(prior => usageSnapshotKey(prior) === usageKey)

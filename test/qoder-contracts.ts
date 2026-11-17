@@ -151,6 +151,84 @@ assert.ok(events.some(e => e.type === 'command_exec' && e.state === 'success' &&
 assert.equal(events.some(e => e.type === 'agent_message' && e.payload.text === 'Child result'), false)
 assert.equal(runner.getSubAgentItems('child').find(e => e.type === 'agent_message')?.payload.text, 'Child result')
 assert.ok(events.some(e => e.type === 'subagent' && e.payload.agents[0].status === 'completed'))
+
+// Minimal sanitized 1.1.91 native frames: Agent receipts arrive without task_started,
+// and later notifications use another task_id but the same output file.
+const receiptRunner = new QoderRunner('qoder-native-receipts', { n: 0 })
+const receiptEvents: UAEvent[] = []
+receiptRunner.on('event', event => receiptEvents.push(event))
+const child = (id: string) => receiptEvents.filter(event => event.type === 'subagent').flatMap(event => event.payload.agents).filter(agent => agent.agentThreadId === id).at(-1)
+receiptRunner.acceptMessage({ type: 'system', subtype: 'init', session_id: 'native-parent', model: 'qfmodel' })
+receiptRunner.acceptMessage({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'foreground-call', name: 'Agent', input: {
+  description: 'Read workspace', subagent_type: 'fixture-reader', prompt: 'Read files and return CHILD_CN_OK'
+} }] } })
+receiptRunner.acceptMessage({ type: 'assistant', parent_tool_use_id: 'foreground-call', message: { id: 'early-child', content: [{ type: 'text', text: 'CHILD_CN_OK' }] } })
+const foregroundReceipt = { type: 'user', tool_use_result: { kind: 'agent-result', agentId: 'native-reader', agentType: 'fixture-reader',
+  content: 'CHILD_CN_OK', state: 'completed', terminateReason: 'GOAL', outputPath: '/fixture/reader.output', transcriptPath: '/fixture/reader.jsonl' },
+  message: { content: [{ type: 'tool_result', tool_use_id: 'foreground-call', content: 'CHILD_CN_OK' }] } }
+receiptRunner.acceptMessage(foregroundReceipt)
+assert.equal(child('native-reader')?.nativeHistoryId, 'native-reader', 'foreground completion receipts must expose the actual native child history')
+assert.equal(child('native-reader')?.status, 'completed')
+assert.equal(child('native-reader')?.dispatchId, 'foreground-call')
+assert.equal(child('native-reader')?.parentThreadId, 'native-parent')
+assert.equal(child('native-reader')?.tool, 'fixture-reader')
+assert.equal(child('native-reader')?.name, 'Read workspace')
+assert.equal(child('native-reader')?.prompt, 'Read files and return CHILD_CN_OK')
+assert.equal(receiptRunner.getSubAgentItems('native-reader').find(event => event.type === 'agent_message')?.payload.text, 'CHILD_CN_OK', 'early streamed child frames must migrate from the actual tool-use identity')
+assert.equal(receiptEvents.some(event => event.type === 'agent_message' && event.payload.text === 'CHILD_CN_OK'), false)
+receiptRunner.acceptMessage(foregroundReceipt)
+assert.equal(new Set(receiptEvents.filter(event => event.type === 'subagent').map(event => event.payload.agents[0].agentThreadId)).size, 1, 'replayed receipts cannot create duplicate child cards')
+
+receiptRunner.acceptMessage({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'background-call', name: 'Agent', input: {
+  description: 'Run background reader', subagent_type: 'general-purpose', prompt: 'Read in the child', run_in_background: true
+} }] } })
+receiptRunner.acceptMessage({ type: 'user', tool_use_result: { isAsync: true, status: 'async_launched', agentId: 'native-background',
+  description: 'Run background reader', prompt: 'Read in the child', outputFile: '/fixture/background.output' },
+  message: { content: [{ type: 'tool_result', tool_use_id: 'background-call', content: 'Background agent launched' }] } })
+assert.equal(child('native-background')?.nativeHistoryId, 'native-background')
+assert.equal(child('native-background')?.status, 'running')
+assert.equal(child('native-background')?.endedAt, undefined, 'launch receipts do not prove completion')
+receiptRunner.acceptMessage({ type: 'assistant', parent_tool_use_id: 'background-call', message: { id: 'background-child', content: [{ type: 'text', text: 'child progress' }] } })
+assert.equal(receiptRunner.getSubAgentItems('native-background').find(event => event.type === 'agent_message')?.payload.text, 'child progress')
+receiptRunner.acceptMessage({ type: 'system', subtype: 'task_notification', task_id: 'unrelated-task', output_file: '/fixture/other.output', status: 'completed', summary: 'Run background reader' })
+assert.equal(child('native-background')?.status, 'running', 'an unrelated Task notification cannot complete the Agent')
+receiptRunner.acceptMessage({ type: 'system', subtype: 'task_notification', task_id: 'native-control-task', output_file: '/fixture/background.output', status: 'stopped', summary: 'Run background reader' })
+assert.equal(child('native-background')?.status, 'interrupted', 'the exact native output file associates the stopped notification with its real Agent')
+assert.equal(child('native-control-task'), undefined, 'the different notification identity cannot create a duplicate child')
+receiptRunner.acceptMessage({ type: 'user', tool_use_result: { isAsync: true, status: 'async_launched', agentId: 'native-background', outputFile: '/fixture/background.output' },
+  message: { content: [{ type: 'tool_result', tool_use_id: 'background-call', content: 'Background agent launched' }] } })
+assert.equal(child('native-background')?.status, 'interrupted', 'replaying the launch receipt cannot reopen a stopped child')
+receiptRunner.acceptMessage({ type: 'assistant', parent_tool_use_id: 'background-call', message: { content: [{ type: 'tool_use', id: 'nested-call', name: 'Agent', input: { description: 'Nested reader', subagent_type: 'fixture-reader' } }] } })
+receiptRunner.acceptMessage({ type: 'user', parent_tool_use_id: 'background-call', tool_use_result: { kind: 'agent-result', agentId: 'native-nested', agentType: 'fixture-reader', state: 'completed', content: 'Nested result' },
+  message: { content: [{ type: 'tool_result', tool_use_id: 'nested-call', content: 'Nested result' }] } })
+assert.equal(child('native-nested')?.parentThreadId, 'native-background', 'native parent tool-use metadata preserves nested Agent lineage')
+for (const [state, expected] of [['running', 'running'], ['error', 'errored'], ['cancelled', 'interrupted']] as const) {
+  receiptRunner.acceptMessage({ type: 'assistant', message: { content: [{ type: 'tool_use', id: state + '-call', name: 'Agent', input: { description: state, subagent_type: 'fixture-reader' } }] } })
+  receiptRunner.acceptMessage({ type: 'user', tool_use_result: { kind: 'agent-result', agentId: 'native-' + state, agentType: 'fixture-reader', state, content: state },
+    message: { content: [{ type: 'tool_result', tool_use_id: state + '-call', content: state }] } })
+  assert.equal(child('native-' + state)?.status, expected, 'completion receipts preserve their actual failure or cancellation state')
+}
+for (const state of ['constructor', 'toString', '__proto__', 'unknown']) {
+  const malformedRunner = new QoderRunner('qoder-malformed-' + state, { n: 0 })
+  const malformedEvents: UAEvent[] = []
+  malformedRunner.on('event', event => malformedEvents.push(event))
+  malformedRunner.acceptMessage({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'malformed-call', name: 'Agent', input: { description: 'Reader', subagent_type: 'fixture-reader' } }] } })
+  malformedRunner.acceptMessage({ type: 'user', tool_use_result: { kind: 'agent-result', agentId: 'malformed-child', agentType: 'fixture-reader', state, content: 'Invalid native state' },
+    message: { content: [{ type: 'tool_result', tool_use_id: 'malformed-call', content: 'Invalid native state' }] } })
+  assert.equal(malformedEvents.filter(event => event.type === 'subagent').length, 0, `${state} is not a native Agent state and must not invent a running child or history identity`)
+}
+
+const legacyReceiptRunner = new QoderRunner('qoder-legacy-receipts', { n: 0 })
+const legacyEvents: UAEvent[] = []
+legacyReceiptRunner.on('event', event => legacyEvents.push(event))
+legacyReceiptRunner.acceptMessage({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'foreground-call', name: 'Agent', input: { description: 'Read files', subagent_type: 'fixture-reader' } }] } })
+legacyReceiptRunner.acceptMessage({ type: 'system', subtype: 'task_started', task_id: 'legacy-task', tool_use_id: 'foreground-call', description: 'Read files' })
+legacyReceiptRunner.acceptMessage(foregroundReceipt)
+assert.deepEqual([...new Set(legacyEvents.filter(event => event.type === 'subagent').map(event => event.payload.agents[0].agentThreadId))], ['legacy-task'])
+assert.equal(legacyEvents.filter(event => event.type === 'subagent').at(-1)?.payload.agents[0].nativeHistoryId, 'native-reader')
+const beforeUnknownReceipt = receiptEvents.filter(event => event.type === 'subagent').length
+receiptRunner.acceptMessage({ type: 'user', tool_use_result: foregroundReceipt.tool_use_result, message: { content: [{ type: 'tool_result', tool_use_id: 'unknown-call', content: 'CHILD_CN_OK' }] } })
+assert.equal(receiptEvents.filter(event => event.type === 'subagent').length, beforeUnknownReceipt, 'unassociated receipts cannot invent Agent lineage')
 await assert.rejects(runner.steer(), /严格/)
 const before = 'one\ntwo\n'
 const after = 'one\nthree\n'

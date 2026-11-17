@@ -7,14 +7,15 @@ const result = await renderEventStream([], 'idle', 'router-session-ui', {
     import {mergeSessionEvent} from './src/renderer/App';
     const config={enabled:true,agentId:'deepseek',model:'flash',version:1};
     const agent={id:'deepseek',name:'DeepSeek Harness',adapter:'deepseek',installed:true,models:[{id:'flash',label:'Flash',efforts:[]}],capabilities:{auxiliarySystemPrompt:true,protocol:'web',permissionModes:[]},lifecycle:{availability:'available'}};
-    let current={id:'old-router',title:'RouterAgent',status:'idle',createdAt:1,config:{agentId:'deepseek',model:'flash',managedPurpose:'router',workdir:'/fixture'}},notice,changed=()=>{},onEvent=()=>{},finishCreate,rejectCreate,releaseOld,delayOld=false;
+    const routerChanges=new Set();
+    let current={id:'old-router',title:'RouterAgent',status:'idle',createdAt:1,config:{agentId:'deepseek',model:'flash',managedPurpose:'router',workdir:'/fixture'}},notice,changed=()=>routerChanges.forEach(cb=>cb()),onEvent=()=>{},finishCreate,rejectCreate,releaseOld,delayOld=false;
     const requests=[{requestId:'old-request',routerSessionId:'old-router',prompt:'旧输入',scope:{kind:'global'},config,version:4,state:'bound',delivery:'queued',createdAt:2,updatedAt:2,targetId:'old-task',targetTitle:'旧分配卡',decision:{action:'reuse_task',taskId:'old-task',reason:'旧任务'}}];
     const errors=[],creates=[];
     window.addEventListener('error',e=>errors.push(e.message));window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
     const message=id=>({sessionId:id,seq:0,ts:1,type:'user_message',payload:{text:id==='old-router'?'旧会话内容':'接续后的原始输入'}});
-    window.uniagent=new Proxy({getRouterSnapshot:async()=>({config,available:true,sessionId:current.id,sessionNotice:notice,requests}),openRouter:async()=>({...current}),
-      getEvents:async id=>{if(delayOld&&id==='old-router')return new Promise(resolve=>{releaseOld=()=>resolve([message(id)])});return [message(id)]},
-      onRouterChanged:cb=>{changed=cb;return()=>{}},onEvent:cb=>{onEvent=cb;return()=>{}},getPrefs:async()=>({lastByAgent:{}}),
+    window.uniagent=new Proxy({getRouterReview:async id=>({request:{requestId:id},revision:0,attempts:[],feedbackHistory:[]}),getRouterSnapshot:async()=>({config,available:true,sessionId:current.id,sessionNotice:notice,requests}),openRouter:async()=>({...current}),
+      getEvents:async id=>{if(id==='empty-router')return [];if(delayOld&&id==='old-router')return new Promise(resolve=>{releaseOld=()=>resolve([message(id)])});return [message(id)]},
+      onRouterChanged:cb=>{routerChanges.add(cb);return()=>routerChanges.delete(cb)},onEvent:cb=>{onEvent=cb;return()=>{}},getPrefs:async()=>({lastByAgent:{}}),
       newRouterSession:id=>{creates.push(id);return new Promise((resolve,reject)=>{rejectCreate=reject;finishCreate=()=>{current={...current,id:'new-router',createdAt:100};notice={sessionId:current.id,kind:'manual'};changed();resolve({...current})}})}},
       {get:(target,key)=>key in target?target[key]:String(key).startsWith('on')?()=>()=>{}:async()=>[]});
     const host=document.body.appendChild(document.createElement('div'));host.className='session-view';host.style.height='800px';const root=createRoot(host);
@@ -22,6 +23,7 @@ const result = await renderEventStream([], 'idle', 'router-session-ui', {
     window.sessionFixture={host,creates,errors,delay:()=>{delayOld=true;config.version++;changed()},releaseOld:()=>releaseOld?.(),oldWaiting:()=>!!releaseOld,
       finish:()=>finishCreate(),fail:()=>rejectCreate(new Error('创建失败，原会话保留')),
       automatic:()=>{current={...current,id:'auto-router',status:'running',createdAt:200};notice={sessionId:current.id,kind:'recovery'};changed()},
+      empty:()=>{current={...current,id:'empty-router',status:'idle'};requests.length=0;notice=undefined;changed()},
       stale:()=>onEvent({sessionId:'old-router',seq:0,ts:99,type:'agent_message',payload:{id:'stale',text:'迟到的旧回复'}})};
   `,
   inspect: `(async()=>{
@@ -36,10 +38,14 @@ const result = await renderEventStream([], 'idle', 'router-session-ui', {
     button().click();await tick();f.fail();await wait(()=>f.host.querySelector('[role="alert"]'));
     const failedKeptConversation=f.host.textContent.includes('接续后的原始输入')&&f.host.textContent.includes('原会话保留')&&!button().disabled;
     f.automatic();await wait(()=>f.host.textContent.includes('已自动创建新会话，正在继续处理任务'));
-    return {headerButtons,pending,clicks,isolated,failedKeptConversation,automaticDisabled:button().disabled,errors:f.errors};
+    const automaticDisabled=button().disabled;
+    f.empty();await wait(()=>!button().disabled&&!f.host.querySelector('.turn-timer')&&!f.host.querySelector('.user-msg'));
+    const emptyStatusRowHidden=getComputedStyle(f.host.querySelector('.router-input-actions')).display==='none';
+    return {headerButtons,emptyStatusRowHidden,pending,clicks,isolated,failedKeptConversation,automaticDisabled,errors:f.errors};
   })()`
 })
 assert.deepEqual(result.headerButtons.slice(-3), ['查看会话', '新建会话', '配置'])
+assert.equal(result.emptyStatusRowHidden, true, 'a new conversation without any turn reserves no empty status row')
 assert.equal(result.pending, true)
 assert.equal(result.clicks, 1, 'double-clicks are coalesced before IPC')
 assert.equal(result.isolated, true, 'equal sequence numbers and late old history/events cannot leak into the new conversation')
@@ -53,21 +59,22 @@ const switched = await renderEventStream([], 'idle', 'router-agent-switch-ui', {
     import {RouterPanel} from './src/renderer/components/RouterPanel';
     import {mergeSessionEvent} from './src/renderer/App';
     const agents=['deepseek','codex','claude'].map(id=>({id,name:{deepseek:'DeepSeek Harness',codex:'Codex',claude:'Claude Code'}[id],adapter:id,installed:true,models:[{id:'vision',label:'Vision',efforts:[],imageInput:true}],capabilities:{auxiliarySystemPrompt:true,protocol:'web',permissionModes:[]}}));
-    let current='first', changed=()=>{},event=()=>{},status=()=>{},finishHistory,finishThird,delayed=false,delayThird=false;
+    const routerChanges=new Set();
+    let current='first', changed=()=>routerChanges.forEach(cb=>cb()),event=()=>{},status=()=>{},finishHistory,finishThird,delayed=false,delayThird=false;
     const segments=[{sessionId:'first',agentId:'deepseek'}],errors=[],imageReads=[];
-    const receipt={requestId:'saved-route',routerSessionId:'first',prompt:'切换前的输入',scope:{kind:'global'},config:{},version:1,state:'bound',delivery:'accepted',createdAt:1,updatedAt:1,targetId:'saved-task',targetTitle:'原分配任务',decision:{action:'reuse_task',taskId:'saved-task',reason:'原目标'}};
+    const receipt={requestId:'saved-route',prompt:'切换前的输入',scope:{kind:'global'},config:{},version:1,state:'bound',delivery:'accepted',createdAt:1,updatedAt:1,targetId:'saved-task',targetTitle:'原分配任务',decision:{action:'reuse_task',taskId:'saved-task',reason:'原目标'}};
     const config={enabled:true,agentId:'deepseek',model:'vision',version:1};
-    const histories={first:[{sessionId:'first',seq:0,ts:1,type:'user_message',payload:{text:'切换前的输入',attachments:[{kind:'image',path:'/fixture/before.png',name:'before.png',mimeType:'image/png',dataUrl:'data:image/png;base64,iVBORw0KGgo='}]}}],second:[{sessionId:'second',seq:0,ts:2,type:'user_message',payload:{text:'切换后的输入'}}],third:[]};
+    const histories={first:[{sessionId:'first',seq:0,ts:1,type:'user_message',payload:{text:'切换前的输入',attachments:[{kind:'image',path:'/fixture/before.png',name:'before.png',mimeType:'image/png',dataUrl:'data:image/png;base64,iVBORw0KGgo='}]}},{sessionId:'first',seq:1,ts:2,type:'tool_call',state:'success',payload:{name:'mcp__router__router_assign_task',input:JSON.stringify({requestId:'saved-route',version:1})}}],second:[{sessionId:'second',seq:0,ts:2,type:'user_message',payload:{text:'切换后的输入'}}],third:[]};
     window.addEventListener('error',e=>errors.push(e.message));window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
-    window.uniagent=new Proxy({getRouterSnapshot:async()=>({config:{...config},available:true,sessionId:current,conversationSessions:[...segments],requests:[receipt]}),
+    window.uniagent=new Proxy({getRouterReview:async id=>({request:{requestId:id},revision:0,attempts:[],feedbackHistory:[]}),getRouterSnapshot:async()=>({config:{...config},available:true,sessionId:current,conversationSessions:[...segments],requests:[receipt]}),
       fsReadAttachmentImage:async(id,path)=>{imageReads.push([id,path]);return 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jN8sAAAAASUVORK5CYII='},
       openRouter:async()=>({id:current,title:'RouterAgent',createdAt:1,status:'idle',config:{agentId:config.agentId,model:'vision',workdir:'/fixture',managedPurpose:'router'}}),
       getEvents:async id=>delayThird&&id==='third'?new Promise(resolve=>{finishThird=()=>resolve([])}):delayed&&id==='first'?new Promise(resolve=>{finishHistory=()=>resolve(histories[id])}):histories[id]||[],getPrefs:async()=>({lastByAgent:{}}),
-      onRouterChanged:cb=>{changed=cb;return()=>{}},onEvent:cb=>{event=cb;return()=>{}},onStatusChange:cb=>{status=cb;return()=>{}}},{get:(t,k)=>k in t?t[k]:String(k).startsWith('on')?()=>()=>{}:async()=>[]});
+      onRouterChanged:cb=>{routerChanges.add(cb);return()=>routerChanges.delete(cb)},onEvent:cb=>{event=cb;return()=>{}},onStatusChange:cb=>{status=cb;return()=>{}}},{get:(t,k)=>k in t?t[k]:String(k).startsWith('on')?()=>()=>{}:async()=>[]});
     const host=document.body.appendChild(document.createElement('div'));host.style.height='800px';let root=createRoot(host);
     const render=()=>root.render(React.createElement(RouterPanel,{agents,onOpenTask:()=>{},onSettings:()=>{},mergeEvent:mergeSessionEvent}));render();
     window.switchFixture={host,errors,imageReads,switch:()=>{delayed=true;current='second';config.agentId='codex';config.version++;segments.push({sessionId:current,agentId:'codex',switchedAt:123});changed()},
-      late:()=>event({sessionId:'first',seq:1,ts:3,type:'agent_message',payload:{text:'旧 Agent 的迟到历史',phase:'final_answer'}}),
+      late:()=>event({sessionId:'first',seq:2,ts:3,type:'agent_message',payload:{text:'旧 Agent 的迟到历史',phase:'final_answer'}}),
       restart:()=>{root.unmount();root=createRoot(host);render()},
       race:()=>{delayed=true;config.version++;changed()},waiting:()=>!!finishHistory,
       next:()=>{delayed=false;delayThird=true;current='third';config.agentId='claude';config.version++;segments.push({sessionId:current,agentId:'claude',switchedAt:456});changed()},release:()=>{delayed=false;finishHistory?.()},
@@ -75,7 +82,11 @@ const switched = await renderEventStream([], 'idle', 'router-agent-switch-ui', {
   `,
   inspect: `(async()=>{
     const f=window.switchFixture,tick=()=>new Promise(resolve=>setTimeout(resolve,10)),wait=async check=>{for(let i=0;i<200;i++){if(check())return;await tick()}throw Error('Agent switch UI timeout: '+f.host.textContent+' / '+f.errors)};
-    await wait(()=>f.host.textContent.includes('切换前的输入'));f.switch();await wait(()=>f.waiting());await tick();await tick();
+    await wait(()=>f.host.textContent.includes('切换前的输入'));
+    f.host.querySelector('[aria-label="查看 RouterAgent 会话"]').click();await wait(()=>f.host.querySelector('[data-router-detail] .user-msg'));
+    const legacyDetail=f.host.querySelector('[data-router-detail]').querySelectorAll('.user-msg').length===1&&!f.host.querySelector('[data-router-detail]').textContent.includes('暂无对话记录');
+    f.host.querySelector('[aria-label="返回分配列表"]').click();await wait(()=>!f.host.querySelector('[data-router-detail]'));
+    f.switch();await wait(()=>f.waiting());await tick();await tick();
     const boundaryBeforeOldHistory=f.host.querySelectorAll('.router-agent-switch').length===1;
     const retainedBeforeOldHistory=f.host.textContent.includes('切换前的输入')&&f.host.textContent.includes('原分配任务');
     const currentBeforeOldHistory=f.host.textContent.includes('切换后的输入');f.release();
@@ -94,7 +105,7 @@ const switched = await renderEventStream([], 'idle', 'router-agent-switch-ui', {
     f.restart();await wait(()=>f.host.textContent.includes('切换前的输入')&&f.host.textContent.includes('切换后的输入'));
     const restored=f.host.querySelectorAll('.router-agent-switch').length===1;
     f.race();await wait(()=>f.waiting());f.next();await wait(()=>f.thirdWaiting());f.deliver();f.finishThird();await wait(()=>f.host.querySelectorAll('.router-agent-switch').length===2);f.release();await tick();await tick();
-    return {boundaryBeforeOldHistory,retainedBeforeOldHistory,currentBeforeOldHistory,retained,boundary,imageRetained,receiptRetained,historyScoped,restored,buffered:f.host.textContent.includes('加载期间的新输入'),running:f.host.querySelector('[aria-label="新建 RouterAgent 会话"]').disabled,boundaries:f.host.querySelectorAll('.router-agent-switch').length,errors:f.errors};
+    return {legacyDetail,boundaryBeforeOldHistory,retainedBeforeOldHistory,currentBeforeOldHistory,retained,boundary,imageRetained,receiptRetained,historyScoped,restored,buffered:f.host.textContent.includes('加载期间的新输入'),running:f.host.querySelector('[aria-label="新建 RouterAgent 会话"]').disabled,boundaries:f.host.querySelectorAll('.router-agent-switch').length,errors:f.errors};
   })()`
 })
 assert.equal(switched.retained, true, 'old input, boundary and new input remain in order')
@@ -110,6 +121,7 @@ assert.equal(switched.buffered, true, 'new Session events received while loading
 assert.equal(switched.running, true, 'running status received during history loading remains effective')
 assert.equal(switched.boundaries, 2, 'late history cannot undo a newer switch or duplicate boundaries')
 assert.deepEqual(switched.errors, [])
+assert.equal(switched.legacyDetail, true, 'a legacy assignment call opens its real Session instead of an unbound input preview')
 console.log('PASS Router Agent switch UI: continuous history, scoped late events, retained images, persistent boundaries and reload race')
 
 const entry = await renderEventStream([], 'idle', 'router-entry-ui', {
@@ -125,7 +137,7 @@ const entry = await renderEventStream([], 'idle', 'router-entry-ui', {
     const viewState={current:undefined},errors=[],snapshots=[],histories=[];
     let status=()=>{},currentText='已有 Router 对话';
     window.addEventListener('error',e=>errors.push(e.message));window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
-    window.uniagent=new Proxy({getRouterSnapshot:()=>new Promise((resolve,reject)=>snapshots.push({resolve,reject})),openRouter:async()=>session,
+    window.uniagent=new Proxy({getRouterReview:async id=>({request:{requestId:id},revision:0,attempts:[],feedbackHistory:[]}),getRouterSnapshot:()=>new Promise((resolve,reject)=>snapshots.push({resolve,reject})),openRouter:async()=>session,
       getEvents:()=>new Promise((resolve,reject)=>histories.push(error=>error?reject(error):resolve([{sessionId:session.id,seq:0,ts:1,type:'user_message',payload:{text:currentText}}]))),
       onStatusChange:cb=>{status=cb;return()=>{}},getPrefs:async()=>({lastByAgent:{}})},
       {get:(target,key)=>key in target?target[key]:String(key).startsWith('on')?()=>()=>{}:async()=>[]});
@@ -178,7 +190,7 @@ assert.equal(entry.failed.text.includes('读取 Router 配置失败'), true)
 assert.equal(entry.failedHistory.cards, 0, 'failed history must not fall back to an unrelated cancelled card')
 assert.equal(entry.failedHistory.text.includes('对话恢复失败'), true, 'a failed first history read remains explicit and retryable')
 assert.equal(entry.failedHistory.composer, true, 'history failure does not block the new-task composer')
-assert.equal(entry.retried.cards, 2, 'retry restores the original history and saved receipts')
+assert.equal(entry.retried.cards, 1, 'retry restores the saved receipt without adding an unrelated cancelled request')
 assert.deepEqual(entry.errors, [])
 console.log('PASS Router entry UI: immediate conversation, delayed snapshot/history, cached navigation, background refresh and confirmed disabled/error states')
 
@@ -193,14 +205,15 @@ const hydration = await renderEventStream([], 'idle', 'router-history-hydration-
     const event=(seq,ts,type,payload,state='success')=>({sessionId:session.id,seq,ts,type,payload,state});
     const partial=[event(0,1000,'user_message',{text:'wire input',displayText:'原始路由输入'}),event(1,1100,'turn_started',{turnId:'1'}),event(2,3000,'reasoning',{id:'thinking',turnId:'1',text:'准备读取路由协议'},'running')];
     const request={requestId:'saved-request',routerSessionId:session.id,prompt:'原始路由输入',scope:{kind:'global'},config,version:4,state:'bound',delivery:'running',createdAt:1000,updatedAt:65000,targetId:'saved-task',targetTitle:'已分配目标',decision:{action:'reuse_task',taskId:'saved-task',reason:'继续原任务'}};
-    const full=[...partial.slice(0,2),event(3,4000,'reasoning',{id:'thinking',turnId:'1',text:'已读取路由协议'}),event(4,5000,'tool_call',{id:'query',name:'router_query',turnId:'1',input:{mode:'bootstrap'}}),event(5,64000,'tool_call',{id:'assign',name:'router_assign_task',turnId:'1',input:{requestId:request.requestId}}),event(6,65000,'agent_message',{id:'reply',text:'分配完成，目标任务已收到输入',phase:'final_answer',turnId:'1'}),event(7,66000,'turn_completed',{turnId:'1'})];
+    const full=[...partial.slice(0,2),event(3,4000,'reasoning',{id:'thinking',turnId:'1',text:'已读取路由协议'}),event(4,5000,'tool_call',{id:'query',name:'router_query',turnId:'1',input:{mode:'catalog',kind:'space'}}),event(5,64000,'tool_call',{id:'assign',name:'router_assign_task',turnId:'1',input:{requestId:request.requestId}}),event(6,65000,'agent_message',{id:'reply',text:'分配完成，目标任务已收到输入',phase:'final_answer',turnId:'1'}),event(7,66000,'turn_completed',{turnId:'1'})];
     const historical=events=>events.map(row=>({...row,sessionId:'previous-router',payload:row.payload.id==='assign'?{...row.payload,input:{requestId:'previous-request'}}:row.payload}));
     const segments=[{sessionId:'previous-router',agentId:'deepseek'},{sessionId:session.id,agentId:'deepseek',switchedAt:1}];
     const snapshot=()=>({config:{...config},available:true,sessionId:session.id,conversationSessions:segments,requests:[request,{...request,requestId:'previous-request',routerSessionId:'previous-router'}]});
     const viewState={current:{snapshot:snapshot(),session,events:partial,history:{'previous-router':historical(partial)},segments}};
-    const errors=[],loads=[];let changed=()=>{},pushEvent=()=>{},root;
+    const routerChanges=new Set();
+    const errors=[],loads=[];let changed=()=>routerChanges.forEach(cb=>cb()),pushEvent=()=>{},root;
     window.addEventListener('error',e=>errors.push(e.message));window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
-    window.uniagent=new Proxy({getRouterSnapshot:async()=>snapshot(),openRouter:async()=>session,getEvents:id=>new Promise(resolve=>loads.push({id,resolve})),getTurnArtifactSummary:async()=>null,getPrefs:async()=>({lastByAgent:{}}),onRouterChanged:cb=>{changed=cb;return()=>{}},onEvent:cb=>{pushEvent=cb;return()=>{}}},
+    window.uniagent=new Proxy({getRouterReview:async id=>({request:{requestId:id},revision:0,attempts:[],feedbackHistory:[]}),getRouterSnapshot:async()=>snapshot(),openRouter:async()=>session,getEvents:id=>new Promise(resolve=>loads.push({id,resolve})),getTurnArtifactSummary:async()=>null,getPrefs:async()=>({lastByAgent:{}}),onRouterChanged:cb=>{routerChanges.add(cb);return()=>routerChanges.delete(cb)},onEvent:cb=>{pushEvent=cb;return()=>{}}},
       {get:(target,key)=>key in target?target[key]:String(key).startsWith('on')?()=>()=>{}:async()=>[]});
     const host=document.body.appendChild(document.createElement('div'));
     const mount=()=>{root=createRoot(host);flushSync(()=>root.render(React.createElement(RouterPanel,{agents,viewState,onOpenTask:()=>{},onSettings:()=>{},mergeEvent:mergeSessionEvent})))};
@@ -250,7 +263,7 @@ const partialFailure = await renderEventStream([], 'idle', 'router-history-parti
     const event=(id,text)=>({sessionId:id,seq:0,ts:10,type:'user_message',payload:{text}});
     const request=id=>({requestId:id,routerSessionId:id,prompt:id,scope:{kind:'global'},config,version:1,state:'bound',delivery:'finished',createdAt:1,updatedAt:2,targetId:'task-'+id,targetTitle:id+'分配结果',decision:{action:'reuse_task',reason:'原任务'}});
     let finishSlow;
-    window.uniagent=new Proxy({getRouterSnapshot:async()=>({config,available:true,sessionId:session.id,conversationSessions:['slow','broken','current'].map(sessionId=>({sessionId,agentId:'codex'})),requests:['slow','broken','current'].map(request)}),
+    window.uniagent=new Proxy({getRouterReview:async id=>({request:{requestId:id},revision:0,attempts:[],feedbackHistory:[]}),getRouterSnapshot:async()=>({config,available:true,sessionId:session.id,conversationSessions:['slow','broken','current'].map(sessionId=>({sessionId,agentId:'codex'})),requests:['slow','broken','current'].map(request)}),
       openRouter:async()=>session,getEvents:id=>id==='slow'?new Promise(resolve=>{finishSlow=()=>resolve([event(id,'慢历史原输入')])}):id==='broken'?Promise.reject(Error('旧会话历史损坏')):Promise.resolve([event(id,'当前会话原输入')]),getPrefs:async()=>({lastByAgent:{}})},
       {get:(target,key)=>key in target?target[key]:String(key).startsWith('on')?()=>()=>{}:async()=>[]});
     const host=document.body.appendChild(document.createElement('div'));

@@ -1,8 +1,6 @@
 import type { RouterScope } from '../../src/shared/router'
 
 export async function readRouterTarget(call: (name: string, args: unknown) => Promise<any>, requestId: string, selectedScope: RouterScope, taskId?: string) {
-  const bootstrap = await call('router_query', { requestId, mode: 'bootstrap' })
-  if (!bootstrap.ok) throw new Error(bootstrap.error)
   const directory = new Map<string, any>()
   for (const kind of ['space', 'requirement']) {
     let cursor: string | undefined

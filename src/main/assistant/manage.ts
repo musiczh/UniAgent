@@ -64,6 +64,7 @@ const operations: Record<ManageResource, { query: Record<string, Spec>; execute:
 }
 
 export interface ManagementDeps {
+  modelSources?: import('../settingsService').SettingsServiceDeps['modelSources']
   saveRouter?: import('../settingsService').SettingsServiceDeps['saveRouter']
   recoveryErrors?: import('../settingsService').SettingsServiceDeps['recoveryErrors']
   appRestart?: Pick<AppRestartService, 'request' | 'status' | 'cancel' | 'reconsider'>

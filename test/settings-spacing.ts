@@ -12,6 +12,7 @@ const result = await renderEventStream([], 'idle', 'settings-spacing', {
     import './src/renderer/components/teams.css';
     const noop = () => {};
     const sources = {phase:'stopped', enabled:false, sources:[], quotaRefreshing:false};
+    const modelSources = {revision:'layout-sources',sources:[],bindings:[],statuses:[],gateway:'stopped',quotas:{}};
     const role = {id:'layout-role',name:'布局角色',agentId:'codex',permissionMode:'ask'};
     let prefs = {lastByAgent:{}};
     const api = {
@@ -22,6 +23,8 @@ const result = await renderEventStream([], 'idle', 'settings-spacing', {
       listDiagnostics:async()=>[], listPresets:async()=>[], listProjects:async()=>[],
       listRoles:async()=>[], listRequirements:async()=>[], listModelCredentials:async()=>[],
       listAutomations:async()=>[], listAgents:async()=>agents,
+      getLifecycleSnapshot:async()=>agents,
+      getModelSources:async()=>modelSources, refreshModelSourceQuotas:async()=>modelSources,
       getPrefs:async()=>prefs,
       setPrefs:async(id,patch)=>(prefs={lastByAgent:{...prefs.lastByAgent,[id]:{...prefs.lastByAgent[id],...patch}}}),
       getAppVersion:async()=>'1.0.9',
@@ -284,7 +287,7 @@ const result = await renderEventStream([], 'idle', 'settings-spacing', {
       if (regular) paddings.push({label,left:parseFloat(style.paddingLeft),right:parseFloat(style.paddingRight)});
       const page = [...content.children].find(element=>element.matches('.set-page:not([hidden])'));
       if (!page) throw new Error(label+': missing active settings page');
-      const items = [...page.querySelectorAll('.set-group,.codex-model-pane,.deepseek-setup,.set-detail-bar,.update-alert,.assistant-save,.role-detail-top,.team-page,.auto-config,.auto-config-scroll,.auto-config-savebar')]
+      const items = [...page.querySelectorAll('.set-group,.model-source-settings,.deepseek-setup,.set-detail-bar,.update-alert,.assistant-save,.role-detail-top,.team-page,.auto-config,.auto-config-scroll,.auto-config-savebar')]
         .filter(element=>element.getClientRects().length);
       if (!items.length) throw new Error(label+': missing rendered settings items');
       for (const item of items) {
@@ -342,7 +345,7 @@ const result = await renderEventStream([], 'idle', 'settings-spacing', {
       ['agent','button[aria-label="查看 Codex 详情"]','','.set-detail-top'],
       ['agent','button[aria-label="查看 DeepSeek Harness 详情"]','','.set-detail-top'],
       ['assistants','button[role="tab"]','session飞书管理','.assistant-bind-form'],
-      ['codex-sources','button[role="tab"]','Codex','.set-detail-bar'],
+      ['codex-sources','button','＋ 添加数据源','.model-source-form .set-detail-bar'],
       ['roles','button','添加角色','.role-detail-top'],
       ['teams','button','创建团队','.team-form']
     ]) {

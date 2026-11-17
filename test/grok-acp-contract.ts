@@ -18,6 +18,7 @@ import { buildTextPromptBlocks } from '../src/main/acp/acpPromptBlocks.ts'
 import { normalizeQuestions, encodeAnswer } from '../src/shared/questions.ts'
 import { normalizeGrokSubagentNotification } from '../src/shared/subAgentLifecycle.ts'
 import { configureRequirementRuntime, requirementCaller, requirementMcpEnv, setRequirementsEnabled } from '../src/main/requirementRuntime'
+import { stripAssistantContext, configureAssistantContextRuntime } from '../src/main/assistant/context'
 import type { AgentDef, Session } from '../src/shared/types.ts'
 
 // Break caught: Grok cannot be registered as a first-class adapter.
@@ -369,9 +370,14 @@ async function waitFor(
 // frames differently from the existing UniAgent session contract.
 const runnerFake = await createRunnerFake()
 setRequirementsEnabled(true)
+let requirementReads = 0
 configureRequirementRuntime(id => ['local-grok', 'local-resumed'].includes(id)
   ? { id, config: { agentId: 'grok', workdir: runnerFake.dir, requirementId: 'grok-requirement' } } as Session
-  : undefined)
+  : undefined, async (_id, request) => {
+    assert.equal(request.action, 'bootstrap')
+    requirementReads++
+    return { requirement: { name: 'Grok requirement' }, overview: { goal: 'Keep existing login state' }, readingStatus: 'ready', revision: 'dynamic-revision', tasks: [{ text: 'Dynamic task facts' }] }
+  })
 try {
   const runnerAgent: AgentDef = {
     ...grokAgent,
@@ -399,6 +405,7 @@ try {
   runner.on('contract', (contract) => contracts.push(structuredClone(contract)))
   runner.on('nativeSession', ({ nativeSessionId }) => nativeIds.push(nativeSessionId))
   await runner.startTurn('stream')
+  assert.equal(requirementReads, 1, 'new native initialization reads the short requirement overview once')
   const firstSessionRequest = (await readFile(runnerFake.logPath, 'utf8'))
     .split('\n')
     .filter(Boolean)
@@ -431,20 +438,34 @@ try {
     'ask',
     'full-access'
   ])
+  await runner.startTurn('stream')
+  const followupPrompt = (await readFile(runnerFake.logPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+    .filter(row => row.kind === 'inbound' && row.frame?.method === 'session/prompt').at(-1).frame.params.prompt
+  assert.deepEqual(followupPrompt, [{ type: 'text', text: 'stream' }], 'the followup keeps raw input without repeated fixed rules, requirement facts or channel markers')
+  assert.equal(requirementReads, 1)
   runner.dispose()
 
   // Break caught: Grok edit tools render as opaque generic calls instead of
   // the same file-change card used by the existing adapters.
   const editEvents: any[] = []
+  const editSession: Session = { id: 'local-edit', title: 'Edit', status: 'idle', createdAt: 1,
+    config: { agentId: 'grok', model: 'grok-4.6', effort: 'high', permissionMode: 'ask', workdir: runnerFake.dir } }
+  configureAssistantContextRuntime(id => id === editSession.id ? editSession : undefined, () => {})
   const edit = new GrokACPRunner(
     'local-edit',
     { n: 0 },
     runnerAgent,
-    { agentId: 'grok', model: 'grok-4.6', effort: 'high', permissionMode: 'ask', workdir: runnerFake.dir }
+    editSession.config
   )
   edit.on('event', (event) => editEvents.push(event))
+  edit.on('nativeSession', value => { editSession.nativeSessionId = value.nativeSessionId })
   await edit.startTurn('edit')
+  const firstEditRequest = (await readFile(runnerFake.logPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+    .find(row => row.kind === 'inbound' && row.frame?.method === 'session/prompt' && row.frame.params.sessionId === editSession.nativeSessionId)
+  assert.match(firstEditRequest.frame.params.prompt[0].text, /^<uniagent_initial_context>/, 'a newly created native session still receives first-business-input initialization')
+  assert.equal(editSession.promptContext?.fallback, 'accepted')
   edit.dispose()
+  configureAssistantContextRuntime(() => undefined, () => {})
   assert.deepEqual(
     editEvents.find((event) => event.type === 'file_change')?.payload.changes,
     [{
@@ -519,7 +540,7 @@ try {
       const record = JSON.parse(line)
       return record.kind === 'inbound' &&
         record.frame?.method === 'session/prompt' &&
-        record.frame?.params?.prompt?.some((block: any) => block.type === 'text' && block.text === 'wait')
+        record.frame?.params?.prompt?.some((block: any) => block.type === 'text' && stripAssistantContext(block.text) === 'wait')
     }),
     'blocking prompt'
   )
@@ -680,13 +701,17 @@ try {
   assert.equal(loaded.cwd, runnerFake.dir)
   assert.equal(loaded.model, 'grok-4.6')
   const nativeUserText = runnerRecords.find(record => record.kind === 'inbound' && record.frame?.method === 'session/prompt').frame.params.prompt[0].text
-  assert.ok(nativeUserText.includes('本会话关联需求共享上下文') && nativeUserText.endsWith('stream'))
+  assert.match(nativeUserText, /^<uniagent_initial_context>\n[\s\S]*<\/uniagent_initial_context>\n\n<uniagent_channel_context>\n当前消息通道：UniAgent App\n<\/uniagent_channel_context>\n\nstream$/)
+  assert.ok(nativeUserText.includes('关联需求时用 requirement_context：'))
+  assert.ok(nativeUserText.includes('"requirement":{"id":"grok-requirement","name":"Grok requirement","overview":{"goal":"Keep existing login state"},"readingStatus":"ready"}'))
+  assert.doesNotMatch(nativeUserText, /dynamic-revision|Dynamic task facts/)
   assert.ok(loaded.events.some((event) => event.type === 'user_message' && event.payload.text === nativeUserText), 'native history preserves the complete submitted requirement context and user input')
   assert.ok(loaded.events.some((event) => event.type === 'reasoning' && event.payload.text === 'Inspecting'))
   assert.ok(loaded.events.some((event) => event.type === 'agent_message' && event.payload.text === 'Grok reply'))
   await deleteGrokSession('grok-session-1', runnerFake.bin, runnerFake.dir)
   assert.equal((await listGrokSessions(runnerFake.bin, runnerFake.dir)).some((entry) => entry.id === 'grok-session-1'), true, 'undeclared native delete preserves native history')
 } finally {
+  configureAssistantContextRuntime(() => undefined, () => {})
   configureRequirementRuntime(() => undefined)
   setRequirementsEnabled(false)
   await runnerFake.cleanup()

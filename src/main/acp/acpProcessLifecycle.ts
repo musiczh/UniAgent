@@ -258,7 +258,13 @@ function validRecord(value: ProcessRecord): boolean {
 }
 
 async function checkedIdentity(expected: ProcessIdentity): Promise<ProcessIdentity | undefined> {
-  const inspected = await inspectACPProcess(expected.pid)
+  let inspected = await inspectACPProcess(expected.pid)
+  if (!inspected.ok) {
+    const error = inspected.error as { code?: unknown; killed?: boolean; signal?: unknown }
+    if (error?.killed === true && error.code === null && error.signal === 'SIGTERM') {
+      inspected = await inspectACPProcess(expected.pid)
+    }
+  }
   if (!inspected.ok) {
     const error = inspected.error as NodeJS.ErrnoException & { killed?: boolean }
     const code = typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,39}$/.test(error.code) ? error.code : error?.killed ? 'TIMEOUT' : 'UNKNOWN'

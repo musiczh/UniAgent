@@ -16,6 +16,7 @@ export interface SettingsServiceDeps {
   agents(): AgentDef[]
   saveRouter?(config: RouterConfig, expectedVersion: number): Promise<unknown>
   recoveryErrors?(): unknown[] | Promise<unknown[]>
+  modelSources?: { read(): Promise<Record<string, unknown>>; update(changes: Record<string, unknown>, expectedRevision: string): Promise<unknown> }
 }
 type Values = Record<string, unknown>
 function record(value: unknown): Values {
@@ -45,6 +46,7 @@ function sectionValues(section: SettingsSection, source: Values): Values {
 export class SettingsService {
   constructor(private deps: SettingsServiceDeps) {}
   private async source(section: SettingsSection): Promise<Values> {
+    if (section.store === 'model-sources') { if (!this.deps.modelSources) throw new Error('模型数据源服务不可用'); return this.deps.modelSources.read() }
     return section.store === 'app' ? this.deps.appSettings() as unknown as Values : (await this.deps.assistant()).assistant as unknown as Values
   }
   private options(schema: SettingSchema, section: SettingsSection, values: Values, recoveryErrors?: unknown[]): unknown[] | undefined {
@@ -114,7 +116,10 @@ export class SettingsService {
     const changes = record(wrapped)
     validateSettingsFields(section.fields,changes,section.path)
     // No await between reading the authoritative values and applying the patch.
-    if (section.store === 'app') {
+    if (section.store === 'model-sources') {
+      if (!this.deps.modelSources || typeof expectedRevision !== 'string') throw new Error('模型数据源服务不可用')
+      await this.deps.modelSources.update(changes, expectedRevision)
+    } else if (section.store === 'app') {
       const current = this.deps.appSettings(), values = sectionValues(section,current as unknown as Values)
       if (typeof expectedRevision !== 'string' || manageRevision(values) !== expectedRevision) throw new Error('revision_conflict: 请重新读取设置')
       const next = mergeSettingValue(values,changes) as Values

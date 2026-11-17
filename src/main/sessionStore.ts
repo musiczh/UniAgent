@@ -32,6 +32,7 @@ import { resolveUserDataHome } from './userData.ts'
 import { PERMISSION_MODE_IDS } from '../shared/types'
 import { parseAgentRole } from './roleStore.ts'
 import { parseSessionWorktree } from './worktreeService.ts'
+import { parseSessionPromptContext } from '../shared/promptContext'
 import { parseNativeThreadAction } from '../shared/nativeCapabilities'
 import { sanitizeZCodeSelection, sanitizeZCodeState } from './zcode/store'
 
@@ -233,6 +234,8 @@ function serializeSession(s: Session): Record<string, unknown> {
     createdAt: s.createdAt,
     updatedAt: s.updatedAt,
     nativeSessionId: s.nativeSessionId,
+    ...(s.promptContext ? { promptContext: s.promptContext } : {}),
+    ...(s.initialRequirementContext ? { initialRequirementContext: s.initialRequirementContext } : {}),
     ...(zcodeState ? { zcodeState } : {}),
     ...(s.zcodeStateInvalid ? { zcodeStateInvalid: true as const } : {}),
     ...(s.pendingClaudeFork ? { pendingClaudeFork: s.pendingClaudeFork } : {}),
@@ -471,6 +474,8 @@ function parseSessionRow(
     createdAt: createdAt as number,
     ...(updatedAt === undefined ? {} : { updatedAt }),
     ...(nativeSessionId === undefined ? {} : { nativeSessionId }),
+    ...(parseSessionPromptContext(value.promptContext) ? { promptContext: parseSessionPromptContext(value.promptContext) } : {}),
+    ...(typeof value.initialRequirementContext === 'string' ? { initialRequirementContext: value.initialRequirementContext } : {}),
     ...(zcodeState ? { zcodeState } : {}),
     ...(zcodeStateInvalid ? { zcodeStateInvalid: true as const } : {}),
     ...(pendingClaudeFork ? { pendingClaudeFork } : {}),

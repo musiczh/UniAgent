@@ -9,7 +9,7 @@ export function testClaudeConnection(connection: ClaudeConnection, timeoutMs = 2
     const body = JSON.stringify({ model: connection.model, max_tokens: 16, messages: [{ role: 'user', content: 'Reply OK.' }] })
     const request = (url.protocol === 'https:' ? httpsRequest : httpRequest)(url, { method: 'POST', headers: {
       'content-type': 'application/json', 'anthropic-version': '2023-06-01', 'content-length': Buffer.byteLength(body),
-      ...(claudeSourceUsesAuthToken(connection.preset) ? { authorization: `Bearer ${connection.apiKey}` } : { 'x-api-key': connection.apiKey })
+      ...((connection.authToken ?? (connection.preset === 'custom' ? true : claudeSourceUsesAuthToken(connection.preset))) ? { authorization: `Bearer ${connection.apiKey}` } : { 'x-api-key': connection.apiKey })
     } }, response => {
       let size = 0
       const chunks: Buffer[] = []

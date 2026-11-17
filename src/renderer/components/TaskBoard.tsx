@@ -13,21 +13,21 @@ import './workspaceBrowser.css'
 import './taskBoard.css'
 import { useLayoutMotion } from '../conversationMotion'
 
-export function TaskBoard({ projects, requirements, agents, unreadBySession, onOpenTask, onOpenRouter, onDeleteTask, onCreate }: {
-  projects: Project[]; requirements: Requirement[]; agents?: AgentDef[]; unreadBySession?: Record<string, unknown>; onOpenTask: (id: string) => void | Promise<void>; onOpenRouter?: (requestId: string) => void | Promise<void>; onDeleteTask: (id: string) => Promise<void>; onCreate: () => void
+export function TaskBoard({ projects, requirements, agents, attentionBySession, unreadBySession, onOpenTask, onOpenRouter, onOpenRequirement, onDeleteTask, onCreate }: {
+  projects: Project[]; requirements: Requirement[]; agents?: AgentDef[]; attentionBySession?: Record<string, string>; unreadBySession?: Record<string, unknown>; onOpenTask: (id: string) => void | Promise<void>; onOpenRouter?: (requestId: string) => void | Promise<void>; onOpenRequirement?: (id: string) => void; onDeleteTask: (id: string) => Promise<void>; onCreate: () => void
 }): JSX.Element {
   return <section className="task-board" aria-label="任务看板">
     <div className="main-panel-head settings-head"><span className="main-panel-title">任务看板</span></div>
     <div className="task-board-content"><div className="scope-heading"><div><h1>任务看板</h1><p>先处理问题，再决定任务如何推进</p></div><button className="scope-button primary" onClick={onCreate}><UiIcon name="plus" size={14}/>新建任务</button></div>
-      <TaskBoardWorkspace projects={projects} requirements={requirements} agents={agents} unreadBySession={unreadBySession} onOpenTask={onOpenTask} onOpenRouter={onOpenRouter} onDeleteTask={onDeleteTask}/>
+      <TaskBoardWorkspace projects={projects} requirements={requirements} agents={agents} attentionBySession={attentionBySession} unreadBySession={unreadBySession} onOpenTask={onOpenTask} onOpenRouter={onOpenRouter} onOpenRequirement={onOpenRequirement} onDeleteTask={onDeleteTask}/>
     </div>
   </section>
 }
 
-type BoardScope = { key: string; kind: 'space' | 'requirement' | 'router'; name: string }
+type BoardScope = { key: string; kind: 'space' | 'requirement' | 'router'; name: string; id?: string }
 
-export function TaskBoardWorkspace({ projects, requirements, agents = [], unreadBySession = {}, onOpenTask, onOpenRouter, onDeleteTask, requirementId }: {
-  projects: Project[]; requirements: Requirement[]; agents?: AgentDef[]; unreadBySession?: Record<string, unknown>; onOpenTask: (id: string) => void | Promise<void>; onOpenRouter?: (requestId: string) => void | Promise<void>; onDeleteTask: (id: string) => Promise<void>; requirementId?: string
+export function TaskBoardWorkspace({ projects, requirements, agents = [], attentionBySession = {}, unreadBySession = {}, onOpenTask, onOpenRouter, onOpenRequirement, onDeleteTask, requirementId }: {
+  projects: Project[]; requirements: Requirement[]; agents?: AgentDef[]; attentionBySession?: Record<string, string>; unreadBySession?: Record<string, unknown>; onOpenTask: (id: string) => void | Promise<void>; onOpenRouter?: (requestId: string) => void | Promise<void>; onOpenRequirement?: (id: string) => void; onDeleteTask: (id: string) => Promise<void>; requirementId?: string
 }): JSX.Element {
   const key = 'ua.taskBoard.' + (requirementId || 'all')
   const deletion = useSessionDeletions()
@@ -108,10 +108,14 @@ export function TaskBoardWorkspace({ projects, requirements, agents = [], unread
     } catch (reason) { setOpenError(String(reason)) }
     finally { actionLocks.current.delete(entry.id); setPendingActions(new Set(actionLocks.current)); refresh() }
   }
-  const scopeFor = (entry: TaskBoardEntry): BoardScope => entry.requirementId
-    ? { key: 'requirement:' + entry.requirementId, kind: 'requirement', name: requirements.find(item => item.id === entry.requirementId)?.name || '原需求' }
-    : entry.routerRequestId && !entry.projectId ? { key: 'router', kind: 'router', name: '自动归属' }
-    : { key: 'space:' + (entry.projectId || 'default'), kind: 'space', name: projects.find(item => item.id === entry.projectId || !entry.projectId && item.isDefault)?.name || '原项目' }
+  const scopeFor = (entry: TaskBoardEntry): BoardScope => {
+    if (entry.requirementId) {
+      const requirement = requirements.find(item => item.id === entry.requirementId)
+      return { key: 'requirement:' + entry.requirementId, kind: 'requirement', name: requirement?.name || '原需求', id: requirement?.id }
+    }
+    return entry.routerRequestId && !entry.projectId ? { key: 'router', kind: 'router', name: '自动归属' }
+      : { key: 'space:' + (entry.projectId || 'default'), kind: 'space', name: projects.find(item => item.id === entry.projectId || !entry.projectId && item.isDefault)?.name || '原项目' }
+  }
   const card = (entry: TaskBoardEntry) => {
     const agent = agents.find(agent => agent.id === entry.agentId)
     const deciding = entry.column === 'decision', pending = pendingActions.has(entry.id)
@@ -120,11 +124,13 @@ export function TaskBoardWorkspace({ projects, requirements, agents = [], unread
     const unreadKind = unreadBySession[entry.id]
     const unread = entry.column !== 'archived' && (unreadKind === 'main' || unreadKind === 'side') ? unreadKind : undefined
     const unreadLabel = unread === 'side' ? '侧边对话有新回复' : '有新回复'
+    const attention = entry.column !== 'archived' && attentionBySession[entry.id]
+    const attentionLabel = attention ? `${attention}\n${entry.attentionDetail || entry.status}` : ''
     const actions: Array<'pause' | 'standby' | 'archive' | 'delete'> = entry.readOnly ? [] : entry.column === 'active' ? entry.canPause ? ['pause'] : [] : deciding ? ['standby', 'archive'] : entry.column === 'standby' ? ['archive'] : []
     if (entry.canDelete) actions.push('delete')
     return <article key={entry.id} className={`task-board-card ${entry.priority}`} data-task-id={entry.id} data-card-column={entry.column} data-motion-key={`task:${entry.id}`}>
       <button type="button" className="task-board-card-open" disabled={opening} title={routing ? '打开 RouterAgent' : undefined} onClick={() => { void openTask(entry.routerRequestId || entry.id, routing) }}>
-        <div className="task-board-card-heading"><span className="task-board-agent">{routing ? <UiIcon name="router" size={15}/> : entry.teamTask ? <UiIcon name="users" size={15}/> : <AgentIcon agentId={entry.agentId} adapter={agent?.adapter}/>}</span><strong>{entry.title}</strong><span className="task-board-card-status">{(running || routing) && <span className={`task-board-indicator${deciding || routing && !running ? ' decision' : ''}`} title={entry.status + (entry.decisionCount > 1 ? ` · ${entry.decisionCount} 项` : '')} role="img" aria-label={entry.status}>{running ? <span className="si-spinner"/> : <UiIcon name={entry.status === '待确认' ? 'question' : 'alert-circle'} size={13}/>}</span>}{routing && <span className="task-board-routing-label">{entry.status}</span>}{unread && <span className="task-board-unread" role="img" aria-label={unreadLabel} title={unreadLabel}/>}</span></div>
+        <div className="task-board-card-heading"><span className="task-board-agent">{routing ? <UiIcon name="router" size={15}/> : entry.teamTask ? <UiIcon name="users" size={15}/> : <AgentIcon agentId={entry.agentId} adapter={agent?.adapter}/>}</span><strong>{entry.title}</strong><span className="task-board-card-status">{(running || routing) && <span className={`task-board-indicator${deciding || routing && !running ? ' decision' : ''}`} title={entry.status + (entry.decisionCount > 1 ? ` · ${entry.decisionCount} 项` : '')} role="img" aria-label={entry.status}>{running ? <span className="si-spinner"/> : <UiIcon name={entry.status === '待确认' ? 'question' : 'alert-circle'} size={13}/>}</span>}{routing && <span className="task-board-routing-label">{entry.status}</span>}{attention && <span className="task-board-attention" role="img" aria-label={attentionLabel} title={attentionLabel}><UiIcon name="alert-circle" size={13}/></span>}{unread && <span className="task-board-unread" role="img" aria-label={unreadLabel} title={unreadLabel}/>}</span></div>
         {entry.description && <p className="task-board-card-description" title={entry.description}>{entry.description}</p>}
       </button>
       {entry.worktree && <WorktreeStatusBadge key={`${entry.id}:${entry.worktree.id}`} sessionId={entry.id} worktree={entry.worktree} compact/>}
@@ -145,11 +151,11 @@ export function TaskBoardWorkspace({ projects, requirements, agents = [], unread
     {(error || openError || deletion.error) && <div className="task-board-error" role="alert">{openError || deletion.error || '更新暂时中断，保留最近已知状态。'}{data && <span>最近更新 {new Date(data.updatedAt).toLocaleTimeString()}</span>}<button className="scope-link" onClick={() => { setOpenError(''); clearSessionDeletionError(); refresh() }}>重试</button></div>}
     {!data && !error && <p className="scope-muted" role="status">正在读取任务状态…</p>}
     <TaskFocusQueue entries={(data?.focus || []).filter(entry => !deletion.hiddenIds.has(entry.id))} onRefresh={refresh} onOpenTask={openTask}/>
-    <div className={`task-board-columns${archiveWidth ? ' archive-expanded' : ''}`}>{(Object.entries(TASK_BOARD_COLUMNS) as Array<[TaskBoardColumn, string]>).map(([id, title]) => <BoardColumn key={id} id={id} scrollKey={key + '.scroll.' + id} title={title} page={visiblePage(id)} loading={loading} render={card} scopeFor={requirementId ? undefined : scopeFor} onPage={page => changePage(id, page)} collapsed={id === 'archived' && !archiveWidth} onToggleWidth={() => { const next = !archiveWidth; saveBrowserValue(key + '.archiveWidth', next); setArchiveWidth(next) }}/>)}</div>
+    <div className={`task-board-columns${archiveWidth ? ' archive-expanded' : ''}`}>{(Object.entries(TASK_BOARD_COLUMNS) as Array<[TaskBoardColumn, string]>).map(([id, title]) => <BoardColumn key={id} id={id} scrollKey={key + '.scroll.' + id} title={title} page={visiblePage(id)} loading={loading} render={card} scopeFor={requirementId ? undefined : scopeFor} onOpenRequirement={onOpenRequirement} onPage={page => changePage(id, page)} collapsed={id === 'archived' && !archiveWidth} onToggleWidth={() => { const next = !archiveWidth; saveBrowserValue(key + '.archiveWidth', next); setArchiveWidth(next) }}/>)}</div>
   </div>
 }
 
-function BoardColumn({ id, scrollKey, title, page, loading, render, scopeFor, onPage, collapsed, onToggleWidth }: { id: TaskBoardColumn; scrollKey: string; title: string; page?: TaskBoardPage; loading: boolean; render: (entry: TaskBoardEntry) => JSX.Element; scopeFor?: (entry: TaskBoardEntry) => BoardScope; onPage: (page: number) => void; collapsed: boolean; onToggleWidth: () => void }): JSX.Element {
+function BoardColumn({ id, scrollKey, title, page, loading, render, scopeFor, onOpenRequirement, onPage, collapsed, onToggleWidth }: { id: TaskBoardColumn; scrollKey: string; title: string; page?: TaskBoardPage; loading: boolean; render: (entry: TaskBoardEntry) => JSX.Element; scopeFor?: (entry: TaskBoardEntry) => BoardScope; onOpenRequirement?: (id: string) => void; onPage: (page: number) => void; collapsed: boolean; onToggleWidth: () => void }): JSX.Element {
   const scroll = useRef<HTMLDivElement>(null)
   useLayoutEffect(() => {
     if (!scroll.current || !page) return
@@ -166,7 +172,13 @@ function BoardColumn({ id, scrollKey, title, page, loading, render, scopeFor, on
     {collapsed ? <button type="button" className="archive-rail" data-motion-key={`column:${id}`} aria-label="展开已归档列" aria-expanded={false} onClick={onToggleWidth}><UiIcon name="chevron-left" size={15}/><UiIcon name="archive" size={15}/><strong>{title}</strong><span>{page?.total ?? 0}</span></button> : <>
       <header data-motion-key={`column:${id}`}><h2>{title}</h2><span>{page?.total ?? 0}</span>{id === 'archived' && <button type="button" className="archive-width-toggle" aria-label="横向收起归档列" onClick={onToggleWidth}><UiIcon name="chevron-right" size={15}/></button>}</header>
       <div ref={scroll} className="task-board-column-scroll" onScroll={event => saveBrowserValue(scrollKey, event.currentTarget.scrollTop)}>
-        {scopeFor ? [...groups.values()].map(({ scope, items }) => <section key={scope.key} className="task-board-group"><div className={`task-board-group-head ${scope.kind}`} data-scope-kind={scope.kind} data-motion-key={`group:${id}:${scope.key}`}><UiIcon name={scope.kind === 'requirement' ? 'file' : scope.kind === 'router' ? 'router' : 'folder'} size={12}/><span title={scope.name}>{scope.name}</span></div>{items.map(render)}</section>) : page?.items.map(render)}{page && !page.total && <p className="task-board-empty" data-motion-key={`empty:${id}`}>{id === 'decision' ? '暂无待决策事项' : id === 'standby' ? '暂定的任务会保留在这里' : id === 'archived' ? '暂无已归档任务' : '暂无进行中的任务'}</p>}
+        {scopeFor ? [...groups.values()].map(({ scope, items }) => {
+          const head = <><UiIcon name={scope.kind === 'requirement' ? 'file' : scope.kind === 'router' ? 'router' : 'folder'} size={12}/><span title={scope.name}>{scope.name}</span></>
+          const headProps = { className: `task-board-group-head ${scope.kind}`, 'data-scope-kind': scope.kind, 'data-motion-key': `group:${id}:${scope.key}` }
+          return <section key={scope.key} className="task-board-group">{scope.id && onOpenRequirement
+            ? <button type="button" {...headProps} title={'打开需求 ' + scope.name} aria-label={'打开需求 ' + scope.name} onClick={() => onOpenRequirement(scope.id!)}>{head}</button>
+            : <div {...headProps}>{head}</div>}{items.map(render)}</section>
+        }) : page?.items.map(render)}{page && !page.total && <p className="task-board-empty" data-motion-key={`empty:${id}`}>{id === 'decision' ? '暂无待决策事项' : id === 'standby' ? '暂定的任务会保留在这里' : id === 'archived' ? '暂无已归档任务' : '暂无进行中的任务'}</p>}
       </div>{page && <Pagination title={title} page={page} loading={loading} onPage={onPage}/>}
     </>}
   </section>

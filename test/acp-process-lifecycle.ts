@@ -7,8 +7,9 @@ import { fileURLToPath } from 'node:url'
 import { createRequire, syncBuiltinESMExports } from 'node:module'
 import { promisify } from 'node:util'
 import test from 'node:test'
+import { captureFixtureCloseTrace, annotateFixtureFailure } from './regression/acp-close-diagnostic.mjs'
 import { ACPConnection } from '../src/main/acp/acpConnection'
-import { awaitACPStartup, closeACPConnections, flushACPProcessRecords, inspectACPProcess, prepareACPConnections, sameProcessIdentity, type ProcessIdentity } from '../src/main/acp/acpProcessLifecycle'
+import { awaitACPStartup, closeACPConnections, flushACPProcessRecords, inspectACPProcess, prepareACPConnections, sameProcessIdentity, stopACPProcessGroup, type ProcessIdentity } from '../src/main/acp/acpProcessLifecycle'
 
 const childCode = `process.on('SIGTERM',()=>{});require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const frame=JSON.parse(line);process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:frame.id,result:{protocolVersion:1,agentCapabilities:{}}})+String.fromCharCode(10))});setInterval(()=>{},1000)`
 const descendantCode = `const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e',${JSON.stringify(childCode)}],{stdio:'ignore'});process.on('SIGTERM',()=>process.exit(0));require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const frame=JSON.parse(line);setTimeout(()=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:frame.id,result:{protocolVersion:1,agentCapabilities:{},childPid:child.pid}})+String.fromCharCode(10)),300)});setInterval(()=>{},1000)`
@@ -110,6 +111,18 @@ if (fixture) {
 } else {
   const exec = promisify(execFile)
   const file = fileURLToPath(import.meta.url)
+  test('failure diagnostics preserve the original assertion when sampling or logging fails', async () => {
+    const failure = new assert.AssertionError({ message: 'owned descendant still alive', actual: true, expected: false, operator: 'strictEqual' })
+    const trace = { snapshot: () => [] }
+    for (const [snapshot, write, sample] of [
+      [trace, () => {}, async () => ({ kind: 'same-identity', stat: 'S' })],
+      [trace, () => {}, async () => { throw new Error('sampling failed') }],
+      [{ snapshot: () => { throw new Error('trace failed') } }, () => {}, async () => ({ kind: 'absent' })],
+      [trace, () => { throw new Error('logging failed') }, async () => ({ kind: 'absent' })]
+    ] as const) {
+      await assert.rejects(annotateFixtureFailure(failure, undefined, snapshot, write, sample), (error: unknown) => error === failure)
+    }
+  })
   function capture(stdout: string): any[] {
     const rows = stdout.split('\n').filter(line => line.startsWith('ACP_FIXTURE ')).map(line => JSON.parse(line.slice(12)))
     owned.push(...rows.flatMap(row => row.children || []))
@@ -127,8 +140,14 @@ if (fixture) {
       const inspected = await inspectACPProcess(response.childPid)
       assert.ok(inspected.ok && inspected.process)
       owned.push(inspected.process)
+      const trace = captureFixtureCloseTrace(connection)
       await connection.closeAndWait()
-      assert.equal(await alive(inspected.process), false, 'completion must include the owned descendant, not only the leader close event')
+      trace.markReturned()
+      try {
+        assert.equal(await alive(inspected.process), false, 'completion must include the owned descendant, not only the leader close event')
+      } catch (originalFailure) {
+        await annotateFixtureFailure(originalFailure, inspected.process, trace)
+      }
     } finally { connection.close('SIGKILL'); await cleanup() }
   })
 
@@ -184,6 +203,71 @@ if (fixture) {
       if (!stalled.ok) assert.equal((stalled.error as { killed?: boolean }).killed, true)
     } finally { childProcess.execFile = execute; syncBuiltinESMExports() }
   })
+
+  for (const mode of ['transient', 'persistent', 'reused', 'denied'] as const) {
+    test(`owned cleanup ${mode}: revalidates timeouts and preserves unverified processes`, async () => {
+      const child = spawn('/bin/sleep', ['60'], { detached: true, stdio: 'ignore' })
+      const exited = new Promise<void>(resolve => { child.once('exit', () => resolve()); child.once('error', () => resolve()) })
+      let identity: ProcessIdentity
+      try {
+        const inspected = await inspectACPProcess(child.pid!)
+        assert.ok(inspected.ok && inspected.process)
+        identity = inspected.process
+      } catch (error) {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+        await exited
+        throw error
+      }
+      const childProcess = createRequire(import.meta.url)('node:child_process') as typeof import('node:child_process')
+      const execute = childProcess.execFile, signal = process.kill
+      let queries = 0, freshIdentity = false
+      const signals: string[] = []
+      const timeout = Object.assign(new Error('fixture inspection deadline'), { code: null, killed: true, signal: 'SIGTERM' })
+      const denied = Object.assign(new Error('fixture inspection denied'), { code: 'EACCES', killed: false })
+      childProcess.execFile = function (file: string, ...args: any[]) {
+        if (file !== '/bin/ps' || !args[0]?.includes('-p') || !args[0]?.includes(String(child.pid))) return Reflect.apply(execute, childProcess, [file, ...args])
+        queries++
+        const callback = args.pop()
+        if (mode === 'denied' || mode === 'persistent' || queries === 1) {
+          return Reflect.apply(execute, childProcess, [process.execPath, ['-e', ''], args[1], () => callback(mode === 'denied' ? denied : timeout, '', '')])
+        }
+        return Reflect.apply(execute, childProcess, [file, ...args, (error: unknown, stdout: string, stderr: string) => {
+          if (mode === 'reused') stdout = `${identity.pid} ${identity.ppid} ${identity.uid} ${identity.pgid} Mon Jan 1 00:00:00 2001\n`
+          else if (!error && stdout.trim().split(/\s+/)[0] === String(identity.pid)) freshIdentity = true
+          callback(error, stdout, stderr)
+        }])
+      } as typeof execFile
+      process.kill = function (pid, value) {
+        if (Math.abs(pid) === identity.pid && value !== 0) {
+          assert.equal(freshIdentity, true, 'no signal is allowed before a fresh successful kernel identity')
+          signals.push(String(value))
+        }
+        return Reflect.apply(signal, process, [pid, value])
+      } as typeof process.kill
+      syncBuiltinESMExports()
+      try {
+        if (mode === 'persistent' || mode === 'denied') {
+          await assert.rejects(stopACPProcessGroup(identity, [identity]), (error: unknown) => error instanceof Error &&
+            error.message.includes(mode === 'persistent' ? 'TIMEOUT' : 'EACCES') && error.cause === (mode === 'persistent' ? timeout : denied))
+          assert.equal(queries, mode === 'persistent' ? 2 : 1, 'only one transient timeout retry is permitted')
+          assert.deepEqual(signals, [])
+          assert.equal(process.kill(identity.pid, 0), true, 'failed inspection leaves the actual process alive')
+        } else {
+          await stopACPProcessGroup(identity, [identity])
+          if (mode === 'transient') { assert.ok(freshIdentity); assert.ok(signals.includes('SIGTERM')); await exited }
+          else {
+            assert.ok(queries >= 2); assert.deepEqual(signals, [], 'a changed start identity is never signalled')
+            assert.equal(process.kill(identity.pid, 0), true, 'the process with a reused identity is preserved')
+          }
+        }
+      } finally {
+        childProcess.execFile = execute; process.kill = signal; syncBuiltinESMExports()
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+        await exited
+      }
+      assert.equal((await inspectACPProcess(identity.pid)).ok, true)
+    })
+  }
 
   test('startup closes abandoned ACP processes before opening a usable replacement', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'ua-acp-recover-'))

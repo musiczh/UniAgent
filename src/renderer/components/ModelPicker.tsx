@@ -1,7 +1,9 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import type { MouseEvent as ReactMouseEvent } from 'react'
 import { createPortal } from 'react-dom'
 import type { ModelDef } from '@shared/types'
 import { UiIcon } from './Icons'
+import { ModelSourceLabel } from './ModelSourceLabel'
 
 /**
  * Doc1 — model selector with a server-side load badge. A native <select> can't
@@ -81,9 +83,9 @@ export function ModelPicker({
   const noModels = models.length === 0
   const menu = open ? <div ref={menuRef} className={`mp-menu${portal ? ' mp-menu-portal' : ''}`} role="listbox"
     style={portal ? { position: 'fixed', bottom: 'auto', ...position, maxHeight: 'min(320px, calc(100vh - 24px))' } : undefined}>
-    {models.map(m => <button key={m.id} type="button" className={`mp-opt ${m.id === current?.id ? 'is-sel' : ''}`}
-      role="option" aria-selected={m.id === current?.id} onClick={() => commitSelection(m.id)}>
-      <span className="mp-opt-label">{m.label}</span><LoadBadge percent={m.loadPercent} />
+    {models.map(m => <button key={m.id} type="button" className={`mp-opt ${m.id === current?.id ? 'is-sel' : ''}${['admin_disabled', 'service_down'].includes(m.nikaHealth?.status || '') ? ' is-nika-unavailable' : ''}`}
+      role="option" aria-selected={m.id === current?.id} disabled={['admin_disabled', 'service_down'].includes(m.nikaHealth?.status || '')} onClick={() => commitSelection(m.id)}>
+      <NikaHealthDot model={m} /><span className="mp-opt-label"><ModelSourceLabel model={m} /></span><LoadBadge percent={m.loadPercent} />
     </button>)}
   </div> : null
 
@@ -104,6 +106,39 @@ export function ModelPicker({
       {portal && menu ? createPortal(menu, document.body) : menu}
     </div>
   )
+}
+
+export function NikaHealthDot({ model }: { model: ModelDef }): JSX.Element | null {
+  if (!model.nikaHealth) return null
+  const status = model.nikaHealth.status
+  const label = { available: '可用', degraded: '服务降级', service_down: '服务中断', admin_disabled: '管理员禁用', unknown: '状态未知' }[status]
+  return <span className={`nika-health-dot ${status === 'available' ? 'is-available' : ['admin_disabled', 'service_down'].includes(status) ? 'is-unavailable' : 'is-unknown'}`}
+    role="img" aria-label={label} title={model.nikaHealth.checkedAt ? `${label} · ${new Date(model.nikaHealth.checkedAt).toLocaleString()}` : label} />
+}
+
+export function ModelMenuOption({ model, selected, disabled, onSelect, pinnedModel, onTogglePin }: {
+  model: ModelDef
+  selected: boolean
+  disabled?: boolean
+  onSelect: (event: ReactMouseEvent<HTMLButtonElement>) => void
+  pinnedModel?: string | null
+  onTogglePin?: () => void
+}): JSX.Element {
+  const unavailable = ['admin_disabled', 'service_down'].includes(model.nikaHealth?.status || '')
+  const option = <button type="button" role="option" aria-selected={selected}
+    className={`sb-menu-item sb-sub-opt ${selected ? 'is-sel' : ''}${unavailable ? ' is-nika-unavailable' : ''}`}
+    disabled={disabled || unavailable} onClick={onSelect}>
+    {model.nikaHealth ? <NikaHealthDot model={model} /> : <span className="sb-sub-radio" aria-hidden />}
+    <span className="sb-entry-body"><ModelSourceLabel model={model} /></span>
+    <LoadBadge percent={model.loadPercent} />
+    <UiIcon name="check" size={13} className="sb-sub-check" />
+  </button>
+  if (!onTogglePin) return option
+  return <div className="nika-model-row">{option}{model.id !== 'nika-auto' && <button type="button"
+    className="sb-menu-item nika-model-pin" role="switch" aria-label={`锁定 ${model.label}`} aria-checked={pinnedModel === model.id}
+    disabled={disabled || model.nikaHealth?.status === 'admin_disabled' && pinnedModel !== model.id} onClick={onTogglePin}>
+    <UiIcon name="lock" size={12} /><span className={`sb-switch${pinnedModel === model.id ? ' on' : ''}`} aria-hidden />
+  </button>}</div>
 }
 
 /**

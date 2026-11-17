@@ -60,6 +60,8 @@ export interface CodexSourceBalance {
   total: string
   granted?: string
   toppedUp?: string
+  frozen?: string
+  creditAvailable?: string
 }
 export interface CodexSourceQuotaWindow {
   label: string
@@ -69,10 +71,11 @@ export interface CodexSourceQuotaWindow {
 export interface CodexSourceQuota {
   status: 'ready' | 'unsupported' | 'error'
   planType?: string
-  kind?: 'balance' | 'windows'
+  kind?: 'balance' | 'windows' | 'credits'
   capturedAt?: number
   balances?: CodexSourceBalance[]
   windows?: CodexSourceQuotaWindow[]
+  credits?: { remaining: number; total: number; unit: string; resetsAt?: number }
   message?: string
   stale?: boolean
 }

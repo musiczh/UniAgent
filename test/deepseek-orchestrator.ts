@@ -21,7 +21,8 @@ class FailingStore extends SessionStore {
 const store = new FailingStore(storePath)
 const agent = { id:'deepseek', name:'DeepSeek Harness', adapter:'deepseek', bin, icon:'deepseek', builtin:true, installed:true,
   models:[], capabilities:{ protocol:'acp', modelSelect:true, reasoningEffort:true, permissionModes:[{ id:'ask', label:'Ask' }, { id:'full-access', label:'Full access' }] } } as AgentDef
-const orchestrator = new Orchestrator(id => id === 'deepseek' ? agent : undefined, store)
+const orchestrator = new Orchestrator(id => id === 'deepseek' ? agent : undefined, store, undefined, undefined, undefined, undefined, undefined,
+  (_agentId, models) => models.map(model => ({ ...model, label: `方舟 · ${model.id}` })))
 async function waitFor(read: () => Promise<any> | any, predicate: (value: any) => boolean) {
   const deadline = Date.now() + 10000
   let last: any
@@ -98,6 +99,8 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
   assert.ok((await orchestrator.getEvents(session.id)).some(e => e.type === 'system_notice' && /持久化/.test(e.payload.text)))
   store.failure = undefined
   await orchestrator.updateSessionConfig(session.id, { permissionMode:'ask' })
+  assert.ok(session.agentContract?.models.every(model => model.label === `方舟 · ${model.id}`), 'permission updates must preserve source projection in the returned native contract')
+  assert.equal(session.agentContract?.currentModelId, 'deepseek-official/pro', 'projection keeps the native selection')
   await orchestrator.sendMessage(session.id, 'pending-delete')
   await waitFor(() => orchestrator.getEvents(session.id), evs => evs.some(e => e.type === 'approval_request' && e.state === 'pending'))
   const transcript = join(dir, 'deepseek/events', session.id + '.jsonl')

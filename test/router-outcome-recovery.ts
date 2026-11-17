@@ -113,7 +113,6 @@ test('a real delivery failure replaces the recovered tool error and remains unkn
     const env = Object.fromEntries(routerMcpServers(f.db.sessionId())![0].env.map(row => [row.name, row.value]))
     const call = async (name: string, args: unknown) => (await fetch(env.UNIAGENT_ROUTER_ENDPOINT, { method: 'POST',
       headers: { authorization: 'Bearer ' + env.UNIAGENT_ROUTER_TOKEN }, body: JSON.stringify({ name, arguments: args }) })).json()
-    await call('router_query', { requestId: input.requestId, mode: 'bootstrap' })
     const current = f.db.request(input.requestId)!
     const failed = f.db.update(input.requestId, current.version, { error: 'object_not_read', failure: { code: 'router-tool-recovery', sessionId: f.db.sessionId() },
       autoRecovery: { attempts: 2, total: 2, phase: 'delivery', reason: 'previous attempts exhausted' } })

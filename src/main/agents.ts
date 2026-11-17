@@ -34,11 +34,13 @@ export async function codexUsesExternalProvider(home = process.env.CODEX_HOME ||
   try { if (!['http:', 'https:'].includes(new URL(provider.base_url).protocol)) return false } catch { return false }
   return provider.env_key === undefined || typeof provider.env_key === 'string' && !!env[provider.env_key]
 }
-type CodexModelsProvider = (nativeModels: ModelDef[]) => ModelDef[]
+type CodexModelsProvider = (nativeModels: ModelDef[]) => ModelDef[] | Promise<ModelDef[]>
 const nativeCodexModels: CodexModelsProvider = models => models
 let codexModelsProvider = nativeCodexModels
 type ClaudeModelsProvider = (nativeModels: ModelDef[]) => ModelDef[] | Promise<ModelDef[]>
 let claudeModelsProvider: ClaudeModelsProvider = nativeCodexModels
+let agentModelsProjection: (agent: AgentDef) => AgentDef = agent => agent
+export function configureAgentModelsProjection(project: typeof agentModelsProjection): void { agentModelsProjection = project }
 export function configureClaudeModelsProvider(provider?: ClaudeModelsProvider): void {
   claudeModelsProvider = provider || nativeCodexModels
 }
@@ -859,8 +861,9 @@ export async function detectAgents(scope: AgentDetectionScope = 'all', agentId?:
         capabilities
       }
     }).map((probe, index) => probe.catch(error => failedAgentDetection(candidates[index], error)).then(async agent => {
-      await onDetected?.(agent)
-      return agent
+      const projected = agentModelsProjection(agent)
+      await onDetected?.(projected)
+      return projected
     }))
   )
   return results

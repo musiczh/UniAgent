@@ -14,7 +14,7 @@ for (const id of ['codex', 'traex', 'claude', 'qoder'].filter(id => isDistributi
   assert.equal(BUILTIN_AGENTS.find(agent => agent.id === id)?.capabilities.startupSystemPrompt, true, `${id} must be marked as a startup system prompt carrier`)
 }
 for (const id of ['kimi', 'grok', 'deepseek', 'zcode']) {
-  assert.ok(!BUILTIN_AGENTS.find(agent => agent.id === id)?.capabilities.startupSystemPrompt, `${id} wraps prompts per turn and must stay unmarked`)
+  assert.ok(!BUILTIN_AGENTS.find(agent => agent.id === id)?.capabilities.startupSystemPrompt, `${id} remains outside the existing personal-assistant carrier selection`)
 }
 
 const lifecycle = (availability: 'available' | 'unavailable'): AgentDef['lifecycle'] => ({ availability, auth: 'unknown', health: 'unknown' })

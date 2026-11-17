@@ -137,6 +137,7 @@ export interface RequirementRoutingSnapshot {
 export interface RequirementRoutingSources {
   revision: string
   documents: Array<RequirementReadableDocument & { contentHash: string }>
+  references?: Array<Pick<RequirementReadableDocument, 'id' | 'title' | 'kind' | 'status' | 'freshness'> & { uris: string[] }>
 }
 export interface RequirementReadingItem { text: string; refs: RequirementReadingReference[]; basis?: RequirementMemoryBasis }
 export interface RequirementReadingSection extends RequirementReadingItem {

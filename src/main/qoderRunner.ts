@@ -7,8 +7,12 @@ import { TurnRunner, developerInstructions } from './adapter.ts'
 import { nativeCredentialEnv } from './agentSetupCredentials'
 import { QoderSdkClient, qoderLaunch, qoderRegionForBin, qoderToolCall } from './qoderSdk.ts'
 import { handoffMcpArgs } from './handoff.ts'
-import { assistantPrompt } from './assistant/context.ts'
+import { prepareAssistantMessage, prepareAssistantInitializationForSession, assistantInitialization, serializeAssistantInput } from './assistant/context.ts'
 import { filesFromTurnChanges } from './turnFileChanges.ts'
+
+const qoderAgentCompletionStatuses = new Map([
+  ['running', 'running'], ['completed', 'completed'], ['error', 'failed'], ['cancelled', 'stopped']
+])
 
 export function qoderReviewPrompt(draft: NativeReviewDraft): string {
   let range: string
@@ -87,6 +91,9 @@ export class QoderRunner extends TurnRunner {
   private reviewing = false
   private budgetStop?: GoalState
   private tasksByTool = new Map<string, string>()
+  private agentCalls = new Map<string, { description?: string; prompt?: string; subagentType?: string; parentToolUseId?: string }>()
+  private tasksByOutput = new Map<string, string>()
+  private nativeTaskIds = new Map<string, string>()
 
   protected override emitEvent(event: Omit<UAEvent, 'sessionId' | 'seq' | 'ts'>): void {
     if (this.sourceMessageId && (event.type === 'agent_message' || event.type === 'reasoning')) event = { ...event, payload: { ...event.payload, nativeMessageId: this.sourceMessageId } }
@@ -100,7 +107,8 @@ export class QoderRunner extends TurnRunner {
   }
 
   async initialize(agent: AgentDef, config: SessionConfig, resumeId?: string): Promise<any> {
-    const key = JSON.stringify([agent.bin, agent.version, config, this.reviewing])
+    if (this.mainContext) await prepareAssistantInitializationForSession(this.sessionId, config, resumeId)
+    const key = JSON.stringify([agent.bin, agent.version, config, this.reviewing, assistantInitialization(this.sessionId)])
     if (this.sdk && this.key === key) {
       const sdk = this.sdk
       await sdk.request('reloadPlugins')
@@ -143,12 +151,16 @@ export class QoderRunner extends TurnRunner {
       try {
         await this.initialize(agent, config, resumeId)
         if (serial !== this.serial || this.interrupted || !this.sdk) return
-        const content = prompt.trimStart().startsWith('/') ? prompt : await assistantPrompt(this.sessionId, config, prompt, '', false)
-        if (serial !== this.serial || this.interrupted || !this.sdk) return
-        const uuid = randomUUID()
-        this.emitEvent({ type: 'system_notice', payload: { kind: 'launch', label: agent.name, model: config.model, text: `启动：Qoder SDK · ${agent.bin}` } })
-        this.emitEvent({ type: 'turn_started', payload: { turnId: uuid, sessionId: this.nativeSessionId, model: config.model } })
-        await this.sdk.request('send', { uuid, content, attachments })
+        await serializeAssistantInput(this.messageDeliveryKey(), async () => {
+          const delivery = await prepareAssistantMessage(this.sessionId, config, prompt, '', true, this.mainContext)
+          const content = delivery.content
+          if (serial !== this.serial || this.interrupted || !this.sdk) return
+          const uuid = randomUUID()
+          this.emitEvent({ type: 'system_notice', payload: { kind: 'launch', label: agent.name, model: config.model, text: `启动：Qoder SDK · ${agent.bin}` } })
+          this.emitEvent({ type: 'turn_started', payload: { turnId: uuid, sessionId: this.nativeSessionId, model: config.model } })
+          await this.sdk.request('send', { uuid, content, attachments, waitForReplay: true })
+          delivery.accepted()
+        })
       } catch (error) {
         if (serial !== this.serial || this.interrupted) return
         this.claudeResultFailed = true
@@ -158,16 +170,66 @@ export class QoderRunner extends TurnRunner {
     })()
   }
 
+  private projectAgentMessage(message: any): any {
+    const blocks: Array<Record<string, unknown>> = Array.isArray(message.message?.content)
+      ? message.message.content.filter((block: unknown): block is Record<string, unknown> =>
+        typeof block === 'object' && block !== null && !Array.isArray(block)) : []
+    if (message.type === 'assistant') {
+      for (const block of blocks) if (block.type === 'tool_use' && block.name === 'Agent' && typeof block.id === 'string') {
+        const input = typeof block.input === 'object' && block.input !== null && !Array.isArray(block.input)
+          ? block.input as Record<string, unknown> : {}
+        this.agentCalls.set(block.id, {
+          description: typeof input.description === 'string' ? input.description : undefined,
+          prompt: typeof input.prompt === 'string' ? input.prompt : undefined,
+          subagentType: typeof input.subagent_type === 'string' ? input.subagent_type : undefined,
+          parentToolUseId: typeof message.parent_tool_use_id === 'string' ? message.parent_tool_use_id : undefined
+        })
+      }
+    } else if (message.type === 'system' && ['task_started', 'task_updated', 'task_progress', 'task_notification'].includes(message.subtype)) {
+      const taskId = this.tasksByTool.get(message.tool_use_id) || this.tasksByOutput.get(message.output_file) || this.nativeTaskIds.get(message.task_id)
+      if (typeof message.task_id === 'string' && message.task_id) {
+        const id = taskId || message.task_id
+        this.nativeTaskIds.set(message.task_id, id)
+        if (message.tool_use_id) this.tasksByTool.set(message.tool_use_id, id)
+        if (taskId) return { ...message, task_id: taskId }
+      }
+    } else if (message.type === 'user') {
+      const receipt = message.tool_use_result
+      if (typeof receipt?.agentId !== 'string' || !receipt.agentId) return message
+      const results = blocks.filter(block => block.type === 'tool_result')
+      if (results.length !== 1 || typeof results[0].tool_use_id !== 'string') return message
+      const toolUseId = results[0].tool_use_id
+      const previousTaskId = this.tasksByTool.get(toolUseId)
+      const call = this.agentCalls.get(toolUseId)
+      const background = receipt.isAsync === true && receipt.status === 'async_launched'
+      const status = background ? 'running' : receipt.kind === 'agent-result'
+        ? qoderAgentCompletionStatuses.get(receipt.state) : undefined
+      if (call && status && !results[0].is_error) {
+        // The real Agent receipt's agentId is accepted by native stopTask and history.
+        // Keep an earlier task_started identity when present so its card stays unique.
+        const taskId = previousTaskId || receipt.agentId
+        this.tasksByTool.set(toolUseId, taskId)
+        const output = background ? receipt.outputFile : receipt.outputPath
+        if (typeof output === 'string' && output) this.tasksByOutput.set(output, taskId)
+        if (!background || !previousTaskId) this.parseClaude({
+          type: 'system', subtype: 'task_updated', task_id: taskId, tool_use_id: toolUseId,
+          parent_task_id: call.parentToolUseId ? this.tasksByTool.get(call.parentToolUseId) : undefined,
+          subagent_type: typeof receipt.agentType === 'string' ? receipt.agentType : call.subagentType,
+          description: typeof receipt.description === 'string' ? receipt.description : call.description,
+          prompt: typeof receipt.prompt === 'string' ? receipt.prompt : call.prompt,
+          summary: typeof receipt.content === 'string' ? receipt.content : undefined,
+          patch: { status }
+        })
+        this.setSdkSubagentHistoryId(taskId, receipt.agentId)
+      } else if (previousTaskId) this.setSdkSubagentHistoryId(previousTaskId, receipt.agentId)
+    }
+    return message
+  }
+
   // Public for transcript replay and behavior tests; does not submit model input.
   acceptMessage(message: any): void {
     this.sourceMessageId = message.type === 'assistant' ? message.uuid : undefined
-    if (message.type === 'system' && message.subtype === 'task_started' && message.tool_use_id) this.tasksByTool.set(message.tool_use_id, message.task_id)
-    if (message.type === 'user' && typeof message.tool_use_result?.agentId === 'string') {
-      for (const block of Array.isArray(message.message?.content) ? message.message.content : []) {
-        const taskId = block.type === 'tool_result' && this.tasksByTool.get(block.tool_use_id)
-        if (taskId) this.setSdkSubagentHistoryId(taskId, message.tool_use_result.agentId)
-      }
-    }
+    message = this.projectAgentMessage(message)
     if (message.type === 'system' && message.subtype === 'goal_updated') {
       this.goalVersion++
       this.goal = projectQoderGoal(message.goal, this.goal)

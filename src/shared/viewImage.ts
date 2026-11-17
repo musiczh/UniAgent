@@ -36,6 +36,8 @@ export function nativeImageSelectors(event: UAEvent): NativeImageSelector[] {
 
 /** Best-effort display name: the path the tool read, else the recorded attachment name. */
 export function nativeImageName(event: UAEvent, selector: NativeImageSelector): string {
+  const recorded = event.payload?.result?.attachments?.[selector.blockIndex]?.filename
+  if (typeof recorded === 'string' && recorded.trim()) return recorded
   let input = event.payload?.input ?? event.payload?.raw?.arguments
   if (typeof input === 'string') {
     try { input = JSON.parse(input) } catch { input = undefined }

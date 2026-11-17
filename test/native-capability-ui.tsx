@@ -344,7 +344,7 @@ async function deliveryAndResetContract(): Promise<void> {
 }
 
 function responseAnnotationDeliveryContract(): void {
-  const instruction = 'Each item contains text selected from an earlier Codex response and may include a user comment. Treat items as Annotation 1, Annotation 2, and so on in array order. Use every selection as context and address every comment. For every annotation you address, include its inline directive `:codex-annotation{index="N"}`, where N is its one-based array position (for example, `:codex-annotation{index="1"}`). Do not use unstructured annotation labels.'
+  const instruction = '以下各项包含引用原文及可选批注；结合所有引用逐项回应批注，在对应回答附 :codex-annotation{index="N"}，N 为条目从 1 开始的序号。'
 
   assert.equal(
     buildComposerDelivery(null, '  Apply these changes  ', [], [], [

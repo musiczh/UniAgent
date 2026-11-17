@@ -1,4 +1,7 @@
-import { assistantPrompt } from '../assistant/context'
+import { prepareAssistantMessage, prepareAssistantInitializationForSession, reconcileAssistantInput, stripAssistantContext, type AssistantMessage } from '../assistant/context'
+import { sessionInstructions } from '../sessionInstructions'
+import { splitFeishuContext } from '../../shared/feishuContext'
+import { splitWeixinContext } from '../../shared/weixin'
 import { EventEmitter } from 'node:events'
 import type { HistoryForkPoint, ModelDef, Session, SessionConfig, SessionAgentContract, UAEvent } from '../../shared/types'
 import { worktreeInstructions } from '../worktreeService'
@@ -133,6 +136,7 @@ export class ZCodeRunner extends EventEmitter {
     return contract
   }
   private async createSession(): Promise<void> {
+    await prepareAssistantInitializationForSession(this.session.id, this.session.config)
     const ledger = this.session.zcodeState!
     let ack: ZCodeCommandAck
     if (ledger.createCommandId) {
@@ -304,7 +308,7 @@ export class ZCodeRunner extends EventEmitter {
     const verification = goal?.verifications?.at(-1)
     const verificationFailed = ['verified', 'failed'].includes(goal?.status) && verification?.outcome === 'failed'
     const normalized: GoalState | undefined = isRecord(goal) && typeof goal.objective === 'string' && goal.objective.length > 0 ? {
-      objective: worktreePrefix && goal.objective.startsWith(worktreePrefix + '\n\n') ? goal.objective.slice(worktreePrefix.length + 2) : goal.objective, status: verificationFailed ? 'blocked' : goal.status === 'verified' ? 'complete' : goal.status === 'paused' ? 'paused' : goal.status === 'failed' ? 'blocked' : 'active',
+      objective: stripAssistantContext(worktreePrefix && goal.objective.startsWith(worktreePrefix + '\n\n') ? goal.objective.slice(worktreePrefix.length + 2) : goal.objective), status: verificationFailed ? 'blocked' : goal.status === 'verified' ? 'complete' : goal.status === 'paused' ? 'paused' : goal.status === 'failed' ? 'blocked' : 'active',
       tokenBudget: null, tokensUsed: Math.max(0, Number(cumulative?.inputTokens) || 0) + Math.max(0, Number(cumulative?.outputTokens) || 0),
       timeUsedSeconds: Math.max(0, Number(goal.timeUsedSeconds) || 0), createdAt: state.meta?.createdAt ?? 0, updatedAt: state.meta?.updatedAt ?? 0,
       continuation: 'native', autonomous: ['active', 'verifying'].includes(goal.status), nativeActivation: ['active', 'verifying'].includes(goal.status) ? 'armed' : 'disarmed',
@@ -404,26 +408,33 @@ export class ZCodeRunner extends EventEmitter {
       void this.recover().then(() => { if (this.active === record) this.failActive('ZCode 长时间未确认任务状态，已暂停；请检查原生引擎') })
         .catch(() => this.failActive('ZCode 任务状态查询失败，已暂停'))
     }, 180_000)
+    let delivery: AssistantMessage | undefined, submitted = false
     try {
-      const compact = record.submission.text.trim() === '/compact'
+      const commandText = splitWeixinContext(record.submission.text)?.text ?? splitFeishuContext(record.submission.text)?.text ?? record.submission.text
+      const compact = commandText.trim() === '/compact'
       const goal = record.submission.text.startsWith('/goal ')
       const text = goal ? record.submission.text.slice(6).trim() : record.submission.text
-      const effectiveText = !goal && text.trimStart().startsWith('/') ? text : await assistantPrompt(this.session.id, this.session.config, text, worktreeInstructions(this.session.config))
+      delivery = await prepareAssistantMessage(this.session.id, this.session.config, text, sessionInstructions(this.session.config, this.session.id), false)
+      const effectiveText = delivery.text
+      delivery.bindNativeInput(record.commandId)
       if (this.disposed || this.active !== record || this.session.zcodeState?.suspendedAfterStop) throw new Error('ZCode 输入已取消')
+      submitted = true
       const ack = await this.command({ commandId: record.commandId, clientId: this.options.clientId, sessionId: this.session.nativeSessionId!,
         type: compact ? 'compact' : goal ? 'sendGoalCommand' : 'sendText', payload: compact ? {} : goal
           ? { ...structuredClone(record.submission), text: effectiveText, displayText: record.submission.text }
           : { ...structuredClone(record.submission), text: effectiveText }, issuedAt: record.issuedAt })
       record.ackStatus = ack.status
       if (['accepted', 'duplicate'].includes(ack.status)) {
+        delivery.accepted()
         if (record.phase === 'sent') record.phase = 'acknowledged'
         this.options.persist(); this.emit('delivery', record); this.observeActive()
       } else {
+        delivery.failed(true)
         record.phase = 'failed'; this.options.persist(); this.emit('delivery', record)
         this.complete({ commandId: record.commandId, interrupted: false, failed: true, delivery: ack.status === 'failed' ? 'failed' : 'not-submitted' })
       }
       return ack
-    } catch (error) { this.failActive('ZCode 输入回执未确认，已暂停自动发送'); throw error }
+    } catch (error) { delivery?.failed(!submitted); this.failActive('ZCode 输入回执未确认，已暂停自动发送'); throw error }
   }
   private observeActive(): void {
     const record = this.active
@@ -434,6 +445,7 @@ export class ZCodeRunner extends EventEmitter {
     }
     const observed = findObservedCommand(this.state, record.commandId)
     if (!observed) return
+    reconcileAssistantInput(this.session.id, record.commandId)
     if (this.turnTimer && !this.session.zcodeState?.suspendedAfterStop) { clearTimeout(this.turnTimer); this.turnTimer = undefined }
     if (record.phase !== 'observed') { record.phase = 'observed'; record.turnId = observed.row.turnId; this.options.persist(); this.emit('delivery', record) }
     if (observed.turn && observed.turn.state !== 'running') {

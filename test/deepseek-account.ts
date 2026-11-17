@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
 import { DeepSeekAccountService, type DeepSeekAccountClient } from '../src/main/deepseekAccountService.ts'
 
-const view = (phase: string, status = 'signed-out', extra = {}) => ({ status, attempt: { id: 'attempt-1', phase, ...extra } })
+const links = { usageUrl: 'https://platform.deepseek.com/usage', topUpUrl: 'https://platform.deepseek.com/top_up' }
+const signedOut = () => ({ status: 'signed-out', attempt: null, links })
+const view = (phase: string, status = 'signed-out', extra = {}) => ({ status, attempt: { id: 'attempt-1', phase, ...extra }, links })
 const tick = () => new Promise<void>(resolve => setImmediate(resolve))
-function fixture() {
-  let current: any = { status: 'signed-out', attempt: null }
+function fixture(enveloped = false) {
+  let current: any = signedOut()
   let initial: any = view('initializing')
   let releaseStart: (() => void) | undefined
   let waitStart = false
@@ -16,7 +18,8 @@ function fixture() {
   const calls: { method: string; args: any }[] = []
   const queue: any[] = []
   let wake: (() => void) | undefined
-  const publish = (value: any) => { current = value; queue.push(value); wake?.() }
+  const emit = (value: any) => { queue.push(value); wake?.() }
+  const publish = (value: any, type = 'snapshot') => { current = value; emit(enveloped ? { type, state: value } : value) }
   const client: DeepSeekAccountClient = {
     callbackOrigin: 'http://127.0.0.1:12345',
     async call<T>(method: string, args?: any): Promise<T> {
@@ -27,11 +30,12 @@ function fixture() {
       }
       if (method === 'account/cancelSignIn') { if (failCancel) throw new Error('fixture transport closed'); publish(view('cancelled')); return current }
       if (method === 'account/hasRunningAccountTasks') return false as T
-      if (method === 'account/signOut') current = { status: 'signed-out', attempt: null }
+      if (method === 'account/signOut') current = signedOut()
+      if (method === 'account/getState' && current instanceof Error) throw current
       return current as T
     },
     async *stream<T>(_method: string, _args?: any, signal?: AbortSignal): AsyncGenerator<T> {
-      yield current as T
+      yield (enveloped ? { type: 'snapshot', state: current } : current) as T
       const abort = () => wake?.()
       signal?.addEventListener('abort', abort)
       try {
@@ -52,9 +56,58 @@ function fixture() {
     openBrowser: async url => { if (failOpen) throw new Error('private failure'); opened.push(url) },
     changed: () => { changed++ }, authenticated: () => { focused++ }
   })
-  return { service, publish, opened, calls, focused: () => focused, changed: () => changed,
+  return { service, publish, emit, opened, calls, focused: () => focused, changed: () => changed, state: (value: any) => { current = value },
     initial: (value: any) => { initial = value }, blockStart: () => { waitStart = true }, release: () => releaseStart!(), failOpen: () => { failOpen = true },
     disconnect: () => { failCancel = true; queue.push(new Error('fixture stream closed')); wake?.() } }
+}
+
+{
+  const f = fixture(true)
+  const login = f.service.start()
+  // Observe rejections immediately so the regression assertion reports the broken projection.
+  const result = login.catch(error => error)
+  try {
+    await tick()
+    assert.equal(f.service.snapshot().phase, 'initializing', 'rc.4 initial snapshot must keep the login attempt alive')
+    f.publish(view('waiting-browser', 'signed-out', { authorizeUrl: 'https://platform.deepseek.com/dsh/authorize?id=fixture' }))
+    await tick()
+    assert.equal(f.opened.length, 1, 'rc.4 progress opens the official authorization page')
+    assert.equal(f.service.snapshot().signedIn, false)
+    f.publish(view('committing', 'credential-stored'), 'credentials-changed')
+    await tick()
+    assert.deepEqual(f.service.snapshot(), { supported: true, signedIn: true, phase: 'committing' }, 'credential changes refresh the IPC projection')
+    assert.equal(f.focused(), 0, 'a credential write does not finish an attempt before the native success outcome')
+    assert.equal(f.service.busy, true)
+    f.publish(view('succeeded', 'credential-stored'))
+    assert.deepEqual(await result, { supported: true, signedIn: true, phase: 'succeeded' })
+    assert.equal(f.focused(), 1, 'rc.4 login success uses the existing authentication lifecycle once')
+    assert.doesNotMatch(JSON.stringify(f.service.snapshot()), /authorize|fixture|attempt-1/)
+  } finally { await f.service.close() }
+}
+
+for (const update of [
+  { type: 'identity', state: view('succeeded', 'credential-stored') },
+  { type: 'snapshot', state: null },
+  { type: 'snapshot', status: 'credential-stored', attempt: null },
+  { type: 'credentials-changed', state: { status: 'credential-stored', attempt: false } },
+  { type: 'snapshot', state: view('unknown', 'credential-stored') }
+]) {
+  const f = fixture(true)
+  const login = f.service.start()
+  const failure = assert.rejects(login, /登录状态无效/)
+  await tick(); f.emit(update); await failure
+  assert.equal(f.focused(), 0, 'malformed account updates cannot signal login success')
+  await f.service.close()
+}
+
+for (const failure of [new Error('fixture network unavailable'), { status: 'signed-out', attempt: false }]) {
+  const f = fixture()
+  f.state({ status: 'credential-stored', attempt: null, links })
+  await f.service.refresh()
+  f.state(failure)
+  await assert.rejects(f.service.refresh(), /network unavailable|登录状态无效/)
+  assert.deepEqual(f.service.snapshot(), { supported: true, signedIn: true, phase: undefined }, 'failed account reads retain the last confirmed credential state')
+  await f.service.close()
 }
 
 {
@@ -134,4 +187,4 @@ for (const url of ['javascript:alert(1)', 'https://evil.example/dsh/authorize', 
   assert.equal(f.focused(), 0)
   await f.service.close()
 }
-console.log('deepseek-account: native login, singleflight, callback success, cancellation, expiry, failed browser and URL boundary passed')
+console.log('deepseek-account: rc.4 envelopes, legacy raw state, credential updates, failed-read preservation, native login, singleflight, cancellation, expiry and URL boundary passed')

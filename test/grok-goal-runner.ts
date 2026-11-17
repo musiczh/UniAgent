@@ -86,7 +86,19 @@ try {
   const frames = (await readFile(log, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
   assert.equal(frames[0].goal, '1')
   assert.equal(frames.filter(frame => frame.method === 'session/prompt').length, 3, 'set/resume/clear use prompts; active pause uses session/cancel')
-  assert.deepEqual(frames.filter(frame => frame.method === '_x.ai/interject').map(frame => frame.params.text), ['active-steer', 'finish-current'])
+  assert.deepEqual(frames.filter(frame => frame.method === 'session/prompt').map(frame => frame.params.prompt), [
+    [{ type: 'text', text: '/goal Confirm native workflow --budget 10000' }],
+    [{ type: 'text', text: '/goal resume' }],
+    [{ type: 'text', text: '/goal clear' }]
+  ], 'native slash commands remain exact and do not consume pending business-input context')
+  const interjections = frames.filter(frame => frame.method === '_x.ai/interject').map(frame => frame.params.text)
+  assert.equal(interjections.length, 2)
+  assert.match(interjections[0], /^<uniagent_initial_context>\n[\s\S]*<\/uniagent_initial_context>\n\n<uniagent_channel_context>\n当前消息通道：UniAgent App\n<\/uniagent_channel_context>\n\nactive-steer$/, 'the first non-slash input delivers the deferred fixed rules and channel while preserving the exact request')
+  assert.match(interjections[0], /你通过 UniAgent 服务用户。/)
+  assert.match(interjections[0], /UniAgent MCP 可使用对象：/)
+  assert.equal((interjections[0].match(/<uniagent_initial_context>/g) || []).length, 1)
+  assert.equal((interjections[0].match(/<uniagent_channel_context>/g) || []).length, 1)
+  assert.equal(interjections[1], 'finish-current', 'confirmed initialization and channel are not re-injected after Goal pause/resume')
   await runner.disposeAndWait()
   const planning = new GrokACPRunner('app-grok-planning', { n: 0 }, agent, { agentId: 'grok', workdir: root, model: 'ua-test', permissionMode: 'full-access' }, undefined,
     { HOME: root, GROK_HOME: join(root, '.grok'), UA_GROK_GOAL_LOG: log, UA_GROK_PLANNING_HOLD: '1' })

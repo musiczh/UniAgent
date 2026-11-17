@@ -21,6 +21,7 @@ import type { AgentDef, Attachment, SessionConfig, TaskTitleGeneratorRef } from 
 type TitleSdk = Pick<ClaudeSdkClient, 'ready' | 'on' | 'respond' | 'request' | 'close'>
 export interface TaskTitleUsage { inputTokens?: number; outputTokens?: number }
 export interface TaskTitleRuntimeDependencies extends TaskTitleAcpDependencies {
+  maxTokens?: number
   maxInputBytes?: number
   outputSchema?: Record<string, unknown>
   codexSession?: ReusableCodexSession
@@ -221,7 +222,7 @@ export async function generateTaskTitleText(agent: AgentDef, config: TaskTitleGe
     : ['claude','qoder'].includes(agent.adapter) ? sdkTitle(agent, selected.config, prompt, controller.signal, deps, images)
     : agent.adapter === 'deepseek' ? generateDeepSeekTitle(selected.config, prompt, controller.signal,
       deps.deepseekHost || (async () => (await import('./deepseekService')).getDeepSeekHost()), (input, output) => reportUsage(deps, input, output), images,
-      { systemPrompt: deps.systemPrompt || TASK_TITLE_SYSTEM_PROMPT, maxOutputChars: deps.maxOutputChars })
+      { systemPrompt: deps.systemPrompt || TASK_TITLE_SYSTEM_PROMPT, maxOutputChars: deps.maxOutputChars, maxTokens: deps.maxTokens })
     : generateAcpTitle(agent, selected.config, prompt, controller.signal, { ...deps, systemPrompt: deps.systemPrompt || TASK_TITLE_SYSTEM_PROMPT }, (input, output) => reportUsage(deps, input, output), images)
   void operation.catch(() => {})
   try { return await Promise.race([operation, abortResult]) }

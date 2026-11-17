@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { bindDeepSeekHostContext, registerDeepSeekHostContext, deepseekHostContextPlugin } from '../src/main/deepseekHostContext.ts'
 import type { DeepSeekHostClient } from '../src/main/deepseekHostClient.ts'
+import { ROUTER_SYSTEM_PROMPT } from '../src/shared/router.ts'
 
 const root = await mkdtemp(join(tmpdir(), 'ua-host-context-'))
 try {
@@ -18,7 +19,7 @@ try {
   const agent = { session: { id: '../../native/path' },
     runMaintenance: async (callback: any) => { if (busy) throw new Error('busy'); return callback() },
     ctx: { plugin: (_module: any, config: any) => {
-      if (_module.name === 'uniagent-router-policy') _module.apply({
+      if (_module.name === 'uniagent-session-policy') _module.apply({
         systemPrompt: { section: (value: any) => prompts.push(value) },
         tools: { guard: () => { throw new Error('Router must retain all native tools') } },
         on: () => { throw new Error('Router must not filter the model tool assembly') }
@@ -58,10 +59,15 @@ try {
   ])
   await bindDeepSeekHostContext(client, agent.session.id, 'router-session', root)
   assert.equal(prompts.length, 1, 'Router instructions are injected alongside normal UniAgent MCP')
-  assert.match(prompts[0].text, /全部正常工具/)
-  assert.match(prompts[0].text, /不修改项目／文档、发送消息/)
-  assert.match(prompts[0].text, /router_assign_task/)
+  assert.deepEqual(prompts[0], { name: 'uniagent-session', text: ROUTER_SYSTEM_PROMPT, order: 10210, interpolate: false }, 'the Host installs the current Router policy as a system section without intercepting native tools')
   assert.deepEqual(mounts.slice(-2).map(mount => mount.serverName), ['uniagent-router', 'uniagent'])
+  await bindDeepSeekHostContext(client, agent.session.id, 'router-session', root, undefined, '固定规则与 USER.md 初始快照')
+  assert.equal(prompts.at(-1).text, '固定规则与 USER.md 初始快照')
+  const promptCount = prompts.length
+  await bindDeepSeekHostContext(client, agent.session.id, 'router-session', root, undefined, '固定规则与 USER.md 初始快照')
+  assert.equal(prompts.length, promptCount, 'unchanged system snapshots do not remount sections')
+  await bindDeepSeekHostContext(client, agent.session.id, 'router-session', root, undefined, '压缩重建后的 USER.md 快照')
+  assert.equal(prompts.at(-1).text, '压缩重建后的 USER.md 快照')
   await assert.rejects(readFile(join(root, 'path.json')), { code: 'ENOENT' })
   console.log('DeepSeek Host context: exact caller, idempotence, rebind cleanup, busy and failed activation passed')
 } finally { await rm(root, { recursive: true, force: true }) }

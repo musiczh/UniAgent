@@ -113,7 +113,7 @@ async function close(): Promise<void> {
 async function send(args: any): Promise<void> {
   let content: SDKUserMessage['message']['content'] = args.content
   if (args.attachments?.length) {
-    const blocks: any[] = [{ type: 'text', text: content }]
+    const blocks: any[] = Array.isArray(content) ? [...content] : [{ type: 'text', text: content }]
     for (const attachment of args.attachments) {
       if (attachment.kind === 'image') {
         const media_type = /\.jpe?g$/i.test(attachment.path) ? 'image/jpeg' : /\.webp$/i.test(attachment.path) ? 'image/webp' : /\.gif$/i.test(attachment.path) ? 'image/gif' : 'image/png'
@@ -192,6 +192,12 @@ port.on('message', async ({ id, method, args }: { id: string; method: string; ar
 async function consume(): Promise<void> {
   try {
     for await (const message of session!) {
+      if (message.type === 'command_lifecycle' && ['queued', 'started', 'completed', 'cancelled', 'discarded'].includes(message.state)) {
+        const receipt = receipts.get(message.command_uuid)
+        receipts.delete(message.command_uuid)
+        if (message.state === 'cancelled' || message.state === 'discarded') receipt?.reject(new Error(message.state === 'cancelled' ? 'Qoder 输入已被取消，请重新发送' : 'Qoder 输入已被丢弃，请重新发送'))
+        else receipt?.resolve()
+      }
       if (message.type === 'user' && 'isReplay' in message && message.isReplay && message.uuid) {
         receipts.get(message.uuid)?.resolve(); receipts.delete(message.uuid)
       }

@@ -3,6 +3,7 @@ import { sessionDisplayTitle } from '@shared/task'
 import { useSessionFork } from './components/SessionForkProgress'
 import { APP_NAME } from '@shared/distribution'
 import { applyColorTheme } from './colorTheme'
+import { captureQueuedSendOrigin } from './conversationMotion'
 import { pendingAgentDetection } from '@shared/agentReadiness'
 export { agentInitializationPrompt } from '@shared/agentInitialization'
 import { parseAssistantCommand } from '@shared/assistant'
@@ -67,7 +68,7 @@ import { SpaceRequirementNavigation, WorkspaceDetail, useWorkspaceData } from '.
 import { AssistantConversations } from './components/AssistantConversations'
 import { RouterPanel, type RouterPanelViewState } from './components/RouterPanel'
 import { TaskBoard } from './components/TaskBoard'
-import { BROWSER_LOCATION_KEY, readBrowserValue, saveBrowserValue, sessionBrowserLocation, type BrowserLocation } from './scopeBrowser'
+import { BROWSER_LOCATION_KEY, browserTaskAttentionBySession, readBrowserValue, saveBrowserValue, sessionBrowserLocation, type BrowserLocation } from './scopeBrowser'
 import { subAgentsFromEvents, TurnStatusBar, type HandoffSessionTarget } from './components/EventStream'
 import { isSessionBusy, sessionActivityStatus } from '@shared/sessionStatus'
 import type { SessionAttentionSnapshot } from '@shared/sessionAttention'
@@ -106,7 +107,7 @@ import { ImmersiveReader } from './components/ImmersiveReader'
 import { TokenUsagePanel } from './components/TokenUsagePanel'
 import { rollbackOptimisticSessionStatus, useNativeCapabilities, useSessionAttention } from './hooks'
 import { mergeZCodeEvent, mergeZCodeSnapshot } from './zcodeEvents'
-import { mergeHydratedEvents, usageSnapshotKey, withCompactionTiming } from '@shared/eventSnapshots'
+import { appendEventSnapshot, mergeHydratedEvents, usageSnapshotKey, withCompactionTiming } from '@shared/eventSnapshots'
 import type { ZCodeEventCursor, ZCodeEventsSnapshot } from '@shared/zcode'
 
 const MERGEABLE_EVENT_TYPES = new Set<UAEvent['type']>([
@@ -146,6 +147,11 @@ function optimisticNativeContext(
 }
 
 export function mergeSessionEvent(events: UAEvent[], event: UAEvent, inPlace = false): UAEvent[] {
+  if (event.payload?.nikaSnapshot) {
+    const next = inPlace ? events : [...events]
+    appendEventSnapshot(next, event)
+    return next
+  }
   const usageKey = usageSnapshotKey(event)
   if (usageKey !== undefined) {
     const index = events.findLastIndex(item => usageSnapshotKey(item) === usageKey)
@@ -721,6 +727,7 @@ export function App(): JSX.Element {
     }
     const offEvent = window.uniagent.onEvent((ev) => {
       if (archivedEventCaches.current.has(ev.sessionId)) return
+      if (ev.type === 'user_message' || ev.type === 'goal_message') captureQueuedSendOrigin(ev.payload.clientTurnKey || ev.payload.routedInputId)
       eventBatch.push(ev)
       if (ev.state !== 'running') flushEvents()
       else if (!eventTimer) eventTimer = setTimeout(flushEvents, 50)
@@ -929,6 +936,7 @@ export function App(): JSX.Element {
   useEffect(() => { if (activeId === 'team:' + activeTeam?.id) setActiveId(activeTeam!.memberSessions[activeTeam!.team.leaderMemberId]) }, [activeId, activeTeam?.id])
   const deletion = useSessionDeletions()
   const sidebarSessions = useMemo(() => [...runtimeSessions.filter(s => !s.teamBinding&&!s.config.managedPurpose), ...teamSessionRows(teamCatalog.projects, runtimeSessions)].filter(session => !deletion.hiddenIds.has(session.id)), [runtimeSessions, teamCatalog.projects, deletion.hiddenIds])
+  const attentionBySession = useMemo(() => browserTaskAttentionBySession(sidebarSessions, activityBySession, pendingInteractionBySession), [sidebarSessions, activityBySession, pendingInteractionBySession])
   async function handleCreateTeam(input: TeamCreateProjectInput): Promise<void> {
     const p = await window.uniagent.createTeamProject(input)
     setTeamCatalog(c => {
@@ -2416,7 +2424,7 @@ export function App(): JSX.Element {
           <NewTaskPanel teams={teamCatalog.teams} teamUnavailableReasons={teamCatalog.unavailableReasons} onCreateTeam={handleCreateTeam} onManageTeams={() => { setSettingsCategory('teams'); setSettingsTeamId(undefined); openPanel('settings') }} key={newTaskKey} agents={agents} enabledAgentIds={enabledAgentIds} loading={agentsLoading || agentsRedetecting || agentChoiceSettingsLoading || sessionsLoading} loadError={sessionsLoadError} onCreate={handleCreate} onCreateNativeAction={handleCreateNativeAction} onCommitCreatedSession={handleCommitCreatedSession} promptPrefill={newTaskPrefill} onRouterSubmitting={() => openPanel('router')} onRouterSubmitted={() => openPanel('router')} onOpenAssistantSettings={() => { setSettingsCategory('assistants'); openPanel('settings') }} onOpenSettings={() => openPanel('settings')} onRedetect={redetectAgents} quickCreateSeed={quickCreateSeed} requirementsEnabled={requirementsEnabled} />
         </div>
         {panel === 'board' ? (
-          <TaskBoard projects={workspaceData.projects} requirements={workspaceData.requirements} agents={agents} unreadBySession={unreadBySession} onCreate={() => openNewTask()} onOpenRouter={id => openPanel('router', id)} onDeleteTask={handleDelete} onOpenTask={async id => {
+          <TaskBoard projects={workspaceData.projects} requirements={workspaceData.requirements} agents={agents} attentionBySession={attentionBySession} unreadBySession={unreadBySession} onCreate={() => openNewTask()} onOpenRouter={id => openPanel('router', id)} onOpenRequirement={id => openBrowser({ kind: 'requirement', id })} onDeleteTask={handleDelete} onOpenTask={async id => {
             const next = await window.uniagent.listSessions()
             if (!next.some(session => session.id === id)) throw new Error('任务已移除，请刷新看板后重试')
             setSessions(next); handleSelect(id); setBoardReturn(true)

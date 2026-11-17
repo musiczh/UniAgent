@@ -44,8 +44,11 @@ try {
     assert.deepEqual(assignment.inputSchema.allOf.map((row: any) => row.then.required), [['taskId'],['requirementId'],['projectId'],['requirementName'],['clarification','clarificationOptions']])
     assert.equal(assignment.inputSchema.properties.clarificationOptions.maxItems,6)
     assert.deepEqual(assignment.inputSchema.properties.clarificationOptions.items.required,['label'])
-    assert.equal(assignment.inputSchema.properties.scopeAssessment.properties.evidenceRefs.minItems, undefined)
-    assert.equal(assignment.inputSchema.properties.reuseAssessment.properties.evidenceRefs.minItems, undefined)
+    assert.equal(assignment.inputSchema.properties.scopeAssessment, undefined, 'the removed optional assessment fields are not advertised')
+    assert.equal(assignment.inputSchema.properties.reuseAssessment, undefined)
+    const queryTool = tools.find((row: any) => row.name === 'router_query')
+    assert.deepEqual(queryTool.inputSchema.properties.mode.enum, ['catalog','object_detail','task_briefs','task_detail'])
+    assert.equal(queryTool.inputSchema.properties.reference, undefined)
     response = receive()
     child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'router_query', arguments: {} } }) + '\n')
     assert.equal(JSON.parse((await response).result.content[0].text).sessionId, 'router-runtime')
@@ -62,7 +65,8 @@ try {
   assert.equal(sdk.role?.toolPolicy, undefined)
   assert.equal(sdk.role?.skills, undefined)
   assert.ok(!launch.args.includes('--disallowedTools'))
-  assert.equal(launch.appendedPrompt, ROUTER_SYSTEM_PROMPT)
+  assert.ok(launch.appendedPrompt!.startsWith(ROUTER_SYSTEM_PROMPT))
+  assert.doesNotMatch(launch.appendedPrompt!, /uniagent_query\(action="context"\)/, 'fixed rules leave runtime queries to the tool schema instead of repeating generic instructions')
   const qoder = qoderLaunch('qodercn', { ...config, agentId: 'qoder' }, ROUTER_SYSTEM_PROMPT, mcp)
   assert.equal(qoder.options.tools, undefined)
   assert.equal(qoder.role?.toolPolicy, undefined)
@@ -99,7 +103,8 @@ try {
       }
       assert.equal(start.config['features.shell_tool'], undefined)
       assert.equal(start.config['features.multi_agent'], undefined)
-      assert.equal(start.developerInstructions, ROUTER_SYSTEM_PROMPT)
+      assert.ok(start.developerInstructions.startsWith(ROUTER_SYSTEM_PROMPT))
+      assert.match(start.developerInstructions, /initialRequirementContext/)
       const turn = transport.calls.find(row => row.method === 'turn/start')!.params
       assert.ok(turn.input.some((row: any) => row.type === 'localImage' && row.path.endsWith('input.png')))
     } finally { runner.dispose() }

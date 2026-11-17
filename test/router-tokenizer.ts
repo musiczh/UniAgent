@@ -10,14 +10,14 @@ for (const row of fixture.samples) {
   assert.ok(tokenizer.count(clipped) <= 200)
   assert.equal(Buffer.from(clipped).toString('utf8'), clipped, 'clipping preserves complete Unicode code points')
 }
-for (const count of [199, 200, 201]) {
+for (const limit of [200, 300, 500]) for (const count of [limit - 1, limit, limit + 1]) {
   const text = ' a'.repeat(count)
   assert.equal(tokenizer.count(text), count)
-  assert.equal(tokenizer.count(tokenizer.clip(text, 200)), Math.min(count, 200))
+  assert.equal(tokenizer.count(tokenizer.clip(text, limit)), Math.min(count, limit))
 }
 assert.equal(await loadRouterTokenizer(), tokenizer, 'model assets load once')
 await assert.rejects(loadRouterTokenizer('/nonexistent/uniagent-tokenizer'), /ENOENT/)
-const items = Array.from({ length: 60 }, (_, id) => ({ id, description: ' a'.repeat(200) }))
+const items = Array.from({ length: 60 }, (_, id) => ({ id, description: ' a'.repeat(id % 2 ? 300 : 500) }))
 let offset = 0, pages = 0
 do {
   const page = tokenizer.page(items, offset)

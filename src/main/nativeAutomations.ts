@@ -171,6 +171,27 @@ export class NativeAutomations {
     return true
   }
 
+  async retry(target: AutomationDetail): Promise<AutomationDetail> {
+    this.load()
+    if (target?.source !== 'uniagent') throw new Error('仅支持重试 UniAgent 原生定时任务')
+    if (!this.started) throw new Error('定时任务尚未就绪，请稍后重试')
+    const current = this.items.find(item => item.id === target.id)
+    if (!current) throw new Error('定时任务不存在或已删除')
+    if (current.lastRunStatus !== 'error' || this.pending.has(current.id)) throw new Error('当前没有可重试的失败执行，或任务正在执行')
+    if (!Number.isFinite(target.lastRunAt) || target.lastRunAt !== current.lastRunAt || target.updatedAt !== current.updatedAt) {
+      throw new Error('任务配置或上次执行已变化，请刷新后重试')
+    }
+    const task: AutomationDetail = { ...current, lastRunAt: Math.max(Date.now(), current.lastRunAt! + 1),
+      lastRunStatus: 'running', lastSessionId: undefined, lastRunError: undefined }
+    this.commit(this.items.map(item => item.id === task.id ? task : item))
+    const token = {}
+    this.pending.set(task.id, token)
+    await this.execute(structuredClone(task), token, true)
+    const result = this.get(task.id)
+    if (!result) throw new Error('定时任务不存在或已删除')
+    return result
+  }
+
   start(): void {
     if (this.started) return
     this.load()
@@ -214,12 +235,12 @@ export class NativeAutomations {
     }
   }
 
-  private async execute(task: AutomationDetail, token: object): Promise<void> {
+  private async execute(task: AutomationDetail, token: object, manual = false): Promise<void> {
     let spawned = false
     const isCurrent = (): boolean => {
       const item = this.items.find(item => item.id === task.id)
-      return this.started && this.pending.get(task.id) === token && item?.status === 'active' && item.updatedAt === task.updatedAt &&
-        matchesAutomationDay(new Date(Date.now()), item.dayMode) === true
+      return !!item && this.started && this.pending.get(task.id) === token && item.updatedAt === task.updatedAt && item.lastRunAt === task.lastRunAt &&
+        (manual ? item.status === task.status : item.status === 'active' && matchesAutomationDay(new Date(Date.now()), item.dayMode) === true)
     }
     try {
       const session = await this.runtime.run(task, isCurrent)

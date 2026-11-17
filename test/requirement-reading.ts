@@ -7,7 +7,7 @@ import { RequirementDistiller } from '../src/main/requirementDistiller'
 import { validateRequirementReading, requirementReadingPrompt, resolveRequirementReadingReferences, requirementBrief } from '../src/main/requirementReading'
 import { TaskTitleTokenCounter } from '../src/main/taskTitleTokens'
 import { saveRequirementSync, publishRequirement, requirementSnapshot } from '../src/main/requirementSpace'
-import { configureRequirementRuntime, prepareRequirementTurn, setRequirementsEnabled } from '../src/main/requirementRuntime'
+import { configureRequirementRuntime, initialRequirementSnapshot, prepareRequirementTurn, setRequirementsEnabled } from '../src/main/requirementRuntime'
 import type { RequirementReading } from '../src/shared/requirementTypes'
 import type { Session, UAEvent } from '../src/shared/types'
 import { requirementDecisionTime } from '../src/shared/requirementTimeline'
@@ -55,6 +55,7 @@ try {
     description: { text: '保存需求背景，支持持续补充需求。', refs: [{ documentId: 'core', quote: '保存需求背景。' }] },
     requirements: Array.from({ length: 9 }, (_, index) => ({ title: '分项 ' + index, text: '保存需求背景', refs: [{ documentId: 'design', quote: '保存需求背景。' }] })),
     goal: { text: '保存需求背景', refs: [{ documentId: 'core', quote: '保存需求背景。' }] },
+    scope: { text: '背景与设计审查', refs: [{ documentId: 'core', quote: '保存需求背景。' }, { documentId: 'state', quote: '下一步审查设计。' }] },
     current: { text: '基础已交付，用户验收待确认', refs: [{ documentId: 'state', quote: '基础已交付，用户验收待确认。' }] },
     constraints: [], stages: [{ title: '基础能力', detail: '用户验收待确认', status: 'delivered', refs: [{ documentId: 'state', quote: '基础已交付，用户验收待确认。' }] }], issues: [],
     next: [{ text: '审查设计', kind: 'confirmed', refs: [{ documentId: 'state', quote: '下一步审查设计。' }] }] }
@@ -93,12 +94,17 @@ try {
   const document = await store.context(requirement.id, session.id, { action: 'read', documentId: 'state', limit: 3 })
   assert.equal(document.sync.pending, undefined)
   assert.equal(document.document.content, '基础已')
+  assert.equal(document.nextOffset, 3)
+  const stateRemainder = await store.context(requirement.id, session.id, { action: 'read', documentId: 'state', offset: document.nextOffset })
+  assert.equal(document.document.content + stateRemainder.document.content, '基础已交付，用户验收待确认。下一步审查设计。', 'on-demand paging preserves the full progress and next action')
+  assert.equal(stateRemainder.nextOffset, null)
   configureRequirementRuntime(() => session, async () => boot)
+  const initialContext = await initialRequirementSnapshot(session)
+  assert.deepEqual(initialContext, { id: requirement.id, name: '人读需求', overview: { goal: '保存需求背景', scope: '背景与设计审查' }, readingStatus: 'ready' }, 'initial context contains identity, short goal/scope and reading status while detailed progress remains available on demand')
+  assert.ok(JSON.stringify(initialContext).length < 3000, 'many historical Sessions cannot expand default injection')
   const turn = prepareRequirementTurn(session, '继续')
   const prompt = await turn.ready; turn.complete()
-  assert.ok(prompt.includes('用户验收待确认'))
-  assert.ok(!prompt.includes('processedSeq'), 'the retrieval entry is short and never includes all historical cursors')
-  assert.ok(prompt.length < 3000, 'many historical Sessions cannot expand default injection')
+  assert.equal(prompt, '继续', 'ordinary turn preparation preserves the original user input')
   await store.context(requirement.id, session.id, { action: 'propose', expectedRevision: source.revision, operationId: 'draft-next', documents: [{ id: 'draft', kind: 'proposal', title: '待确认建议', content: '建议并不生效' }] })
   overview = await store.readOverview(requirement.id)
   assert.equal(overview.readingStatus, 'stale')

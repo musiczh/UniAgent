@@ -8,6 +8,7 @@ import { TaskTitleIntegration } from '../src/main/taskTitleIntegration'
 import { TaskMetadataStore } from '../src/main/taskMetadataStore'
 import { TaskTitleService } from '../src/main/taskTitleService'
 import type { AgentDef, Session, UAEvent } from '../src/shared/types'
+import { prepareAssistantInitializationForSession } from '../src/main/assistant/context'
 
 const root = await mkdtemp(join(tmpdir(), 'title-claude-start-'))
 const until = async (predicate: () => boolean) => { for (let i = 0; i < 200; i++) { if (predicate()) return; await new Promise(resolve => setTimeout(resolve, 5)) }; assert.fail('Claude fixture timeout') }
@@ -29,6 +30,7 @@ try {
       return {}
     }
     sdk.close = async () => {}; sdk.respond = () => {}
+    await prepareAssistantInitializationForSession(mode, config)
     const launch = buildCommand(agent, config, '修复图片漏显', undefined, undefined, mode, undefined, true)
     ;(runner as any).sdk = sdk
     ;(runner as any).sdkKey = JSON.stringify({ bin: agent.bin, version: agent.version, config, env: undefined, instructions: launch.appendedPrompt })

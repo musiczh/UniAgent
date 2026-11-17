@@ -1,6 +1,53 @@
 import assert from 'node:assert/strict'
 import { renderEventStream } from './regression/render-event-stream.mjs'
 
+const errorDisclosure = await renderEventStream([], 'idle', 'router-error-disclosure', {
+  setup: `
+    import {RouterAssignmentContext,RouterAssignmentEvent} from './src/renderer/components/RouterAssignmentCard';
+    const marker='diagnostic-only-marker';
+    const response={content:[{type:'text',text:JSON.stringify({error:'invalid_router_arguments',code:'invalid_router_arguments',message:'请按工具声明修正参数；router_query 仅支持 catalog、object_detail、task_briefs、task_detail。本轮基础信息已随输入提供。',recovery:{action:'retry'},detail:marker})}],structuredContent:null,_meta:null};
+    const request={requestId:'11111111-1111-4111-8111-111111111111',prompt:'用户输入：{"error":"invalid_router_arguments"}',scope:{kind:'global'},config:{},version:4,state:'routing',delivery:'pending',createdAt:1,updatedAt:1};
+    const event={sessionId:'router-errors',seq:1,ts:2,type:'tool_call',state:'failed',payload:{name:'router_assign_task',input:{requestId:request.requestId,version:3},output:response}};
+    const original=JSON.stringify(event),host=document.body.appendChild(document.createElement('div')),root=createRoot(host);
+    window.uniagent={getRouterReview:async id=>({request:{requestId:id},revision:0,attempts:[],feedbackHistory:[]}),getRouterReviewTargets:async()=>[],onRouterChanged:()=>()=>{}};
+    let rejection=response;
+    const show=(patch={},tool=event,known=true)=>root.render(React.createElement(RouterAssignmentContext.Provider,{value:known?{requests:[{...request,...patch}],agents:[],resolve:async()=>{throw rejection},openTask:()=>{}}:undefined},React.createElement(RouterAssignmentEvent,{event:tool})));
+    show();window.errorDisclosure={host,request,event,response,original,show,rejectWith:value=>rejection=value};
+  `,
+  inspect: `(async()=>{
+    const f=window.errorDisclosure,tick=()=>new Promise(resolve=>setTimeout(resolve,20)),wait=async check=>{for(let i=0;i<100;i++){if(check())return;await tick()}throw Error('Router error disclosure timeout')};
+    await wait(()=>f.host.querySelector('.router-assignment'));
+    const checks={},safe=()=>!f.host.textContent.includes('diagnostic-only-marker')&&!f.host.textContent.includes('structuredContent')&&!f.host.textContent.includes('router_query 仅支持 catalog、object_detail、task_briefs、task_detail');
+    for(const [index,[field,value]] of [['output',f.response],['output',JSON.stringify(f.response)],['error',f.response],['result',f.response],['error','invalid_router_arguments'],['output',undefined]].entries()){
+      const {output,...payload}=f.event.payload;f.show({}, {...f.event,payload:{...payload,[field]:value}});await tick();
+      checks['toolResponse'+index]=safe()&&f.host.querySelector('.router-error')?.textContent==='正在重新确认分配信息，请稍候。'&&f.host.querySelector('.router-error')?.getAttribute('role')==='status';
+    }
+    checks.businessInputPreserved=f.host.querySelector('.router-assignment-input').textContent===f.request.prompt;
+    f.show({}, {...f.event,state:'success'});await tick();checks.successfulCallClearsNotice=!f.host.querySelector('.router-error');
+    f.show({state:'bound',delivery:'accepted',targetId:'task',error:JSON.stringify(f.response)},f.event);await tick();checks.confirmedReceiptIgnoresOldToolFailure=!f.host.querySelector('.router-error')&&safe();
+    f.show({state:'cancelled',error:JSON.stringify(f.response)});await tick();checks.cancelledHasNoStaleError=!f.host.querySelector('.router-error')&&safe();
+    const snapshot={...f.request,state:'needs_input',version:3,error:JSON.stringify(f.response),decision:{action:'clarify',reason:'请选择归属',clarificationOptions:[]},question:'请选择归属'};
+    f.show({state:'bound',clarifications:[{id:'old-round',answeredAt:3,answer:'属于 UniAgent',snapshot}]});await tick();checks.frozenClarificationHasNoToolError=!f.host.querySelector('.router-error')&&safe();
+    f.show({state:'routing',error:JSON.stringify(f.response),failure:{code:'router-tool-recovery',sessionId:'router-errors'}}, {...f.event,state:'success'});await tick();checks.persistedRecoveryIsReadable=safe()&&f.host.querySelector('.router-error')?.textContent==='正在重新确认分配信息，请稍候。';
+    f.show({state:'queued',error:JSON.stringify(f.response),autoRecovery:{attempts:1,total:1,phase:'routing',reason:JSON.stringify(f.response),nextAt:Date.now()+2000}});await tick();checks.automaticRecoveryHidesDiagnostics=safe()&&!f.host.querySelector('.router-error')&&f.host.querySelector('.router-recovery')?.textContent.startsWith('正在自动恢复分配，请稍候。');
+    f.show({state:'failed',error:JSON.stringify(f.response)});await tick();
+    checks.failureHasReadableRetry=safe()&&f.host.querySelector('[role="alert"]')?.textContent==='任务分配暂未完成，请重试。'&&[...f.host.querySelectorAll('button')].some(button=>button.textContent==='重试');
+    for(const value of [f.response,Error(JSON.stringify(f.response))]){
+      f.rejectWith(value);[...f.host.querySelectorAll('button')].find(button=>button.textContent==='重试').click();await tick();
+      checks[value instanceof Error?'exceptionHidden':'rejectedResponseHidden']=safe()&&f.host.querySelector('[role="alert"]')?.textContent==='操作暂未完成，请重试。';
+    }
+    f.show({state:'bound',delivery:'accepted',targetId:'task',version:5});await tick();checks.newReceiptClearsLocalError=!f.host.querySelector('.router-error');
+    f.show({state:'bound',delivery:'failed',targetId:'task'});await tick();checks.failedDeliveryKeepsAssignmentSuccess=safe()&&f.host.querySelector('.router-assignment-status')?.textContent==='分配成功'&&!f.host.querySelector('.router-assignment-body [role="alert"]')&&f.host.querySelector('.router-assignment footer')?.textContent.includes('本轮执行失败')&&[...f.host.querySelectorAll('button')].some(button=>button.textContent==='打开目标任务')&&![...f.host.querySelectorAll('button')].some(button=>button.textContent==='重试');
+    f.show({},f.event,false);await tick();const fallback=f.host.querySelector('.tool-call');fallback.open=true;await tick();checks.missingReceiptHidesPayload=safe()&&!fallback.querySelector('pre')&&fallback.textContent.includes('暂时无法读取分配结果，请稍后再查看。');
+    f.show({}, {...f.event,state:'running'},false);await tick();checks.pendingReceiptHidesPayload=safe()&&!f.host.querySelector('pre')&&f.host.textContent.includes('正在读取分配结果，请稍候。');
+    checks.originalDiagnosticsRetained=JSON.stringify(f.event)===f.original;
+    return{checks,errors:window.__fixtureErrors};
+  })()`
+})
+assert.deepEqual(errorDisclosure.errors, [])
+for (const [name, passed] of Object.entries(errorDisclosure.checks)) assert.equal(passed, true, name)
+console.log('PASS Router error disclosure: object/string tool responses, missing receipts, native failures, action errors, recovery and original diagnostics')
+
 const result = await renderEventStream([], 'idle', 'router-ui', {
   setup: `
     import {RouterAssignmentContext} from './src/renderer/components/RouterAssignmentCard';
@@ -12,9 +59,10 @@ const result = await renderEventStream([], 'idle', 'router-ui', {
     const config={enabled:false,agentId:'deepseek',model:JSON.stringify(['deepseek-official','deepseek-flash']),effort:'max',version:1};
     const agents=[{id:'deepseek',name:'DeepSeek Harness',adapter:'deepseek',installed:true,models:[{id:config.model,label:'Flash',efforts:['max']}],capabilities:{auxiliarySystemPrompt:true,protocol:'web',permissionModes:[]},lifecycle:{availability:'available'}}];
     const request={requestId:'11111111-1111-4111-8111-111111111111',prompt:'继续修复图片',scope:{kind:'global'},config,version:4,state:'bound',delivery:'queued',createdAt:1,updatedAt:1,decision:{action:'reuse_task',taskId:'original',reason:'目标相同'},targetId:'original',targetTitle:'图片漏显',projectName:'UniAgent',execution:{agentId:'codex',model:'gpt',workdir:'/other'}};
-    const errors=[],resolutions=[],opened=[],saves=[];let finishSave,changed=()=>{},reads=0;
+    const routerChanges=new Set();
+    const errors=[],resolutions=[],opened=[],saves=[];let finishSave,changed=()=>routerChanges.forEach(cb=>cb()),reads=0;
     window.addEventListener('error',e=>errors.push(e.message));window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
-    window.uniagent=new Proxy({getRouterSnapshot:async()=>({config,available:true,requests:[request],sessionId:'fixed-router'}),onRouterChanged:cb=>{changed=cb;return()=>{}},saveRouterConfig:(draft,version)=>{saves.push({draft,version});return new Promise(resolve=>finishSave=resolve)},openRouter:async()=>({id:'fixed-router',title:'RouterAgent',status:'idle',createdAt:1,config:{agentId:'deepseek',model:config.model,effort:'max',workdir:'/fixture',managedPurpose:'router'}}),getEvents:async()=>[{sessionId:"fixed-router",seq:0,ts:1,type:"user_message",payload:{text:"wire request instruction",displayText:"原始任务输入"}},{sessionId:"fixed-router",seq:1,ts:2,type:"system_notice",payload:{kind:"usage",usage:{contextTokens:32000,contextWindow:1000000}}}],getPrefs:async()=>({lastByAgent:{}})}, {get:(target,key)=>key in target?target[key]:String(key).startsWith('on')?()=>()=>{}:async()=>[]});
+    window.uniagent=new Proxy({getRouterReview:async id=>({request:{requestId:id},revision:0,attempts:[],feedbackHistory:[]}),getRouterSnapshot:async()=>({config,available:true,requests:[request],sessionId:'fixed-router'}),onRouterChanged:cb=>{routerChanges.add(cb);return()=>routerChanges.delete(cb)},saveRouterConfig:(draft,version)=>{saves.push({draft,version});return new Promise(resolve=>finishSave=resolve)},openRouter:async()=>({id:'fixed-router',title:'RouterAgent',status:'idle',createdAt:1,config:{agentId:'deepseek',model:config.model,effort:'max',workdir:'/fixture',managedPurpose:'router'}}),getEvents:async()=>[{sessionId:"fixed-router",seq:0,ts:1,type:"user_message",payload:{text:"wire request instruction",displayText:"原始任务输入",routedInputId:request.requestId}},{sessionId:"fixed-router",seq:1,ts:2,type:"system_notice",payload:{kind:"usage",usage:{contextTokens:32000,contextWindow:1000000}}}],getPrefs:async()=>({lastByAgent:{}})}, {get:(target,key)=>key in target?target[key]:String(key).startsWith('on')?()=>()=>{}:async()=>[]});
     const event=(seq,type,payload,state='success')=>({sessionId:'fixed-router',seq,ts:seq+1,type,payload,state});
     const history=[event(0,'user_message',{text:request.prompt}),event(1,'tool_call',{name:'mcp__uniagent_router__router_assign_task',input:{requestId:request.requestId,version:3}}),...Array.from({length:12},(_,i)=>event(i+2,'agent_message',{text:'处理步骤 '+i,phase:'commentary'})),event(20,'agent_message',{text:'输入已排队，按原任务配置继续',phase:'final_answer'}),event(21,'turn_completed',{})];
     const host=document.body.appendChild(document.createElement('div')),root=createRoot(host);
@@ -104,7 +152,7 @@ const duplicates = await renderEventStream([], 'idle', 'router-duplicates', {
     const failedWithoutDecision={...routing,requestId:'33333333-3333-4333-8333-333333333333',state:'failed',error:'读取候选失败'};
     render('running',history.slice(0,2),routing,[routing,second]);
     const panelHost=document.body.appendChild(document.createElement('div')),panelRoot=createRoot(panelHost);
-    window.uniagent=new Proxy({getRouterSnapshot:async()=>({config,available:true,requests:[request,second,failedWithoutDecision],sessionId:'router-duplicates'}),openRouter:async()=>({id:'router-duplicates',title:'RouterAgent',status:'idle',createdAt:1,config:{agentId:'deepseek',model:'flash',workdir:'/fixture',managedPurpose:'router'}}),getEvents:async()=>history,getPrefs:async()=>({lastByAgent:{}})},{get:(target,key)=>key in target?target[key]:String(key).startsWith('on')?()=>()=>{}:async()=>[]});
+    window.uniagent=new Proxy({getRouterReview:async id=>({request:{requestId:id},revision:0,attempts:[],feedbackHistory:[]}),getRouterSnapshot:async()=>({config,available:true,requests:[request,second,failedWithoutDecision],sessionId:'router-duplicates'}),openRouter:async()=>({id:'router-duplicates',title:'RouterAgent',status:'idle',createdAt:1,config:{agentId:'deepseek',model:'flash',workdir:'/fixture',managedPurpose:'router'}}),getEvents:async()=>history,getPrefs:async()=>({lastByAgent:{}})},{get:(target,key)=>key in target?target[key]:String(key).startsWith('on')?()=>()=>{}:async()=>[]});
     const mountPanel=key=>panelRoot.render(React.createElement(RouterPanel,{key,agents:[agent],onOpenTask:id=>opened.push(id),onSettings:()=>{},mergeEvent:mergeSessionEvent}));
     mountPanel('initial');
     window.duplicateFixture={host,panelHost,history,opened,errors,render,mountPanel,request,second,routing};
@@ -116,8 +164,8 @@ const duplicates = await renderEventStream([], 'idle', 'router-duplicates', {
     const beforeAcceptance=[ids(f.host).length];
     const rejected=[...f.history.slice(0,2),{...f.history[2],payload:{...f.history[2].payload,output:'router_scope_conflict'}}];
     f.render('running',rejected,f.routing,[f.routing,f.second]);await tick();beforeAcceptance.push(ids(f.host).length);
-    const rejectionVisible=f.host.querySelector('[role="alert"]')?.textContent.includes('router_scope_conflict');
-    f.render('running',f.history.slice(0,5),f.routing,[f.routing,f.second]);await tick();beforeAcceptance.push(ids(f.host).length);const retryClearsRejection=!f.host.textContent.includes('router_scope_conflict');
+    const rejectionVisible=f.host.querySelector('[role="status"].router-error')?.textContent==='正在重新确认分配信息，请稍候。'&&!f.host.textContent.includes('router_scope_conflict');
+    f.render('running',f.history.slice(0,5),f.routing,[f.routing,f.second]);await tick();beforeAcceptance.push(ids(f.host).length);const retryClearsRejection=!f.host.querySelector('.router-error');
     f.render('running',f.history.slice(0,5),{...f.request,state:'routing'});await tick();beforeAcceptance.push(ids(f.host).length);
     f.render('running',f.history.slice(0,5),{...f.request,state:'cancelled'});await tick();beforeAcceptance.push(ids(f.host).length);
     f.render('running',f.history.slice(0,5),f.request);await wait(()=>ids(f.host).length===1);
@@ -143,8 +191,8 @@ const duplicates = await renderEventStream([], 'idle', 'router-duplicates', {
   })()`
 })
 assert.deepEqual(duplicates.beforeAcceptance,[1,1,1,1,1],'every known request has one card, including routing, rejected calls and cancellation')
-assert.equal(duplicates.rejectionVisible,true,'rejected assignment keeps the original tool error available')
-assert.equal(duplicates.retryClearsRejection,true,'a later successful tool call clears the earlier rejection alert')
+assert.equal(duplicates.rejectionVisible,true,'rejected assignment shows a readable status without the tool error')
+assert.equal(duplicates.retryClearsRejection,true,'a later successful tool call clears the earlier recovery status')
 assert.deepEqual(duplicates.committing,['11111111-1111-4111-8111-111111111111'],'accepted decisions remain visible during delivery')
 assert.deepEqual(duplicates.waiting, [], 'saved assignment calls do not create a card for a waiting input')
 assert.deepEqual(duplicates.acceptedFailure,['11111111-1111-4111-8111-111111111111'],'an accepted decision retains the task creation failure result')
@@ -192,43 +240,44 @@ const placement = await renderEventStream([], 'idle', 'router-assignment-placeme
     const agents=[{id:'deepseek',name:'DeepSeek Harness',adapter:'deepseek',installed:true,models:[{id:'flash',label:'Flash',efforts:[]}],capabilities:{auxiliarySystemPrompt:true,protocol:'web',permissionModes:[]}}];
     const session={id:'router-placement',title:'RouterAgent',createdAt:1,status:'running',config:{agentId:'deepseek',model:'flash',workdir:'/fixture',managedPurpose:'router'}};
     const request=(requestId,createdAt,state)=>({requestId,prompt:'输入 '+requestId,scope:{kind:'global'},config,createdAt,updatedAt:createdAt,state,delivery:'pending',version:1});
-    let requests=[request('old-failed',1,'failed'),request('old-cancelled',2,'cancelled'),{...request('first',1000,'routing'),routerSessionId:session.id}];
+    let requests=[request('old-failed',1,'failed'),request('old-cancelled',2,'cancelled'),{...request('old-bound',3,'bound'),delivery:'finished',targetId:'unrelated-task'}, {...request('first',1000,'routing'),routerSessionId:session.id}];
     const event=(seq,ts,type,payload)=>({sessionId:session.id,seq,ts,type,payload,state:'success'});
-    let events=[event(0,1010,'user_message',{text:'第一项输入',routedInputId:'first'})],changed=()=>{},push=()=>{},activeRequestId='first';
+    const routerChanges=new Set();
+    let events=[event(0,1010,'user_message',{text:'第一项输入',routedInputId:'first'})],changed=()=>routerChanges.forEach(cb=>cb()),push=()=>{},activeRequestId='first';
     const errors=[],opened=[];window.addEventListener('error',e=>errors.push(e.message));window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
-    window.uniagent=new Proxy({getRouterSnapshot:async()=>({config,available:true,sessionId:session.id,activeRequestId,requests}),openRouter:async()=>session,getEvents:async()=>events,getTurnArtifactSummary:async()=>null,getPrefs:async()=>({lastByAgent:{}}),
-      onRouterChanged:cb=>{changed=cb;return()=>{}},onEvent:cb=>{push=cb;return()=>{}}},{get:(t,k)=>k in t?t[k]:String(k).startsWith('on')?()=>()=>{}:async()=>[]});
+    window.uniagent=new Proxy({getRouterReview:async id=>({request:{requestId:id},revision:0,attempts:[],feedbackHistory:[]}),getRouterSnapshot:async()=>({config,available:true,sessionId:session.id,activeRequestId,requests}),openRouter:async()=>session,getEvents:async()=>events,getTurnArtifactSummary:async()=>null,getPrefs:async()=>({lastByAgent:{}}),
+      onRouterChanged:cb=>{routerChanges.add(cb);return()=>routerChanges.delete(cb)},onEvent:cb=>{push=cb;return()=>{}}},{get:(t,k)=>k in t?t[k]:String(k).startsWith('on')?()=>()=>{}:async()=>[]});
     const host=document.body.appendChild(document.createElement('div'));host.style.cssText='position:fixed;inset:0';const root=createRoot(host);
     const mount=key=>root.render(React.createElement(RouterPanel,{key,agents,onSettings:()=>{},onOpenTask:id=>opened.push(id),mergeEvent:mergeSessionEvent}));mount('initial');
     const append=rows=>{events=[...events,...rows];rows.forEach(push)};
     const finish=id=>{requests=requests.map(row=>row.requestId===id?{...row,state:'bound',delivery:'accepted',version:row.version+1,targetId:id+'-task',targetTitle:id+' 目标',decision:{action:'reuse_task',taskId:id+'-task',reason:'已确认目标'}}:row);changed();const seq=events.at(-1).seq,ts=events.at(-1).ts;
       append([event(seq+1,ts+10,'tool_call',{id:id+'-call',name:'router_assign_task',input:{requestId:id,version:1}}),event(seq+2,ts+20,'agent_message',{text:'分配完成'}),event(seq+3,ts+30,'turn_completed',{})])};
-    window.placementFixture={host,errors,opened,finish,mount,queueNext:()=>{requests=[...requests,{...request('second',1500,'queued'),routerSessionId:session.id}];changed()},startNext:()=>{activeRequestId='second';requests=requests.map(row=>row.requestId==='second'?{...row,state:'routing',version:row.version+1}:row);requests.splice(3,0,request('between-cancelled',1600,'cancelled'));changed();append([event(4,2010,'user_message',{text:'第二项输入',routedInputId:'second'})])}};
+    window.placementFixture={host,errors,opened,finish,mount,queueNext:()=>{requests=[...requests,{...request('second',1500,'queued'),routerSessionId:session.id}];changed()},startNext:()=>{activeRequestId='second';requests=requests.map(row=>row.requestId==='second'?{...row,state:'routing',version:row.version+1}:row);requests.push({...request('between-cancelled',1600,'cancelled'),routerSessionId:session.id,roundStartedAt:1600});changed();append([event(4,2010,'user_message',{text:'第二项输入',routedInputId:'second'})])}};
   `,
   inspect: `(async()=>{
     const f=window.placementFixture,tick=()=>new Promise(r=>setTimeout(r,15)),wait=async check=>{for(let i=0;i<160;i++){if(check())return;await tick()}throw Error('Router card placement timeout: '+f.host.textContent+' / '+f.errors)};
     const ids=()=>[...f.host.querySelectorAll('[data-router-request]')].map(row=>row.dataset.routerRequest);
     const card=id=>f.host.querySelector('[data-router-request="'+id+'"]');
-    await wait(()=>ids().length===3);for(let i=0;i<5;i++)await tick();const routing=ids();
+    await wait(()=>card('first'));for(let i=0;i<5;i++)await tick();const routing=ids();
     f.queueNext();await wait(()=>f.host.querySelectorAll('.queue-card').length===1);for(let i=0;i<5;i++)await tick();const waiting={cards:ids(),queue:f.host.querySelector('.queue-text').textContent};
     f.finish('first');await wait(()=>card('first')?.textContent.includes('分配成功'));for(let i=0;i<5;i++)await tick();const firstDone=ids();
     const stream=f.host.querySelector('.event-stream').getBoundingClientRect(),receipt=card('first').getBoundingClientRect();const successVisible=receipt.bottom>stream.top&&receipt.top<stream.bottom&&!card('first').closest('details:not([open]),[aria-hidden="true"]');
     [...card('first').querySelectorAll('button')].find(button=>button.textContent==='打开目标任务').click();
-    f.startNext();await wait(()=>ids().length===5);for(let i=0;i<5;i++)await tick();const nextRouting=ids();
+    f.startNext();await wait(()=>card('second'));for(let i=0;i<5;i++)await tick();const nextRouting=ids();
     f.finish('second');await wait(()=>card('second')?.textContent.includes('分配成功'));for(let i=0;i<5;i++)await tick();const bothDone=ids();
     [...card('second').querySelectorAll('button')].find(button=>button.textContent==='打开目标任务').click();
-    f.mount('reopened');await wait(()=>ids().length===5);for(let i=0;i<5;i++)await tick();
+    f.mount('reopened');await wait(()=>card('second'));for(let i=0;i<5;i++)await tick();
     return {waiting,successVisible,routing,firstDone,nextRouting,bothDone,reopened:ids(),opened:f.opened,errors:f.errors};
   })()`
 })
 assert.deepEqual(placement.errors, [])
-assert.deepEqual(placement.waiting, {cards:['old-failed','old-cancelled','first'],queue:'输入 second'}, 'a waiting input appears once in the queue without an assignment card')
+assert.deepEqual(placement.waiting, {cards:['old-failed','first'],queue:'输入 second'}, 'unrelated terminal requests stay out of the conversation while pending preparation failures remain retryable')
 assert.equal(placement.successVisible, true, 'the completed receipt remains visible while the next input waits in the queue')
 for (const stage of ['routing', 'firstDone'] as const) {
-  assert.deepEqual(placement[stage], ['old-failed', 'old-cancelled', 'first'], `${stage}: old fallback cards must not push the current result above the visible latest input`)
+  assert.deepEqual(placement[stage], ['old-failed', 'first'], `${stage}: unrelated cancelled and bound requests must not push the current result above the visible latest input`)
 }
 for (const stage of ['nextRouting', 'bothDone', 'reopened'] as const) {
-  assert.deepEqual(placement[stage], ['old-failed', 'old-cancelled', 'first', 'between-cancelled', 'second'], `${stage}: fallback and result cards retain chronological input order`)
+  assert.deepEqual(placement[stage], ['old-failed', 'first', 'between-cancelled', 'second'], `${stage}: a cancellation after routing started remains in its own Session`)
 }
 assert.deepEqual(placement.opened, ['first-task', 'second-task'])
-console.log('PASS Router assignment placement: old failure/cancellation fallbacks, consecutive results, input anchors, chronological gaps and reopening')
+console.log('PASS Router assignment placement: retryable preparation failures, scoped cancellations, unrelated terminal records, consecutive results and reopening')

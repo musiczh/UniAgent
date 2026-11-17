@@ -524,7 +524,10 @@ async function nativeModelNextTurnCase(): Promise<void> {
     const turn = wire.requests.find(request => request.method === 'turn/start')!.params
     assert.equal(turn.model, 'gpt-small', '直接切换后的首条自然对话使用目标模型')
     assert.equal(turn.collaborationMode, undefined, '普通对话不发送覆盖模型的模式配置')
-    assert.deepEqual(turn.input, [{ type: 'text', text: 'hi', text_elements: [] }])
+    assert.deepEqual(turn.input, [
+      { type: 'text', text: '<uniagent_channel_context>\n当前消息通道：UniAgent App\n</uniagent_channel_context>', text_elements: [] },
+      { type: 'text', text: 'hi', text_elements: [] }
+    ])
     assert.equal(wire.requests.filter(request => request.method === 'thread/resume').length, 1)
     assert.equal(wire.requests.some(request => request.method === 'thread/compact/start'), false)
   } finally { runner.dispose() }
@@ -546,7 +549,7 @@ async function providerRoundTripCase(chain: SessionConfig[]): Promise<void> {
       return method === 'turn/start' ? { turn: { id: `roundtrip-${++turnNumber}` } } as T : result
     }
   }
-  const runner = new AppServerRunner('roundtrip', { n: 0 }, agent, chain[0], 'roundtrip-thread', undefined, () => {
+  const runner = new AppServerRunner(`roundtrip-${chain.length}`, { n: 0 }, agent, chain[0], 'roundtrip-thread', undefined, () => {
     const wire = new RoundTripTransport()
     transports.push(wire)
     return wire
@@ -568,7 +571,10 @@ async function providerRoundTripCase(chain: SessionConfig[]): Promise<void> {
       await runner.startTurn(`message-${index}`)
       const start = wire.requests.find(request => request.method === 'turn/start')!.params
       assert.equal(start.model, model, '切换后新发送的消息必须使用目标模型')
-      assert.deepEqual(start.input, [{ type: 'text', text: `message-${index}`, text_elements: [] }])
+      assert.deepEqual(start.input, [
+        ...(index === 0 ? [{ type: 'text', text: '<uniagent_channel_context>\n当前消息通道：UniAgent App\n</uniagent_channel_context>', text_elements: [] }] : []),
+        { type: 'text', text: `message-${index}`, text_elements: [] }
+      ], 'the first input carries a separate host channel; provider switches preserve the confirmed same-channel input history')
       const turnId = `roundtrip-${turnNumber}`
       wire.emit('notification', 'item/completed', { threadId, turnId, item: { id: `reply-${index}`, type: 'agentMessage', text: `reply-${index}` } })
       wire.emit('notification', 'turn/completed', { threadId, turn: { id: turnId, status: 'completed' } })
@@ -576,6 +582,13 @@ async function providerRoundTripCase(chain: SessionConfig[]): Promise<void> {
       assert.equal(!!result.failed, false)
       assert.equal(!!result.interrupted, false)
       assert.ok(events.some(event => event.type === 'agent_message' && event.payload.text === `reply-${index}`), '切换后必须完成真实消息事件链，不能只验证配置值')
+      const followupDone = new Promise<any>(resolve => runner.once('done', resolve))
+      await runner.startTurn(`followup-${index}`)
+      const followup = wire.requests.findLast(request => request.method === 'turn/start')!.params
+      assert.equal(followup.model, model)
+      assert.deepEqual(followup.input, [{ type: 'text', text: `followup-${index}`, text_elements: [] }], 'a confirmed same-channel followup does not repeat host context')
+      wire.emit('notification', 'turn/completed', { threadId, turn: { id: `roundtrip-${turnNumber}`, status: 'completed' } })
+      assert.equal(!!(await followupDone).failed, false)
       previousThreadId = threadId
     }
     assert.equal(transports.length, chain.length, '每次跨来源都重新连接，切回官方时不得沿用第三方路由')

@@ -158,6 +158,11 @@ export function mergeSubAgentSnapshot(
       : undefined
     return { ...incoming, startedAt, endedAt }
   }
+  // A child can become visible before its dispatch tool receipt. Its provisional
+  // message clock is not the dispatch generation carried by the later receipt.
+  if (incoming.nativeTaskId && !previous.nativeTaskId && incoming.generation !== undefined) {
+    return mergeSubAgentSnapshot({ ...previous, nativeTaskId: incoming.nativeTaskId, generation: incoming.generation }, incoming, observedAt)
+  }
 
   const previousGeneration = generationOf(previous)
   const incomingGeneration = generationOf(incoming)
@@ -431,4 +436,18 @@ export function formatSubAgentElapsed(agent: Pick<UASubAgent, 'startedAt' | 'end
   return seconds < 60
     ? `${seconds} 秒`
     : `${Math.floor(seconds / 60)} 分 ${(seconds % 60).toString().padStart(2, '0')} 秒`
+}
+
+/** A native task can migrate between threads while retaining one logical roster entry. */
+export function upsertSubAgentRoster(roster: Map<string, UASubAgent>, incoming: UASubAgent, observedAt?: number): void {
+  if (!incoming.agentThreadId) return
+  if (incoming.nativeTaskId) {
+    const prior = [...roster.values()].find(agent => agent.nativeTaskId === incoming.nativeTaskId &&
+      agent.parentThreadId === incoming.parentThreadId && agent.agentThreadId !== incoming.agentThreadId)
+    if (prior) {
+      if ((incoming.generation ?? 0) < (prior.generation ?? 0)) return
+      roster.delete(prior.agentThreadId)
+    }
+  }
+  roster.set(incoming.agentThreadId, mergeSubAgentSnapshot(roster.get(incoming.agentThreadId), incoming, observedAt))
 }

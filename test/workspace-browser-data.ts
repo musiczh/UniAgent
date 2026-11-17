@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { AppSettingsStore } from '../src/main/appSettingsStore'
 import { RequirementStore } from '../src/main/requirementStore'
 import { setRequirementsEnabled } from '../src/main/requirementRuntime'
-import { scopeSessions, browserAttention, browserRequirementTaskCounts, browserTaskStatus, sessionBrowserLocation } from '../src/renderer/scopeBrowser'
+import { scopeSessions, browserAttention, browserRequirementTaskCounts, browserTaskAttentionBySession, browserTaskStatus, sessionBrowserLocation } from '../src/renderer/scopeBrowser'
 import type { Session, Project } from '../src/shared/types'
 
 const root = mkdtempSync(join(tmpdir(), 'workspace-browser-'))
@@ -64,6 +64,7 @@ try {
   assert.equal(browserTaskStatus(cross,'running'),'正在执行')
   assert.equal(browserTaskStatus(cross,'completed',true),'需处理')
   const summary = (items: Session[], status = {}, pending = {}, unread = {}) => browserRequirementTaskCounts(items, status, pending, unread).get(req.id)
+  const attention = (items: Session[], status = {}, pending = {}) => browserTaskAttentionBySession(items, status, pending)
   assert.equal(summary(sessions), undefined, 'viewed normal results do not retain acceptance reminders')
   assert.deepEqual(summary(sessions, {}, {}, { cross: 'main', assistant: 'main', tool: 'main', archived: 'main', direct: 'main' }), { running: 0, acceptance: 1, waiting: 0, unread: 0 }, 'unviewed normal completion counts once; assistant, tool, archived and direct tasks are excluded')
   assert.deepEqual(summary([cross, { ...cross, updatedAt: 2, archived: true }]), undefined, 'latest duplicate snapshot controls archived membership')
@@ -73,10 +74,13 @@ try {
   for (const status of ['queued', 'cancelling', 'waiting_members']) {
     assert.deepEqual(summary([cross], { cross: status }), { running: 1, acceptance: 0, waiting: 0, unread: 0 }, status + ' remains active')
   }
-  assert.deepEqual(summary([cross], { cross: 'awaiting-approval' }), { running: 0, acceptance: 0, waiting: 1, unread: 0 }, 'approval is waiting for the user')
-  assert.deepEqual(summary([cross], { cross: 'running' }, { cross: true }), { running: 1, acceptance: 0, waiting: 1, unread: 0 }, 'an async question can coexist with execution')
+  assert.deepEqual(summary([cross], { cross: 'awaiting-approval' }, {}, { cross: 'main' }), { running: 0, acceptance: 0, waiting: 1, unread: 0 }, 'unread approval is waiting for the user')
+  assert.equal(summary([cross], { cross: 'awaiting-approval' }), undefined, 'reading an approval clears the requirement reminder without answering it')
+  assert.deepEqual(summary([cross], { cross: 'running' }, { cross: true }, { cross: 'main' }), { running: 1, acceptance: 0, waiting: 1, unread: 0 }, 'an unread async question can coexist with execution')
+  assert.deepEqual(summary([cross], { cross: 'running' }, { cross: true }), { running: 1, acceptance: 0, waiting: 0, unread: 0 }, 'reading a question leaves execution counted without a permanent yellow reminder')
   for (const status of ['error', 'interrupted', 'cancelled'] as const) {
     assert.deepEqual(summary([{ ...cross, status }], {}, {}, { cross: 'main' }), { running: 0, acceptance: 0, waiting: 1, unread: 0 }, status + ' unread errors are not normal result reminders')
+    assert.equal(summary([{ ...cross, status }]), undefined, status + ' does not keep a reminder after reading')
   }
   const recovered = { ...cross, status: 'error' as const, recovery: { phase: 'backoff' } as Session['recovery'] }
   assert.deepEqual(summary([recovered]), { running: 1, acceptance: 0, waiting: 0, unread: 0 }, 'automatic recovery still has active work')
@@ -91,6 +95,24 @@ try {
   assert.equal(summary([{ ...empty, nativeSessionId: 'native' }]), undefined, 'viewed native history does not become unread after restoration')
   assert.deepEqual(summary([{ ...empty, nativeSessionId: 'native' }], {}, {}, { cross: 'main' }), { running: 0, acceptance: 1, waiting: 0, unread: 0 }, 'unviewed restored native replies retain their reminder')
   assert.deepEqual(summary([{ ...empty, taskRegistration: { delivery: 'dispatched' } as Session['taskRegistration'] }], {}, {}, { cross: 'main' }), { running: 0, acceptance: 1, waiting: 0, unread: 0 }, 'an unviewed finished dispatched input counts without a delivery report')
-  assert.deepEqual(summary([{ ...cross, taskState: { phase: 'active', version: 1, updatedAt: 1, awaitingAcceptance: false, decisionHint: { count: 3, priority: 'high' } } }]), { running: 0, acceptance: 0, waiting: 1, unread: 0 }, 'multiple pending decisions contribute one task reminder')
+  const decisions = { ...cross, taskState: { phase: 'active', version: 1, updatedAt: 1, awaitingAcceptance: false, decisionHint: { count: 3, priority: 'high' } } } as Session
+  assert.deepEqual(summary([decisions], {}, {}, { cross: 'main' }), { running: 0, acceptance: 0, waiting: 1, unread: 0 }, 'multiple unread decisions contribute one task reminder')
+  assert.equal(summary([decisions]), undefined, 'read decision hints do not keep a requirement reminder')
+  const standby = { phase: 'standby', version: 1, updatedAt: 1, awaitingAcceptance: false } as const
+  const failed = { ...cross, status: 'error' as const, taskState: standby }
+  assert.deepEqual(attention([failed]), { cross: '任务执行异常' }, 'deferring an error changes the column without hiding the unresolved exception')
+  assert.equal(summary([failed], {}, {}, { cross: 'main' })?.waiting, Object.keys(attention([failed])).length, 'the unread yellow count identifies the same deferred failed task')
+  assert.equal(summary([failed]), undefined, 'reading a deferred failure clears its requirement reminder')
+  assert.deepEqual(attention([failed], { cross: 'running' }), {}, 'live continuation replaces the persisted error marker')
+  assert.deepEqual(attention([recovered]), {}, 'automatic recovery has execution feedback without an unresolved error marker')
+  assert.deepEqual(attention([{ ...cross, taskState: standby }]), {}, 'ordinary deferred work does not add a handling marker')
+  assert.deepEqual(attention([cross], { cross: 'running' }, { cross: true }), { cross: '需要回答或授权' }, 'a pending async question stays marked during execution')
+  assert.deepEqual(attention([{ ...cross, taskState: { ...standby, error: '任务业务记录无法读取' } }]), { cross: '状态待确认：任务业务记录无法读取' }, 'state read failures retain their specific reason')
+  const stateError = { ...cross, taskState: { ...standby, error: '任务业务记录无法读取' } }
+  assert.deepEqual(summary([stateError], {}, {}, { cross: 'main' }), { running: 0, acceptance: 0, waiting: 1, unread: 0 }, 'unread state failures still prompt reading')
+  assert.equal(summary([stateError]), undefined, 'a read state failure keeps its reason without a requirement reminder')
+  assert.deepEqual(attention([{ ...failed, updatedAt: 1 }, { ...cross, updatedAt: 2 }]), {}, 'an older error snapshot cannot restore the marker')
+  assert.deepEqual(attention([{ ...failed, archived: true }, assistant, member], {}, { cross: true, assistant: true, tool: true }), {}, 'archived, assistant and internal sessions do not produce board handling markers')
+  assert.deepEqual(attention([{ ...failed, taskState: { ...standby, phase: 'archived' } }]), {}, 'persisted archive excludes a stale runtime error')
   console.log('PASS R03/R04 settings defaults, persistence/failure, read-only managed/legacy context, task scope and attention ownership')
 } finally { setRequirementsEnabled(false);rmSync(root,{recursive:true,force:true}) }

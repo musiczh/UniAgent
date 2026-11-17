@@ -64,7 +64,7 @@ const result = await renderEventStream([], 'idle', 'task-board-sidebar-attention
     let root;
     const mount = () => { root = createRoot(host); root.render(React.createElement(App)); };
     mount();
-    window.fixture = { host, emit, logs, questions, calls, runtimeLoads, deleted, attention, allow: () => fail = false, restart: (legacy = false) => { root.unmount(); attention.restart(legacy); mount(); }, deferSnapshot: () => { let release; sessionSnapshotGate = new Promise(resolve => release = resolve); return () => { sessionSnapshotGate = undefined; release(); }; }, update: (id, patch) => { const index = sessions.findIndex(s => s.id === id); sessions[index] = { ...sessions[index], ...patch }; emit('updated', { session: sessions[index] }); }, publishSnapshot: session => { sessions.push(session); logs[session.id] = []; emit('updated', { session }); emit('board'); } };
+    window.fixture = { host, emit, logs, questions, calls, runtimeLoads, deleted, attention, allow: () => fail = false, restart: (legacy = false) => { root.unmount(); attention.restart(legacy); mount(); }, deferSnapshot: () => { let release; sessionSnapshotGate = new Promise(resolve => release = resolve); return () => { sessionSnapshotGate = undefined; release(); }; }, update: (id, patch) => { const index = sessions.findIndex(s => s.id === id); sessions[index] = { ...sessions[index], ...patch }; emit('updated', { session: sessions[index] }); }, publishSnapshot: session => { sessions.push(session); logs[session.id] = []; emit('updated', { session }); emit('board'); }, publishCreated: session => { sessions.push(session); logs[session.id] = []; emit('created', structuredClone(session)); emit('status', { sessionId: session.id, status: 'running' }); emit('board'); } };
   `,
   inspect: `(async () => {
     const f = window.fixture, tick = () => new Promise(r => setTimeout(r, 30));
@@ -76,6 +76,7 @@ const result = await renderEventStream([], 'idle', 'task-board-sidebar-attention
     const panel = () => [...f.host.querySelectorAll('.task-focus-panel')].find(el => !el.hidden);
     const radio = () => panel()?.querySelector('input[type=radio]');
     const submit = () => panel()?.querySelector('.approval-actions .btn-send');
+    const markers = () => [...f.host.querySelectorAll('.task-board-attention')].map(el => el.closest('[data-task-id]').dataset.taskId).sort();
     await wait(() => requirement() && boardButton() && f.host.querySelector('.new-task'), 'App ready');
     const chooseSidebarView = async value => { f.host.querySelector('[aria-label="切换侧栏视图"]').click();await tick();f.host.querySelector('[data-sidebar-view='+value+']').click();await tick(); };
     await chooseSidebarView('task');const agentAdapterFromApp = !!f.host.querySelector('[data-task-id=a] .agent-icon-codex');await chooseSidebarView('space');
@@ -85,16 +86,20 @@ const result = await renderEventStream([], 'idle', 'task-board-sidebar-attention
     const before = badge();
     boardButton().click();
     await wait(() => radio() && !radio().disabled, 'board native question');
+    const beforeMarkers = markers();
     const boardAgentAdapterFromApp = !!f.host.querySelector('.task-board [data-task-id=a] .task-board-agent .agent-icon-codex');
     radio().click(); submit().click();
     await wait(() => panel()?.textContent.includes('发送失败'), 'failed response');
     const afterFailure = badge(), dockAfterFailure = f.attention.text();
+    const failureMarkers = markers();
     f.allow(); submit().click();
     await wait(() => panel()?.dataset.focusTaskId === 'b' && radio() && !radio().disabled, 'next async question');
     const afterNative = badge();
+    const nativeMarkers = markers();
     radio().click(); submit().click();
     await wait(() => !f.host.querySelector('.task-focus-queue'), 'all questions resolved');
     const afterAll = badge(), persisted = storedUnread(), dockAfterAll = f.attention.text();
+    const settledMarkers = markers();
     f.restart();
     await wait(() => requirement() && boardButton(), 'restart'); await tick();
     const afterRestart = badge();
@@ -216,7 +221,52 @@ const result = await renderEventStream([], 'idle', 'task-board-sidebar-attention
     document.querySelector('[data-confirm-delete]').click();
     await wait(() => f.deleted.length === 1 && !f.host.querySelector('[data-task-id=routed]'), 'task deleted from requirement board');await tick();
     const deletion = { ids:f.deleted, attention:attention(), unread:storedUnread().routed ?? null };
-    return { ...result, restoredActiveCompletion, afterRecoveryInput, afterHiddenInput, afterChannelInput, channelPersisted, afterMainInputWithSideUnread, afterSideInput, afterSideResumeWithMainUnread, afterGoalInput, afterSideResume, afterBackgroundCreation, restoredRunning, restoredRunningPersisted, restoredQuestion, restoredQuestionPersisted, freshQuestion, freshQuestionPersisted, beforeSnapshotResume, afterSnapshotResume, snapshotResumePersisted, cleanRunningCard, runningSideReply, afterMainContinue, afterSideContinue, pendingQuestionAfterResume, routedQueued, stayedOnBoard, routedRunning, routedRepeated, routedCompleted, routedArchived, deletion };
+    f.publishSnapshot({id:'failed',title:'整理服务端基础知识清单并生成飞书文档',status:'error',createdAt:300,taskState:{phase:'standby',version:1,updatedAt:300,awaitingAcceptance:false},config:{agentId:'codex',workdir:'/fixture',projectId:'p',requirementId:'r'}});
+    f.logs.failed.push({sessionId:'failed',seq:1,ts:300,type:'error',state:'failed',payload:{message:'需求上下文读取失败，本轮未启动：需求文档写入等待超时'}});f.emit('board');
+    await wait(() => f.host.querySelector('.requirement-detail [data-task-id=failed]'), 'deferred error on requirement board');
+    const failureMarker=f.host.querySelector('[data-task-id=failed] .task-board-attention');
+    const deferredFailure={badge:badge(),markers:markers(),title:failureMarker?.title ?? null};
+    f.host.querySelector('[data-task-id=failed] .task-board-card-open').click();await wait(() => f.runtimeLoads.includes('failed'), 'open actual failed task');
+    const viewedFailure=badge();
+    boardButton().click();await wait(() => f.host.querySelector('.task-board [data-task-id=failed]'), 'global board retains failed task');
+    const globalFailureMarkers=markers();
+    f.update('failed',{status:'running'});f.emit('board');await wait(() => f.host.querySelector('[data-task-id=failed] .si-spinner'), 'continue failed task');
+    const resumedFailure={badge:badge(),markers:markers()};
+    f.update('failed',{archived:true,taskState:{phase:'archived',version:2,updatedAt:301,awaitingAcceptance:false}});f.emit('board');await wait(() => !f.host.querySelector('[data-task-id=failed]'), 'archive failed task');
+    const archivedFailure={badge:badge(),markers:markers()};
+    Object.assign(result,{beforeMarkers,failureMarkers,nativeMarkers,settledMarkers,deferredFailure,viewedFailure,globalFailureMarkers,resumedFailure,archivedFailure});
+    boardButton().click();await tick();
+    const scheduled = [1,2].map(i => ({id:'scheduled-'+i,title:'定时任务 '+i,status:'draft',createdAt:300+i,config:{agentId:'codex',workdir:'/fixture',projectId:'p',requirementId:'r'}}));
+    for (const session of scheduled) f.publishCreated(session);
+    await wait(() => f.host.querySelectorAll('.task-board [data-task-id^=scheduled-] .si-spinner').length === 2 && icons()[0]?.[1] === '2', 'both scheduled tasks reach board and sidebar');
+    const scheduledRunning = attention(), scheduledStayedOnBoard = !!f.host.querySelector('.task-board-workspace');
+    for (const session of scheduled) f.emit('created', {...session,status:'running'});
+    await tick();const scheduledRepeated = attention();
+    f.emit('status', {sessionId:'scheduled-1',status:'completed'});await tick();const scheduledCompleted = attention();
+    f.update('scheduled-1', {archived:true});await tick();const scheduledResultArchived = attention();
+    f.update('scheduled-2', {archived:true});await tick();const scheduledArchived = attention();
+    f.publishSnapshot({id:'reading',title:'待阅读的授权',status:'awaiting-approval',createdAt:500,config:{agentId:'codex',workdir:'/fixture',projectId:'p',requirementId:'r'}});
+    const unreadQuestion={...f.questions.a,sessionId:'reading',seq:501,ts:501,payload:{...f.questions.a.payload,requestId:'reading-first'}};
+    f.logs.reading.push(unreadQuestion);f.emit('event',unreadQuestion);
+    await wait(() => badge()?.text === '1', 'unread question reminder');
+    const beforeReadingQuestion=badge(), callsBeforeReading=f.calls.length;
+    requirement().querySelector('.scope-nav-name').click();
+    await wait(() => f.host.querySelector('.requirement-detail [data-task-id=reading] .task-board-card-open'), 'browse requirement without reading session');
+    const afterBrowsingQuestion=badge();
+    f.host.querySelector('.requirement-detail [data-task-id=reading] .task-board-card-open').click();
+    await wait(() => f.runtimeLoads.includes('reading'), 'read unanswered session');await tick();
+    const afterReadingQuestion=badge(), persistedAfterReadingQuestion=storedUnread().reading ?? null;
+    const pendingAfterReading=f.logs.reading[0].state, answeredWhileReading=f.calls.length-callsBeforeReading;
+    boardButton().click();await wait(() => f.host.querySelector('.task-board [data-task-id=reading]'), 'leave read session');
+    f.update('reading',{status:'awaiting-approval',updatedAt:502});f.emit('event',unreadQuestion);await tick();
+    const replayedReadQuestion=badge();
+    f.restart();await wait(() => requirement() && boardButton(), 'restore read unanswered session');await tick();
+    const restoredReadQuestion=badge();
+    boardButton().click();await wait(() => f.host.querySelector('.task-board [data-task-id=reading]'), 'restored question on board');
+    const nextQuestion={...unreadQuestion,seq:503,ts:503,payload:{...unreadQuestion.payload,requestId:'reading-next'}};
+    f.logs.reading.push(nextQuestion);f.emit('event',nextQuestion);await wait(() => badge()?.text === '1', 'new unread question returns reminder');
+    const newQuestionAfterReading=badge();
+    return { ...result, beforeReadingQuestion, afterBrowsingQuestion, afterReadingQuestion, persistedAfterReadingQuestion, pendingAfterReading, answeredWhileReading, replayedReadQuestion, restoredReadQuestion, newQuestionAfterReading, restoredActiveCompletion, afterRecoveryInput, afterHiddenInput, afterChannelInput, channelPersisted, afterMainInputWithSideUnread, afterSideInput, afterSideResumeWithMainUnread, afterGoalInput, afterSideResume, afterBackgroundCreation, restoredRunning, restoredRunningPersisted, restoredQuestion, restoredQuestionPersisted, freshQuestion, freshQuestionPersisted, beforeSnapshotResume, afterSnapshotResume, snapshotResumePersisted, cleanRunningCard, runningSideReply, afterMainContinue, afterSideContinue, pendingQuestionAfterResume, routedQueued, stayedOnBoard, routedRunning, routedRepeated, routedCompleted, routedArchived, deletion, scheduledRunning, scheduledStayedOnBoard, scheduledRepeated, scheduledCompleted, scheduledResultArchived, scheduledArchived };
   })()`
 })
 
@@ -286,4 +336,30 @@ assert.deepEqual(result.routedRunning, result.routedQueued, 'the same snapshot-d
 assert.deepEqual(result.routedRepeated, result.routedRunning, 'repeated snapshots and a late creation push do not count the task twice')
 assert.deepEqual(result.routedCompleted, {badge:null,icons:[['acceptance','1']]}, 'completion of the discovered task replaces execution with the unread result reminder')
 assert.deepEqual(result.routedArchived, {badge:null,icons:[]}, 'archiving the discovered task removes its sidebar indicators')
+assert.deepEqual(result.scheduledRunning, {badge:null,icons:[['running','2']]}, 'two scheduled creations followed only by status pushes display the same running count as the board')
+assert.equal(result.scheduledStayedOnBoard, true, 'scheduled creations keep the current board open')
+assert.deepEqual(result.scheduledRepeated, result.scheduledRunning, 'repeated scheduled creation notifications do not duplicate the task count')
+assert.deepEqual(result.scheduledCompleted, {badge:null,icons:[['running','1'],['acceptance','1']]}, 'one scheduled completion replaces only its running count with a result reminder')
+assert.deepEqual(result.scheduledResultArchived, {badge:null,icons:[['running','1']]}, 'archiving the completed scheduled task clears its result without changing the other execution count')
+assert.deepEqual(result.scheduledArchived, {badge:null,icons:[]}, 'archiving the other scheduled task clears the remaining execution count')
+assert.deepEqual(result.beforeReadingQuestion,{text:'1',waiting:true},'an unread question keeps the yellow requirement reminder')
+assert.deepEqual(result.afterBrowsingQuestion,result.beforeReadingQuestion,'browsing a requirement does not read its sessions')
+assert.equal(result.afterReadingQuestion,null,'opening an unanswered session clears the yellow requirement reminder')
+assert.equal(result.persistedAfterReadingQuestion,null,'reading clears the same persisted session unread record')
+assert.equal(result.pendingAfterReading,'pending','reading does not settle the pending question')
+assert.equal(result.answeredWhileReading,0,'reading does not submit an answer or authorization')
+assert.equal(result.replayedReadQuestion,null,'replaying the read question and waiting status cannot restore its reminder')
+assert.equal(result.restoredReadQuestion,null,'an unanswered but read session stays clear after restart')
+assert.deepEqual(result.newQuestionAfterReading,result.beforeReadingQuestion,'a new unread question in the same session restores the reminder')
+assert.deepEqual(result.beforeMarkers,['a','b'],'each task counted by the yellow sidebar badge is marked on the board')
+assert.deepEqual(result.failureMarkers,['a','b'],'failed answers preserve both handling markers')
+assert.deepEqual(result.nativeMarkers,['b'],'a successful native answer clears only its own handling marker')
+assert.deepEqual(result.settledMarkers,[],'successful answers clear the sidebar and handling markers together')
+assert.deepEqual(result.deferredFailure.badge,{text:'1',waiting:true})
+assert.deepEqual(result.deferredFailure.markers,['failed'],'the deferred failed task identifies the yellow count')
+assert.match(result.deferredFailure.title,/需求文档写入等待超时/,'the marker includes the recorded failure reason')
+assert.equal(result.viewedFailure,null,'reading an execution failure clears its requirement reminder without resolving the failure')
+assert.deepEqual(result.globalFailureMarkers,['failed'],'the global board uses the same failure marker')
+assert.deepEqual(result.resumedFailure,{badge:null,markers:[]},'continuing clears the old exception marker and sidebar count')
+assert.deepEqual(result.archivedFailure,{badge:null,markers:[]},'archived tasks do not retain orphan reminders')
 console.log('PASS task board answers clear sidebar reminders; failed answers, other pending tasks, persistence and later unread progress remain correct')

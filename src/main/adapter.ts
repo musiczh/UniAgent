@@ -1,15 +1,13 @@
 import { prepareClaudeSourceRuntime, type ClaudeSourceRuntime } from './claudeSourceRuntime'
 import { assistantMcpEnv } from './assistant/mcp'
-import { assistantIdentity } from '../shared/assistant'
-import { assistantPrompt } from './assistant/context'
-import { requirementInstructions } from './requirementRuntime'
-import { worktreeInstructions } from './worktreeService'
+import { prepareAssistantMessage, prepareAssistantInitializationForSession, serializeAssistantInput, type AssistantMessage } from './assistant/context'
+import { sessionInstructions } from './sessionInstructions'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { computeCost } from './pricing'
 import { nativeCredentialEnv } from './agentSetupCredentials.ts'
-import { handoffMcpArgs, uniAgentSessionInstructions } from './handoff'
+import { handoffMcpArgs, redactContextCapability } from './handoff'
 import { teamRuntime } from './teamRuntime'
 import { traexMaxConfigFlags } from './maxMode'
 import { normalizeClaudeRateLimits } from './claudeRateLimits'
@@ -31,7 +29,7 @@ import { startTokenSpeedTelemetry, type TokenSpeedTelemetry } from './tokenSpeed
 import { SdkWorkerClient } from './sdkWorkerClient'
 import { ClaudeSdkClient, claudeSdkLaunch } from './claudeSdk'
 import { updateClaudeTaskPlan } from './claudeTaskPlan'
-import { ROUTER_SYSTEM_PROMPT, routerRole } from '../shared/router'
+import { routerRole } from '../shared/router'
 import type { GoalState } from '../shared/nativeCapabilities'
 
 /**
@@ -77,11 +75,16 @@ export class TurnRunner extends EventEmitter {
   private claudeTools = new Map<string, { name: string; input: any }>()
   protected claudeRequests = new Map<string, { wireId: string; toolName: string; input: any; suggestions?: any[]; kind?: string }>()
   protected claudeCompact = false
+  protected mainContext = true
+  setMainContext(value: boolean): void { this.mainContext = value }
+  private claudeCompactionOrdinal = 0
+  private execInputDelivery?: AssistantMessage
   protected claudeCompactDone = false
   protected claudeWorkdir = ''
   protected claudeFileEvents: UAEvent[] = []
   private assistantConfig?: SessionConfig
   private preparingAssistant = false
+  private preparationSerial = 0
   private claudeSourceRuntime?: ClaudeSourceRuntime
   protected claudeResultFailed = false
   private claudeRole?: SessionConfig['roleSnapshot']
@@ -110,6 +113,7 @@ export class TurnRunner extends EventEmitter {
   }
 
   protected emitEvent(e: Omit<UAEvent, 'sessionId' | 'seq' | 'ts'>): void {
+    if (['agent_message', 'reasoning', 'command_exec'].includes(e.type)) { this.execInputDelivery?.accepted(); this.execInputDelivery = undefined }
     const ev: UAEvent = {
       sessionId: this.sessionId,
       seq: this.seqRef.n++,
@@ -185,14 +189,18 @@ export class TurnRunner extends EventEmitter {
 
   /** Append through the SDK's streaming input and wait for its native receipt. */
   async steer(prompt: string, attachments?: Attachment[]): Promise<void> {
+    return serializeAssistantInput(this.messageDeliveryKey(), () => this.steerInput(prompt, attachments))
+  }
+  protected messageDeliveryKey(): string { return this.mainContext ? this.sessionId : `${this.sessionId}:branch:${this.nativeSessionId}` }
+  private async steerInput(prompt: string, attachments?: Attachment[]): Promise<void> {
     if (!this.sdk || !this.sdkActive || this.interrupted || this.preparingAssistant) throw new Error('Claude 当前没有可插话的回合')
     this.assertClaudeCommand(prompt)
     const uuid = randomUUID()
-    const content = this.assistantConfig && !prompt.trimStart().startsWith('/')
-      ? await assistantPrompt(this.sessionId, this.assistantConfig, prompt, '', false) : prompt
+    const delivery = this.assistantConfig ? await prepareAssistantMessage(this.sessionId, this.assistantConfig, prompt, '', true, this.mainContext) : undefined
+    const content = delivery?.content ?? prompt
     if (!this.sdk || this.interrupted) throw new Error('Claude 回合已停止')
     this.sdkPendingMessages.add(uuid)
-    try { await this.sdk.request('send', { uuid, content, attachments, waitForReplay: true }) }
+    try { await this.sdk.request('send', { uuid, content, attachments, waitForReplay: true }); delivery?.accepted() }
     catch (error) { this.sdkPendingMessages.delete(uuid); throw error }
   }
 
@@ -367,20 +375,22 @@ export class TurnRunner extends EventEmitter {
       void this.startClaudeSdk(agent, config.collaborationMode === 'plan' ? { ...config, permissionMode: 'plan' } : config, prompt, resumeId, attachments, fork)
       return
     }
-    if (config.assistantSnapshot && ['codex','traex'].includes(agent.adapter)) {
-      this.preparingAssistant = true
-      void assistantPrompt(this.sessionId, config, prompt, '', false).then(effective => {
-        this.preparingAssistant = false
-        if (!this.interrupted) this.startPrepared(agent, config, effective, resumeId, attachments, fork)
-      }).catch(error => {
-        this.preparingAssistant = false
-        if (this.interrupted) return
-        this.emitEvent({ type: 'error', state: 'failed', payload: { message: `助手上下文加载失败：${String(error)}` } })
-        this.emit('done', { failed: true })
-      })
-      return
-    }
-    this.startPrepared(agent, config, prompt, resumeId, attachments, fork)
+    const preparation = ++this.preparationSerial
+    this.interrupted = false
+    this.preparingAssistant = true
+    const system = ['codex','traex'].includes(agent.adapter)
+    void serializeAssistantInput(this.messageDeliveryKey(), async () => {
+      const delivery = await prepareAssistantMessage(this.sessionId, config, prompt, system ? '' : sessionInstructions(config, this.sessionId), system)
+      if (preparation !== this.preparationSerial || this.interrupted) { delivery.failed(true); return }
+      this.preparingAssistant = false
+      this.execInputDelivery = delivery
+      this.startPrepared(agent, config, [delivery.context, delivery.text].filter(Boolean).join('\n\n'), resumeId, attachments, fork)
+    }).catch(error => {
+      if (preparation !== this.preparationSerial || this.interrupted) return
+      this.preparingAssistant = false
+      this.emitEvent({ type: 'error', state: 'failed', payload: { message: `初始化上下文加载失败：${String(error)}` } })
+      this.emit('done', { failed: true })
+    })
   }
 
   private assertClaudeCommand(prompt: string): void {
@@ -416,6 +426,7 @@ export class TurnRunner extends EventEmitter {
     if (this.sdkIdleTimer) clearTimeout(this.sdkIdleTimer)
     let runtime: ClaudeSourceRuntime | undefined
     try {
+      if (this.mainContext) await prepareAssistantInitializationForSession(this.sessionId, config, resumeId)
       runtime = await prepareClaudeSourceRuntime(config)
       await this.sdkDisposing
       if (serial !== this.sdkSerial || this.interrupted) { await runtime?.dispose(); return }
@@ -523,15 +534,19 @@ export class TurnRunner extends EventEmitter {
       const nativeAction = prompt.match(/^\/(goal|code-review)(?:\s|$)/)?.[1]
       if (nativeAction && !this.claudeBuiltinCommands.has(nativeAction)) throw new Error(`当前 Claude Code 未声明原生 /${nativeAction}，请更新本机程序后重试`)
       this.assertClaudeCommand(prompt)
-      const content = !prompt.trimStart().startsWith('/') ? await assistantPrompt(this.sessionId, config, prompt, '', false) : prompt
-      if (serial !== this.sdkSerial || this.interrupted || !this.sdk) return
-      this.preparingAssistant = false
-      this.emitEvent({ type: 'system_notice', payload: { kind: 'launch', label: agent.name, model: config.model || agent.defaultModel,
-        effort: config.effort, appendedPrompt: launch.appendedPrompt, text: `启动: Claude Agent SDK · ${agent.bin}` } })
-      const uuid = randomUUID()
-      this.sdkPendingMessages.add(uuid)
-      this.emitEvent({ type: 'turn_started', payload: { turnId: uuid, sessionId: this.nativeSessionId, model: config.model } })
-      await this.sdk.request('send', { uuid, content, attachments })
+      await serializeAssistantInput(this.messageDeliveryKey(), async () => {
+        const delivery = await prepareAssistantMessage(this.sessionId, config, prompt, '', true, this.mainContext)
+        const content = delivery.content
+        if (serial !== this.sdkSerial || this.interrupted || !this.sdk) return
+        this.preparingAssistant = false
+        this.emitEvent({ type: 'system_notice', payload: { kind: 'launch', label: agent.name, model: config.model || agent.defaultModel,
+          effort: config.effort, appendedPrompt: launch.appendedPrompt, text: `启动: Claude Agent SDK · ${agent.bin}` } })
+        const uuid = randomUUID()
+        this.sdkPendingMessages.add(uuid)
+        this.emitEvent({ type: 'turn_started', payload: { turnId: uuid, sessionId: this.nativeSessionId, model: config.model } })
+        await this.sdk.request('send', { uuid, content, attachments, waitForReplay: true })
+        delivery.accepted()
+      })
     } catch (error) {
       await runtime?.dispose()
       if (serial !== this.sdkSerial || this.interrupted) return
@@ -657,7 +672,8 @@ export class TurnRunner extends EventEmitter {
       text: config.managedPurpose === 'router' ? `启动: ${cmd} exec [RouterAgent 专用工具配置]` : `启动: ${cmd} ${args.map(arg => {
         const token = teamRuntime(this.sessionId)?.token
         const memoryToken = assistantMcpEnv(this.sessionId).UNIAGENT_ASSISTANT_TOKEN
-        const safe = token ? arg.split(token).join('[team capability]') : arg
+        const scoped = redactContextCapability(this.sessionId, arg)
+        const safe = token ? scoped.split(token).join('[team capability]') : scoped
         return memoryToken ? safe.split(memoryToken).join('[assistant capability]') : safe
       }).join(' ')}`, kind: 'launch', label: agent.name, model: config.model || agent.defaultModel, effort: config.effort, appendedPrompt
     } })
@@ -899,9 +915,9 @@ export class TurnRunner extends EventEmitter {
           })
           if (this.claudeCompact) this.emitEvent({ type: 'context_compaction', state: 'running', payload: { id: 'claude-compact' } })
         }
-        if (o.subtype === 'compact_boundary' && this.claudeCompact) {
+        if (o.subtype === 'compact_boundary') {
           this.claudeCompactDone = true
-          this.emitEvent({ type: 'context_compaction', state: 'success', payload: { id: 'claude-compact' } })
+          this.emitEvent({ type: 'context_compaction', state: 'success', payload: { id: o.uuid || `claude-compact-${this.sdkSerial}-${++this.claudeCompactionOrdinal}` } })
         }
         // thinking_tokens/hook chatter is intentionally ignored for noise control.
         break
@@ -1346,15 +1362,7 @@ function claudePermission(mode: PermissionMode): string {
 }
 
 export function developerInstructions(config: SessionConfig, sessionId?: string): string {
-  if (config.managedPurpose === 'router') return ROUTER_SYSTEM_PROMPT
-  return [
-    uniAgentSessionInstructions(),
-    assistantIdentity(config.assistantSnapshot),
-    worktreeInstructions(config),
-    requirementInstructions(config),
-    config.roleSnapshot?.instructions?.trim(),
-    teamRuntime(sessionId)?.instructions
-  ].filter(Boolean).join('\n\n')
+  return sessionInstructions(config, sessionId)
 }
 
 function roleToolPolicy(config: SessionConfig):

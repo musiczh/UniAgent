@@ -4,20 +4,22 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
 import ts from 'typescript'
+import { load as parseYaml, dump as dumpYaml } from 'js-yaml'
 import { buildPublicWebsite, PUBLIC_APP_NAME, PUBLIC_ARTIFACT_PREFIX } from './public-website.mjs'
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const internalFiles = new Set([
+  'src/main/model-source-gateway/trae.ts', 'test/model-source-trae.ts',
   'src/main/kaboo.ts', 'src/main/localModelCli.ts', 'src/main/localModelService.ts',
   'src/main/localModelDiagnostics.ts', 'src/main/bitsReleaseSource.ts',
   'src/renderer/components/LocalModelSettings.tsx', 'src/renderer/components/NikaSettings.tsx', 'scripts/release.sh', 'scripts/sync-download-page.mjs',
   'test/kaboo.test.mjs', 'test/local-model-cli.ts', 'test/local-model-service.ts',
   'test/local-model-ui.tsx', 'test/local-model-overlay.ts', 'test/bits-release-source.test.ts',
-  'test/release-workflow.test.mjs'
+  'test/release-workflow.test.mjs', 'test/internal-website-download.test.mjs'
 ])
 const rootFiles = new Set(['package.json', 'pnpm-lock.yaml', 'tsconfig.json', 'electron.vite.config.ts', 'LICENSE', '.gitignore'])
 const sourceDirectories = ['src/', 'native/', 'build/', 'resources/', 'patches/', 'scripts/', 'test/', 'supabase/', 'monitor/']
-const privateHost = /(?:https?:\/\/[^\s'"<>)]*(?:code\.byted\.org|bnpm\.byted\.org|kaboo\.bytedance\.net|bytedance\.larkoffice\.com|ida-app\.bytedance\.net|nika\.fan)|@bytedance-dev\/bonsai-codex)/i
+const privateHost = /(?:https?:\/\/[^\s'"<>)]*(?:code\.byted\.org|bnpm\.byted\.org|kaboo\.bytedance\.net|bytedance\.larkoffice\.com|ida-app\.bytedance\.net|nika\.fan)|@bytedance-dev\/(?:bonsai-codex|bytecloud-auth))/i
 
 /** Remove only explicitly delimited source regions; malformed/nested markers fail closed. */
 export function stripInternalRegions(text, path = '') {
@@ -69,7 +71,7 @@ export function stripPrivateAgentEntries(text, path) {
 }
 
 export function publicSource(text, path) {
-  if (path.startsWith('src/')) text = stripInternalRegions(text, path)
+  if (path.startsWith('src/') || path === 'electron.vite.config.ts') text = stripInternalRegions(text, path)
   if (path === 'src/shared/distribution.ts') return `export const INTERNAL_DISTRIBUTION = false\nexport const APP_NAME = '${PUBLIC_APP_NAME}'\nexport const APP_BUNDLE_ID = 'com.uniagent.public'\nexport const PUBLIC_ARTIFACT_PREFIX = '${PUBLIC_ARTIFACT_PREFIX}'\nexport const PUBLIC_REPOSITORY = 'https://github.com/musiczh/UniAgent'\nexport const PUBLIC_WEBSITE = 'https://musiczh.github.io/UniAgent/'\nexport const APP_REPOSITORY = PUBLIC_REPOSITORY\nexport function isDistributionAgent(agentId: string, adapter?: string): boolean { return !['traex', 'nika'].includes(agentId) && !['traex', 'nika'].includes(adapter || '') }\n`
   if (path === 'src/main/releaseSource.ts') return "export { RELEASE_REPOSITORY_PAGE, ReleaseSourceError, readLatestRelease } from './githubReleaseSource'\n"
   if (path.startsWith('src/') && /\.[cm]?[jt]sx?$/.test(path)) text = stripPrivateAgentEntries(text, path)
@@ -88,9 +90,21 @@ export function publicSource(text, path) {
   return text
 }
 
+export function publicLockfile(text) {
+  const lock = parseYaml(text)
+  if (!lock || typeof lock !== 'object') throw new Error('Invalid pnpm lockfile')
+  const privateDependency = name => name.startsWith('@bytedance-dev/bytecloud-auth')
+  for (const importer of Object.values(lock.importers || {})) for (const group of ['dependencies','devDependencies','optionalDependencies']) {
+    if (importer[group]) importer[group] = Object.fromEntries(Object.entries(importer[group]).filter(([name]) => !privateDependency(name)))
+  }
+  for (const group of ['packages','snapshots']) if (lock[group]) lock[group] = Object.fromEntries(Object.entries(lock[group]).filter(([name]) => !privateDependency(name)))
+  return dumpYaml(lock, { lineWidth: -1, noRefs: true })
+}
+
 export function publicPackage(value, version = value.version) {
   return {
     ...value, version, name: 'uniagent-public', productName: PUBLIC_APP_NAME,
+    dependencies: Object.fromEntries(Object.entries(value.dependencies || {}).filter(([name]) => name !== '@bytedance-dev/bytecloud-auth-sdk')),
     description: PUBLIC_APP_NAME + ' — a desktop workbench for coding agents',
     repository: { type: 'git', url: 'git+https://github.com/musiczh/UniAgent.git' },
     homepage: 'https://musiczh.github.io/UniAgent/',
@@ -98,7 +112,7 @@ export function publicPackage(value, version = value.version) {
     scripts: Object.fromEntries(Object.entries({ ...value.scripts, release: 'node scripts/release-public.mjs --publish' })
       .filter(([, command]) => ![...internalFiles].some(path => command.includes(path)))
       .map(([name, command]) => [name, command.replaceAll('release/mac-arm64/UniAgent.app/Contents/MacOS/UniAgent', '"release/mac-arm64/' + PUBLIC_APP_NAME + '.app/Contents/MacOS/' + PUBLIC_APP_NAME + '"')])),
-    build: { ...value.build, appId: 'com.uniagent.public', productName: PUBLIC_APP_NAME, artifactName: PUBLIC_ARTIFACT_PREFIX + '-${version}-${arch}.${ext}',
+    build: { ...value.build, asarUnpack: (value.build.asarUnpack || []).filter(path => !path.includes('@bytedance-dev/bytecloud-auth')), appId: 'com.uniagent.public', productName: PUBLIC_APP_NAME, artifactName: PUBLIC_ARTIFACT_PREFIX + '-${version}-${arch}.${ext}',
       dmg: { ...value.build?.dmg, artifactName: PUBLIC_ARTIFACT_PREFIX + '-${version}-${arch}.${ext}' } }
   }
 }
@@ -132,6 +146,7 @@ export async function exportPublic({ sourceRoot = root, destination, ref = 'HEAD
     if (modes.get(path) === '120000' || workingTree && (await lstat(join(sourceRoot, path))).isSymbolicLink()) throw new Error(`Symlinks require an explicit public export rule: ${path}`)
     let content = await read(path)
     if (path === 'package.json') content = Buffer.from(JSON.stringify(publicPackage(JSON.parse(content), version), null, 2) + '\n')
+    else if (path === 'pnpm-lock.yaml') content = Buffer.from(publicLockfile(content.toString()))
     else if (path === 'docs/share/uniagent-introduction/web-design-preview.html') {
       content = Buffer.from(buildPublicWebsite(content.toString(), {
         version: version || JSON.parse(await read('package.json')).version,

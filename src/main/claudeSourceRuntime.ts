@@ -6,8 +6,10 @@ import { parseCodexModelKey } from '../shared/codexModelIdentity'
 import { claudeSourceEffort, claudeSourceUsesAuthToken, type ClaudeSourcePreset } from '../shared/claudeSources'
 
 export interface ClaudeConnection {
-  baseUrl: string; apiKey: string; model: string; preset: ClaudeSourcePreset | 'ferry'
+  baseUrl: string; apiKey: string; model: string; preset: ClaudeSourcePreset | 'ferry' | 'custom'
+  authToken?: boolean
   efforts?: ReasoningEffort[]; defaultEffort?: ReasoningEffort
+  thinkingBudget?: number
 }
 export interface ClaudeSourceRuntime {
   model: string
@@ -50,8 +52,8 @@ export async function prepareClaudeSourceRuntime(config: SessionConfig): Promise
 
 export async function createClaudeSourceRuntime(connection: ClaudeConnection, effort?: ReasoningEffort): Promise<ClaudeSourceRuntime> {
   const { model, apiKey, baseUrl, preset } = connection
-  const support = preset === 'ferry' ? { efforts: connection.efforts || [], defaultEffort: connection.defaultEffort } : claudeSourceEffort(model, preset)
-  const bearer = claudeSourceUsesAuthToken(preset)
+  const support = preset === 'ferry' || preset === 'custom' ? { efforts: connection.efforts || [], defaultEffort: connection.defaultEffort } : claudeSourceEffort(model, preset)
+  const bearer = connection.authToken ?? (preset === 'custom' ? true : claudeSourceUsesAuthToken(preset))
   const resolved = effort && support.efforts.includes(effort) ? effort : support.defaultEffort ?? 'auto'
   // MiMo 的 "off" 是思考开关而非档位：CLI 的 CLAUDE_CODE_EFFORT_LEVEL 没有 off 值，
   // 且对第三方端点恒发 adaptive thinking，只能用 EXTRA_BODY 覆盖请求体来关闭思考。
@@ -67,7 +69,7 @@ export async function createClaudeSourceRuntime(connection: ClaudeConnection, ef
     ANTHROPIC_MODEL: model, ANTHROPIC_SMALL_FAST_MODEL: model,
     CLAUDE_CODE_SUBAGENT_MODEL: model,
     CLAUDE_CODE_EFFORT_LEVEL: thinkingOff ? 'auto' : resolved,
-    ...(thinkingOff ? { CLAUDE_CODE_EXTRA_BODY: JSON.stringify({ thinking: { type: 'disabled' } }) } : {}),
+    ...(thinkingOff ? { CLAUDE_CODE_EXTRA_BODY: JSON.stringify({ thinking: { type: 'disabled' } }) } : connection.thinkingBudget ? { CLAUDE_CODE_EXTRA_BODY: JSON.stringify({ thinking: { type: 'enabled', budget_tokens: connection.thinkingBudget } }) } : {}),
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
   }
   for (const alias of ['OPUS', 'SONNET', 'HAIKU', 'FABLE']) env[`ANTHROPIC_DEFAULT_${alias}_MODEL`] = model

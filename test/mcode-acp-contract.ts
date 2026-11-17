@@ -13,6 +13,7 @@ import {
   projectACPContract
 } from '../src/main/acp/acpProvider.ts'
 import { parseMCodeCatalog } from '../src/main/mcodeCatalog.ts'
+import { stripAssistantContext } from '../src/main/assistant/context'
 import { ACP_ADAPTERS, acpProviderFor, isACPAdapter } from '../src/main/acp/acpAdapters.ts'
 import {
   MCODE_BIN,
@@ -52,6 +53,8 @@ assert.equal(parseMCodeModelValue('m:minimax:MiniMax-M3:x'), undefined)
 assert.equal(parseMCodeModelValue('m:minimax:MiniMax-M3:v:thinking:extra'), undefined)
 assert.equal(parseMCodeModelValue(''), undefined)
 assert.equal(parseMCodeModelValue(undefined), undefined)
+assert.deepEqual(parseMCodeModelValue('m:custom_provider%3Aprovider-1:custom%2Fmodel%3Av1:u'), { providerId: 'custom_provider:provider-1', modelId: 'custom/model:v1' }, 'native MCode config values encode provider and model identities')
+assert.equal(parseMCodeModelValue('m:custom%:model:u'), undefined)
 
 assert.equal(mcodeModelLabel('m:minimax:MiniMax-M3.1-Flash:v:thinking'), 'MiniMax-M3.1-Flash · thinking')
 assert.equal(mcodeModelLabel('m:minimax:MiniMax-M3.1-Flash:v:'), 'MiniMax-M3.1-Flash')
@@ -773,7 +776,9 @@ await withRunner({}, async ({ runner, dir }) => {
     // The session keeps the workspace it was created in, not the folder the
     // history was read from.
     assert.equal(loaded.cwd, dir)
-    assert.ok(loaded.events.some((event) => event.type === 'user_message' && event.payload.text === 'hello'))
+    const submitted = (await readFrames(dir)).find(row => row.kind === 'inbound' && row.frame?.method === 'session/prompt').frame.params.prompt[0].text
+    assert.equal(stripAssistantContext(submitted), 'hello')
+    assert.ok(loaded.events.some((event) => event.type === 'user_message' && event.payload.text === submitted), 'native history retains the complete initialization and business input')
     assert.ok(loaded.events.some((event) => event.type === 'agent_message' && event.payload.text === 'MiniMax Code reply'))
   } finally {
     await rm(listDir, { recursive: true, force: true })

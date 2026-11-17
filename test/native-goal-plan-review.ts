@@ -30,6 +30,7 @@ const baseConfig: SessionConfig = {
   workdir: '/repo',
   permissionMode: 'read-only'
 }
+const channelInstructions = '通道以宿主提供的本轮信息为准。飞书通道下，图片、文件用 send_to_feishu；微信通道下，用 send_to_weixin。这两种通道的正文不放本地路径或本地链接，附件发送成功后才告知已发送。'
 
 const testAgent: AgentDef = {
   id: 'codex',
@@ -257,7 +258,7 @@ async function planCollaborationRpcOrdering(): Promise<void> {
         assert.equal(threadRequest.params.approvalPolicy, 'on-request')
         assert.equal(threadRequest.params.sandbox, 'workspace-write')
         assert.equal(threadRequest.params.developerInstructions,
-          `${uniAgentSessionInstructions()}\n\n${config.roleSnapshot.instructions}`,
+          `${uniAgentSessionInstructions()}\n\n${config.roleSnapshot.instructions}\n\n${channelInstructions}`,
           'new and resumed threads must retain business instructions independently of mode instructions')
         assert.deepEqual(transport.workflowRequests[4]?.params, {
           threadId: resume ? 'thread-existing' : 'thread-1',
@@ -566,7 +567,7 @@ async function securityConfigChangesReconnectReadyThreads(): Promise<void> {
         cwd: '/repo',
         sandbox: 'danger-full-access',
         approvalPolicy: 'never',
-        developerInstructions: uniAgentSessionInstructions(),
+        developerInstructions: `${uniAgentSessionInstructions()}\n\n${channelInstructions}`,
         model: 'configured-model',
         modelProvider: 'openai',
         config: Object.fromEntries(handoffMcpArgs('codex', 'security-reconnect-session').filter(arg => arg !== '-c').map(arg => {
@@ -596,7 +597,7 @@ async function securityConfigChangesReconnectReadyThreads(): Promise<void> {
       cwd: '/repo',
       sandbox: 'read-only',
       approvalPolicy: 'on-request',
-      developerInstructions: uniAgentSessionInstructions(),
+      developerInstructions: `${uniAgentSessionInstructions()}\n\n${channelInstructions}`,
       approvalsReviewer: 'user',
       model: 'configured-model',
       modelProvider: 'openai',

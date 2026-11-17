@@ -64,9 +64,11 @@ export async function readZCodeConfiguredModels(personalPath: string, builtinPat
     providers.set(rule.providerId, { ...previous, ...rule, config: mergeZCodeConfig(previous?.config, rule.config) })
   }
   const models: ModelDef[] = []
-  const managed = ZCODE_MODEL_SERVICES.some(service => fallback.providerId === `personal:uniagent-zcode-${service.id}`)
+  const nativeServiceIds = ZCODE_MODEL_SERVICES.map(service => `personal:uniagent-zcode-${service.id}`)
+  const selectedNativeService = nativeServiceIds.includes(fallback.providerId)
   for (const provider of providers.values()) {
-    if (managed && provider.providerId !== fallback.providerId) continue
+    // The native service switch is exclusive; independent providers remain selectable.
+    if (selectedNativeService && nativeServiceIds.includes(provider.providerId) && provider.providerId !== fallback.providerId) continue
     const template = templates.find((item: any) => item.templateId === provider.templateId)
     const config = mergeZCodeConfig(template?.config, provider.config)
     if (provider.enabled === false || config?.visibility === 'hidden' || config?.access?.type === 'zhipu-account') continue

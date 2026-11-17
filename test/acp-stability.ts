@@ -16,7 +16,8 @@ try {
    await writeFile(bin, `#!/usr/bin/env node\nrequire(${JSON.stringify(resolve('test/fixtures/fake-stable-acp.cjs'))})\n`); await chmod(bin,0o755)
    const agent = { id: provider, adapter: provider, name: provider, bin, icon: provider, models: [], capabilities: { modelSelect: true, reasoningEffort: false, permissionModes: [{ id:'ask', label:'请求批准', hint:'' }] } } as AgentDef
    const events: any[] = [], done: any[] = []
-   const runner = new ACPRunner('local', { n: 0 }, agent, { agentId:provider, workdir:root, permissionMode:'ask', model:scenario.openingUpdates ? 'another-model' : 'old-model', ...(scenario.openingUpdates ? { roleSnapshot:{id:'parameter-role',name:'Parameter preset',agentId:provider,model:'another-model',permissionMode:'ask'} } : {effort:'high'}) }, 'stable-id', { UA_STABLE_LOG:log, UA_STABLE_SCENARIO:JSON.stringify(scenario) })
+   const runner = new ACPRunner(`${provider}-${checks}`, { n: 0 }, agent, { agentId:provider, workdir:root, permissionMode:'ask', model:scenario.openingUpdates ? 'another-model' : 'old-model', ...(scenario.openingUpdates ? { roleSnapshot:{id:'parameter-role',name:'Parameter preset',agentId:provider,model:'another-model',permissionMode:'ask'} } : {effort:'high'}) }, 'stable-id', { UA_STABLE_LOG:log, UA_STABLE_SCENARIO:JSON.stringify(scenario) })
+   const lastPrompt = async () => (await readFile(log, 'utf8')).trim().split('\n').map(JSON.parse).filter(record => record.method === 'session/prompt').at(-1)?.params.prompt
    runner.on('event', e => { events.push(e); if (e.type === 'approval_request' && e.state === 'pending') runner.respondResult(e.payload.requestId, { outcome:{ outcome:'selected', optionId:'yes' } }) }); runner.on('done', x => done.push(x))
    try {
     const { contract } = await runner.probeSession(false)
@@ -32,9 +33,11 @@ try {
     else {
      await runner.setCollaborationMode('plan')
      await runner.startTurn('report-mode')
+     assert.deepEqual(await lastPrompt(), [{ type: 'text', text: scenario.openingUpdates ? '<uniagent_channel_context>\n当前消息通道：UniAgent App\n</uniagent_channel_context>\n\nreport-mode' : 'report-mode' }], 'mode updates preserve the user input and carry only a pending host channel marker')
      assert.equal(events.filter(e => e.type === 'agent_message').at(-1)?.payload.text, 'MODE_plan')
      await runner.setCollaborationMode('default')
      await runner.startTurn('report-mode')
+     assert.deepEqual(await lastPrompt(), [{ type: 'text', text: 'report-mode' }], 'the next mode query does not repeat the channel marker')
      assert.equal(events.filter(e => e.type === 'agent_message').at(-1)?.payload.text, 'MODE_default')
     }
     const image = join(root,'image.png'); await writeFile(image, Buffer.from('iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAN0lEQVR4nO3RMQ0AMAzEQLf8OacQ3CWbD8BHcg4Mm+7qOh340A9UiVSJVIlUiVSJVIlUiVSJMA+hxgE/8m7SpQAAAABJRU5ErkJggg==','base64'))

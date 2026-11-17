@@ -1,6 +1,7 @@
 import type { RouterObject, RouterQuery, RouterRequest } from '../../shared/router'
 
-export interface RouterErrorData { code: string; message: string; recovery?: { action: 'query' | 'refresh' | 'clarify'; arguments?: Partial<RouterQuery> } }
+export interface RouterErrorData { code: string; message: string; recovery?: { action: 'query' | 'refresh' | 'retry' | 'clarify'; arguments?: Partial<RouterQuery> };
+  current?: { requestId: string; version: number; state: RouterRequest['state']; hardScope: RouterRequest['scope'] } }
 export class RouterToolError extends Error {
   constructor(readonly data: RouterErrorData) { super(data.code) }
 }

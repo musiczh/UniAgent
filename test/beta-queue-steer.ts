@@ -34,6 +34,7 @@ try {
     const delivered=(await host.getEvents(provider)).at(-1)!
     assert.equal(delivered.payload.appendedToTurn,false)
     assert.equal(delivered.payload.nativePromptId,'accepted-followup')
+    assert.equal(delivered.payload.clientTurnKey,item.id,'legacy queue delivery retains its own identity for the send transition')
     item=enqueue();host.promoteQueueItem(provider,item.id)
     reject(new ACPTimeoutError('lost delivery receipt'))
     await new Promise(done=>setImmediate(done))

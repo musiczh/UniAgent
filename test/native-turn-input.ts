@@ -169,6 +169,7 @@ async function appServerWireContract(): Promise<void> {
     const turnStart = transport.calls.find((call) => call.method === 'turn/start')
     const turnSteer = transport.calls.find((call) => call.method === 'turn/steer')
     assert.deepEqual(turnStart?.params.input, [
+      { type: 'text', text: '<uniagent_channel_context>\n当前消息通道：UniAgent App\n</uniagent_channel_context>', text_elements: [] },
       { type: 'text', text: 'start', text_elements: [] },
       { type: 'skill', name: 'openai-docs', path: '/skills/openai-docs/SKILL.md' }
     ])
@@ -388,7 +389,8 @@ async function feishuTurnSources(): Promise<void> {
       assert.deepEqual(params, {
         threadId: 'feishu-thread', expectedTurnId: 'feishu-turn',
         input: [
-          { type: 'text', text: followUp, text_elements: [] },
+          { type: 'text', text: '<uniagent_channel_context>\n当前消息通道：飞书\n</uniagent_channel_context>', text_elements: [] },
+          { type: 'text', text: '飞书直接插话', text_elements: [] },
           { type: 'localImage', path: '/repo/follow-up.png' }
         ]
       })

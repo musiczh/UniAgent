@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync, symlinkSync, utimesSync, statSync } from 'node:fs'
+import fsPromises from 'node:fs/promises'
+import { syncBuiltinESMExports } from 'node:module'
+import { mock } from 'node:test'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -140,6 +143,7 @@ try {
   await check('live disk locks block only the same requirement', async () => {
     const lock=join(home,'requirement-locks',createHash('sha256').update(a.id).digest('hex')+'.lock')
     mkdirSync(lock);writeFileSync(join(lock,'owner'),String(process.pid))
+    const old=new Date(Date.now()-60_000);utimesSync(lock,old,old)
     let finished=false;const pending=read().then(()=>{finished=true})
     await sleep(150);assert.equal(finished,false)
     assert.equal((await read(b.id)).requirement.id,b.id)
@@ -153,6 +157,97 @@ try {
       await new Promise(resolve=>child.exitCode===null?child.once('exit',resolve):resolve(undefined))
       mkdirSync(lock);writeFileSync(join(lock,'owner'),String(child.pid));await read();assert.equal(existsSync(lock),false)
     } finally {if(child.exitCode===null)child.kill()}
+  })
+  await check('abandoned empty locks recover across concurrent store instances', async () => {
+    const lock=join(home,'requirement-locks',createHash('sha256').update(a.id).digest('hex')+'.lock')
+    mkdirSync(lock);const old=new Date(Date.now()-60_000);utimesSync(lock,old,old)
+    const other=new RequirementStore(home)
+    const results=await Promise.all([read(),other.context(a.id,'a',{action:'bootstrap'},{background:true})])
+    assert.ok(results.every(result=>result.requirement.id===a.id))
+    assert.equal(existsSync(lock),false);assert.equal(existsSync(lock+'.recovery'),false)
+  })
+  await check('abandoned invalid owners recover without treating them as process ids', async () => {
+    const lock=join(home,'requirement-locks',createHash('sha256').update(a.id).digest('hex')+'.lock')
+    for (const owner of ['', 'invalid', '0', '-1', '1.5', 'Infinity', '9007199254740991']) {
+      mkdirSync(lock);writeFileSync(join(lock,'owner'),owner)
+      const old=new Date(Date.now()-60_000);utimesSync(lock,old,old)
+      assert.equal((await read()).requirement.id,a.id)
+      assert.equal(existsSync(lock),false)
+    }
+  })
+  await check('a new empty lock has time to publish its live owner', async () => {
+    const lock=join(home,'requirement-locks',createHash('sha256').update(a.id).digest('hex')+'.lock')
+    mkdirSync(lock)
+    let finished=false;const pending=read().then(()=>{finished=true})
+    await sleep(150);assert.equal(finished,false);assert.equal(existsSync(lock),true)
+    writeFileSync(join(lock,'owner'),String(process.pid))
+    await sleep(150);assert.equal(finished,false)
+    rmSync(lock,{recursive:true});await pending
+  })
+  await check('ownerless locks recover only after the thirty-second grace period', async () => {
+    const lock=join(home,'requirement-locks',createHash('sha256').update(a.id).digest('hex')+'.lock')
+    mkdirSync(lock);const created=statSync(lock).mtimeMs
+    let now=created+29_999,finished=false
+    const clock=mock.method(Date,'now',()=>now)
+    const pending=read().then(()=>{finished=true})
+    try {
+      await sleep(150);assert.equal(finished,false)
+      now=created+30_000;await sleep(150);assert.equal(finished,false)
+      now=created+30_001;await pending
+      assert.equal(finished,true);assert.equal(existsSync(lock),false)
+    } finally {clock.mock.restore();rmSync(lock,{recursive:true,force:true});await pending}
+  })
+  await check('recovery preserves a successor directory or an owner published during cleanup', async () => {
+    const lock=join(home,'requirement-locks',createHash('sha256').update(a.id).digest('hex')+'.lock')
+    for (const race of ['successor','owner','late-owner','invalid-owner','late-invalid-owner']) {
+      mkdirSync(lock)
+      if (race.includes('invalid')) writeFileSync(join(lock,'owner'),'invalid')
+      const old=new Date(Date.now()-60_000);utimesSync(lock,old,old)
+      let raced=false,finished=false
+      const method=race.startsWith('late-')?'rmdir':race==='invalid-owner'?'rename':'mkdir',original=fsPromises[method]
+      const patch=mock.method(fsPromises,method,async (...args:any[])=>{
+        if (!raced && args[0]===(method==='rmdir'?lock:method==='rename'?join(lock,'owner'):lock+'.recovery')) {
+          raced=true
+          if (race==='successor') {rmSync(lock,{recursive:true});mkdirSync(lock)}
+          else writeFileSync(join(lock,'owner'),String(process.pid))
+        }
+        return (original as any)(...args)
+      })
+      syncBuiltinESMExports()
+      const pending=read().then(()=>{finished=true})
+      try {
+        await sleep(150);assert.equal(raced,true);assert.equal(finished,false)
+        assert.equal(existsSync(lock),true)
+        if (race==='successor') assert.ok(Date.now()-statSync(lock).mtimeMs<30_000)
+        else assert.equal(readFileSync(join(lock,'owner'),'utf8'),String(process.pid))
+      } finally {
+        patch.mock.restore();syncBuiltinESMExports();rmSync(lock,{recursive:true,force:true});await pending
+      }
+    }
+  })
+  await check('failed cleanup restores its owner and preserves unrelated lock contents', async () => {
+    const lock=join(home,'requirement-locks',createHash('sha256').update(a.id).digest('hex')+'.lock')
+    mkdirSync(lock);writeFileSync(join(lock,'owner'),'invalid')
+    const old=new Date(Date.now()-60_000);utimesSync(lock,old,old)
+    const original=fsPromises.rmdir
+    const patch=mock.method(fsPromises,'rmdir',async (...args:any[])=>{
+      if (args[0]===lock) throw Object.assign(new Error('cleanup denied'),{code:'EACCES'})
+      return (original as any)(...args)
+    })
+    syncBuiltinESMExports()
+    try {
+      await assert.rejects(read(),{code:'EACCES'})
+      assert.equal(readFileSync(join(lock,'owner'),'utf8'),'invalid')
+      assert.equal(existsSync(lock+'.recovery'),false)
+    } finally {patch.mock.restore();syncBuiltinESMExports();rmSync(lock,{recursive:true,force:true})}
+    mkdirSync(lock);writeFileSync(join(lock,'owner.tmp'),'unfinished owner');utimesSync(lock,old,old)
+    const now=Date.now;let calls=0
+    const clock=mock.method(Date,'now',()=>now()+(calls++?31_000:0))
+    try {
+      await assert.rejects(read(),/写入等待超时/)
+      assert.equal(readFileSync(join(lock,'owner.tmp'),'utf8'),'unfinished owner')
+      assert.equal(existsSync(lock+'.recovery'),false)
+    } finally {clock.mock.restore();rmSync(lock,{recursive:true,force:true})}
   })
   await check('raw messages are referenced by cursor, pagination preserves long messages', async () => {
     const long=event('a',10,'甲'.repeat(33000));events.get('a')!.push(long)

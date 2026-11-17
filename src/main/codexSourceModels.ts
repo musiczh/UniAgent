@@ -25,7 +25,7 @@ function httpError(status: number): Error {
   return new Error(`模型查询失败（HTTP ${status || 502}）`)
 }
 
-export async function fetchSourceModelCatalog(baseUrl: string, apiKey: string, timeoutMs = 8000): Promise<unknown> {
+export async function fetchSourceModelCatalog(baseUrl: string, apiKey: string, timeoutMs = 8000, userAgent = 'UniAgent'): Promise<unknown> {
   const input = modelRequestFor(baseUrl, apiKey)
   const destination = new URL(input.url)
   const raw = await new Promise<unknown>((resolve, reject) => {
@@ -34,7 +34,7 @@ export async function fetchSourceModelCatalog(baseUrl: string, apiKey: string, t
       error ? reject(error) : resolve(value)
     }
     const req = (destination.protocol === 'https:' ? httpsRequest : httpRequest)(destination, {
-      method: 'GET', headers: { Authorization: input.authorization, Accept: 'application/json', 'User-Agent': 'UniAgent' }
+      method: 'GET', headers: { Authorization: input.authorization, Accept: 'application/json', 'User-Agent': userAgent }
     }, response => {
       if (response.statusCode !== 200) { response.destroy(); finish(httpError(response.statusCode || 0)); return }
       let size = 0

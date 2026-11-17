@@ -1,5 +1,5 @@
 import { ASSISTANT_TOOLS, ASSISTANT_REVIEW_TOOLS, ASSISTANT_SERVER_SOURCE, assistantMcpEnv } from './assistant/mcp'
-import { routerMcpServers, globalMemoryMcpEnv, GLOBAL_MEMORY_TOOL, GLOBAL_MEMORY_SERVER_SOURCE, PROJECT_MEMORY_TOOL } from './router/mcp'
+import { routerMcpServers, projectMemoryMcpEnv, PROJECT_MEMORY_SERVER_SOURCE, PROJECT_MEMORY_TOOL } from './router/mcp'
 import {
   writeFileSync,
   mkdirSync,
@@ -60,6 +60,18 @@ const SERVER_PATH = join(MCP_DIR, 'server.cjs')
 // the query tools read. Rewritten by the main process whenever detection or the
 // preset store changes, so a handoff-issuing agent always sees current options.
 const CATALOG_PATH = join(MCP_DIR, 'catalog.json')
+const CONTEXT_INBOX_DIR = join(INBOX_DIR, 'contexts')
+const contextTokens = new Map<string, string>()
+function contextMcpEnv(sessionId?: string): Record<string, string> {
+  if (!sessionId) return { UNIAGENT_CONTEXT_TOKEN: '' }
+  let token = contextTokens.get(sessionId)
+  if (!token) { token = randomUUID(); contextTokens.set(sessionId, token) }
+  return { UNIAGENT_CONTEXT_TOKEN: token }
+}
+export function redactContextCapability(sessionId: string, text: string): string {
+  const token = contextTokens.get(sessionId)
+  return token ? text.split(token).join('[context capability]') : text
+}
 const TEAM_TOOLS_PATH = join(MCP_DIR, 'team-tools.json')
 const TEAM_INBOX_DIR = join(BASE, 'team-inbox')
 const TEAM_RESULTS_DIR = join(BASE, 'team-results')
@@ -68,17 +80,6 @@ const REQUIREMENT_INSTANCE_INBOX_DIR = join(REQUIREMENT_INBOX_DIR, randomUUID())
 const REQUIREMENT_RESULTS_DIR = join(BASE, 'requirement-results')
 export interface RequirementMcpRequest { id: string; sessionId: string; token: string; args: RequirementContextRequest }
 export interface TeamMcpRequest { id: string; token: string; tool: string; args: unknown; cancelled?: boolean }
-
-interface SessionInstructionAgent {
-  id: string
-  name: string
-}
-
-interface SessionInstructionRole {
-  id: string
-  name: string
-  agentId?: string
-}
 
 /**
  * Build the session-level UniAgent context from the same catalog exposed by the
@@ -90,39 +91,38 @@ export function buildUniAgentSessionInstructions(catalog: unknown): string {
     ? catalog as { agents?: unknown; roles?: unknown }
     : {}
   const agents = Array.isArray(value.agents)
-    ? value.agents.flatMap((candidate): SessionInstructionAgent[] => {
+    ? value.agents.flatMap((candidate): string[] => {
       if (!candidate || typeof candidate !== 'object') return []
       const item = candidate as { id?: unknown; name?: unknown }
       return typeof item.id === 'string' && item.id && typeof item.name === 'string' && item.name
-        ? [{ id: item.id, name: item.name }]
+        ? [item.name]
         : []
     })
     : []
   const roles = Array.isArray(value.roles)
-    ? value.roles.flatMap((candidate): SessionInstructionRole[] => {
+    ? value.roles.flatMap((candidate): string[] => {
       if (!candidate || typeof candidate !== 'object') return []
       const entry = candidate as { executable?: unknown; role?: unknown }
       if (entry.executable !== true || !entry.role || typeof entry.role !== 'object') return []
-      const role = entry.role as { id?: unknown; name?: unknown; agentId?: unknown }
+      const role = entry.role as { id?: unknown; name?: unknown }
       if (typeof role.id !== 'string' || !role.id || typeof role.name !== 'string' || !role.name) return []
-      return [{
-        id: role.id,
-        name: role.name,
-        ...(typeof role.agentId === 'string' && role.agentId ? { agentId: role.agentId } : {})
-      }]
+      return [role.name]
     })
     : []
 
   const roleList = roles.length
-    ? roles.map((role) => JSON.stringify(role.name)).join('、')
+    ? JSON.stringify(roles)
     : '无'
   const agentList = agents.length
-    ? agents.map((agent) => JSON.stringify(agent.name)).join('、')
+    ? JSON.stringify(agents)
     : '无'
 
   return [
-    '本session用户通过UniAgent App启动。',
-    `UniAgent MCP中可以使用的角色有：${roleList}，可使用的agen有：${agentList}`
+    '你通过 UniAgent 服务用户。',
+    '',
+    'UniAgent MCP 可使用对象：',
+    `角色：${roleList}`,
+    `Agent：${agentList}`
   ].join('\n')
 }
 
@@ -280,6 +280,7 @@ const CATALOG = process.env.UNIAGENT_CATALOG || ''
 // Fix#4 — the caller (issuing) UniAgent session id, injected per-turn so the
 // main process can flag it as "等待中 <agent> 的 <task>" while wait=true blocks.
 const CALLER_SESSION = process.env.UNIAGENT_CALLER_SESSION || ''
+const CONTEXT_TOKEN = process.env.UNIAGENT_CONTEXT_TOKEN || ''
 const REQUIREMENT_TOKEN = process.env.UNIAGENT_REQUIREMENT_TOKEN || ''
 const REQUIREMENT_INBOX = process.env.UNIAGENT_REQUIREMENT_INBOX || ''
 const REQUIREMENT_RESULTS = process.env.UNIAGENT_REQUIREMENT_RESULTS || ''
@@ -417,9 +418,9 @@ const TOOLS = [
   AUTOMATION_TOOL,
   {
     name: 'uniagent_query',
-    description: '查询 UniAgent 可用配置。action=list 返回 Agent、角色、任务预设、项目的精简目录，可用 type 限定一类；action=detail 必须指定 type 和稳定 id，返回 {type,item}。Agent 详情含模型、各模型的 efforts/defaultEffort、权限和能力；角色详情含定位指令 instructions、固定运行配置、Skill/工具策略及可执行情况；预设详情含提示词模板；项目详情含目录。创建任务前先查目录，再按需读取详情，不要猜模型、思考深度或角色 id。',
+    description: '查询 UniAgent 可用配置。action=context 只读取调用者当前会话、Agent、模型、目录、绑定、通道和时间，不接受其它会话 id，不返回凭据；action=list 返回 Agent、角色、任务预设、项目的精简目录，可用 type 限定一类；action=detail 必须指定 type 和稳定 id，返回 {type,item}。Agent 详情含模型、各模型的 efforts/defaultEffort、权限和能力；角色详情含定位指令 instructions、固定运行配置、Skill/工具策略及可执行情况；预设详情含提示词模板；项目详情含目录。创建任务前先查目录，再按需读取详情，不要猜模型、思考深度或角色 id。',
     inputSchema: { type: 'object', properties: {
-      action: { type: 'string', enum: ['list', 'detail'] },
+      action: { type: 'string', enum: ['list', 'detail', 'context'] },
       type: { type: 'string', enum: ['agent', 'role', 'preset', 'project', 'requirement'], description: 'list 可省略以返回全部目录；detail 必填；requirement 返回需求稳定 id 与主空间 projectId' },
       id: { type: 'string', description: 'detail 必填，使用目录返回的稳定 id；list 不接受 id' }
     }, required: ['action'], additionalProperties: false }
@@ -522,18 +523,34 @@ function taskStatus(taskId, state) {
 
 ${ASSISTANT_SERVER_SOURCE}
 const ASSISTANT_TOOLS = ${JSON.stringify(ASSISTANT_TOOLS)}
-const GLOBAL_MEMORY_TOOL = ${JSON.stringify(GLOBAL_MEMORY_TOOL)}
 const PROJECT_MEMORY_TOOL = ${JSON.stringify(PROJECT_MEMORY_TOOL)}
-${GLOBAL_MEMORY_SERVER_SOURCE}
+${PROJECT_MEMORY_SERVER_SOURCE}
 const ASSISTANT_REVIEW_TOOLS = ${JSON.stringify(ASSISTANT_REVIEW_TOOLS)}
+
+const CONTEXT_TOOL = { name: 'uniagent_query', description: '只读调用者当前运行上下文，不接收其它会话 id。', inputSchema: { type: 'object', properties: { action: { const: 'context' } }, required: ['action'], additionalProperties: false } }
 
 function handleCall(id, params) {
   if (process.env.UNIAGENT_REQUIRE_CALLER === '1' && !CALLER_SESSION) { fail(id, -32000, '请从 UniAgent 会话使用此工具'); return }
   const name = params && params.name
   if (process.env.UNIAGENT_ASSISTANT_ONLY === '1' && !['assistant_memory','session_search'].includes(name)) { fail(id, -32000, '复盘工具权限受限'); return }
   const args = (params && params.arguments) || {}
-  if(name==='global_memory'){handleGlobalMemoryCall(id,args);return}
-  if(name==='project_memory'){handleGlobalMemoryCall(id,args,name);return}
+  if (name === 'uniagent_query' && args.action === 'context') {
+    if (Object.keys(args).some(function(key) { return key !== 'action' }) || !CALLER_SESSION || !CONTEXT_TOKEN) { fail(id, -32602, 'context requires the current UniAgent caller'); return }
+    try {
+      const requestId = randomUUID(), directory = join(INBOX, 'contexts'), dst = join(directory, requestId + '.json')
+      mkdirSync(directory, { recursive: true })
+      writeFileSync(dst + '.tmp', JSON.stringify({ id: requestId, sessionId: CALLER_SESSION, token: CONTEXT_TOKEN }), { mode: 384 })
+      renameSync(dst + '.tmp', dst)
+      const cancel = awaitResult(RESULTS, requestId, 30, function(result) {
+        PENDING_HANDOFF_CALLS.delete(id)
+        if (!result || !result.ok) { fail(id, -32000, result && result.error || 'context query timed out'); return }
+        jsonResult(id, result.value)
+      })
+      PENDING_HANDOFF_CALLS.set(id, cancel)
+    } catch (e) { fail(id, -32000, String(e)) }
+    return
+  }
+  if(name==='project_memory'){handleProjectMemoryCall(id,args);return}
   if (ASSISTANT_TOOLS.some(function(tool) { return tool.name === name })) { handleAssistantCall(id, name, args); return }
   if (name === 'requirement_context') {
     if (!REQUIREMENT_TOKEN || !REQUIREMENT_INBOX || !REQUIREMENT_RESULTS || !CALLER_SESSION) {
@@ -1051,7 +1068,7 @@ function onMessage(msg) {
   } else if (method === 'notifications/initialized' || method === 'initialized') {
     // notification — no reply
   } else if (method === 'tools/list') {
-    reply(id, { tools: process.env.UNIAGENT_ASSISTANT_ONLY === '1' ? (ASSISTANT_TOKEN ? ASSISTANT_REVIEW_TOOLS : []) : process.env.UNIAGENT_REQUIRE_CALLER === '1' && !CALLER_SESSION ? [] : (TEAM_CAPABILITY ? TEAM_TOOLS.concat(TEAM_LEADER && FEISHU_OUTBOX ? TOOLS.filter(function(t) { return t.name === 'send_to_feishu' }) : []) : TOOLS).concat(REQUIREMENT_TOKEN ? [REQUIREMENT_TOOL] : []).concat(ASSISTANT_TOKEN ? ASSISTANT_TOOLS : []).concat(GLOBAL_MEMORY_TOKEN ? [GLOBAL_MEMORY_TOOL] : []).concat(PROJECT_MEMORY_TOKEN ? [PROJECT_MEMORY_TOOL] : []) })
+    reply(id, { tools: process.env.UNIAGENT_ASSISTANT_ONLY === '1' ? (ASSISTANT_TOKEN ? ASSISTANT_REVIEW_TOOLS : []) : process.env.UNIAGENT_REQUIRE_CALLER === '1' && !CALLER_SESSION ? [] : (TEAM_CAPABILITY ? TEAM_TOOLS.concat(TEAM_LEADER && FEISHU_OUTBOX ? TOOLS.filter(function(t) { return t.name === 'send_to_feishu' }) : []) : TOOLS).concat(TEAM_CAPABILITY && CONTEXT_TOKEN ? [CONTEXT_TOOL] : []).concat(REQUIREMENT_TOKEN ? [REQUIREMENT_TOOL] : []).concat(ASSISTANT_TOKEN ? ASSISTANT_TOOLS : []).concat(PROJECT_MEMORY_TOKEN ? [PROJECT_MEMORY_TOOL] : []) })
   } else if (method === 'tools/call') {
     handleCall(id, msg.params)
   } else if (method === 'ping') {
@@ -1234,7 +1251,7 @@ export function handoffMcpServers(callerSessionId?: string): Array<{
         { name: 'UNIAGENT_FEISHU_OUTBOX', value: FEISHU_OUTBOX_DIR },
         { name: 'UNIAGENT_FEISHU_RESULTS', value: FEISHU_RESULTS_DIR },
         { name: 'UNIAGENT_CALLER_SESSION', value: callerSessionId || '' },
-        ...Object.entries({ ...teamMcpEnv(callerSessionId), ...requirementEnv(callerSessionId), ...assistantMcpEnv(callerSessionId), ...globalMemoryMcpEnv(callerSessionId) }).map(([name, value]) => ({ name, value }))
+        ...Object.entries({ ...contextMcpEnv(callerSessionId), ...teamMcpEnv(callerSessionId), ...requirementEnv(callerSessionId), ...assistantMcpEnv(callerSessionId), ...projectMemoryMcpEnv(callerSessionId) }).map(([name, value]) => ({ name, value }))
       ]
     }
   ]
@@ -1284,7 +1301,7 @@ export function handoffMcpArgs(adapter: string, callerSessionId?: string, allowF
       ]),
       ...(adapter === 'codex' && team.UNIAGENT_TEAM_LEADER === '1'
         ? ['-c', 'features.code_mode.direct_only_tool_namespaces=["mcp__uniagent"]'] : []),
-      ...Object.entries({ ...team, ...requirement, ...globalMemoryMcpEnv(callerSessionId), ...(allowFeishuSend && allowRequirementSync ? assistantMcpEnv(callerSessionId) : assistantMcpEnv()) }).flatMap(([key, value]) => ['-c', 'mcp_servers.uniagent.env.' + key + '=' + JSON.stringify(value)]),
+      ...Object.entries({ ...contextMcpEnv(callerSessionId), ...team, ...requirement, ...projectMemoryMcpEnv(callerSessionId), ...(allowFeishuSend && allowRequirementSync ? assistantMcpEnv(callerSessionId) : assistantMcpEnv()) }).flatMap(([key, value]) => ['-c', 'mcp_servers.uniagent.env.' + key + '=' + JSON.stringify(value)]),
       '-c',
       `mcp_servers.uniagent.command=${JSON.stringify(exec)}`,
       '-c',
@@ -1329,10 +1346,11 @@ export function handoffMcpArgs(adapter: string, callerSessionId?: string, allowF
               UNIAGENT_FEISHU_OUTBOX: allowFeishuSend ? FEISHU_OUTBOX_DIR : '',
               UNIAGENT_FEISHU_RESULTS: FEISHU_RESULTS_DIR,
               UNIAGENT_CALLER_SESSION: caller,
+              ...contextMcpEnv(callerSessionId),
               ...team,
               ...requirement,
               ...(allowFeishuSend && allowRequirementSync ? assistantMcpEnv(callerSessionId) : assistantMcpEnv()),
-              ...globalMemoryMcpEnv(callerSessionId)
+              ...projectMemoryMcpEnv(callerSessionId)
             }
           }
         }
@@ -1349,6 +1367,15 @@ export function handoffMcpArgs(adapter: string, callerSessionId?: string, allowF
  */
 export function watchHandoffInbox(onTask: (req: HandoffInboxReq) => void): () => void {
   return watchInbox(INBOX_DIR, onTask)
+}
+export function watchContextInbox(read: (sessionId: string) => Promise<unknown>): () => void {
+  return watchInbox<{ id: string; sessionId: string; token: string }>(CONTEXT_INBOX_DIR, async req => {
+    if (typeof req.id !== 'string' || !/^[a-f0-9-]{36}$/i.test(req.id)) return
+    try {
+      if (!req.token || contextTokens.get(req.sessionId) !== req.token) throw new Error('context_caller_mismatch')
+      writeInboxResult(RESULTS_DIR, req.id, { ok: true, value: await read(req.sessionId) })
+    } catch (error) { writeInboxResult(RESULTS_DIR, req.id, { ok: false, error: String(error) }) }
+  }, true)
 }
 
 export function watchFeishuSendInbox(onSend: (req: FeishuSendReq) => void): () => void {

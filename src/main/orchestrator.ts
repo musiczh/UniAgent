@@ -1,7 +1,7 @@
 import { projectQoderHistory } from './qoderHistory'
 import { appendWeixinContext, splitWeixinContext } from '../shared/weixin'
-import { stripAssistantContext } from './assistant/context'
-import { cancelRequirementPreparation, forgetRequirementContext, hasRequirementContext, prepareRequirementTurn } from './requirementRuntime'
+import { stripAssistantContext, configureAssistantContextRuntime, prepareAssistantInitialization, assistantContextCompacted, withAssistantMessageSource } from './assistant/context'
+import { cancelRequirementPreparation, hasRequirementContext, prepareRequirementTurn } from './requirementRuntime'
 import { hasProjectMemoryContext } from './projectMemoryRuntime'
 import { resolveAgentWorkspaceConfig } from './projectStore'
 import { resolveModelEffort, withAgentDefaults } from '../shared/agentChoices'
@@ -117,6 +117,7 @@ import type {
   BubbleComment,
   HistoryForkPoint,
   CodexModelSourceRef,
+  ModelDef,
   CodexRateLimits,
   DurableQueueItem,
   QueueItem,
@@ -163,7 +164,7 @@ import {
   isToolSession,
   sessionDedupKey
 } from '../shared/types'
-import { mergeSubAgentSnapshot } from '../shared/subAgentLifecycle'
+import { mergeSubAgentSnapshot, upsertSubAgentRoster } from '../shared/subAgentLifecycle'
 import {
   buildDetailExplanationPrompt,
   parseDetailExplanationResponse,
@@ -209,7 +210,7 @@ function bubblePayload(bubble?: TurnBubble): Record<string, unknown> {
 // A queued item carries its own bubble decorations; forward them onto the user
 // event recorded when the item is finally delivered/steered.
 function queueItemBubblePayload(item: QueueItem): Record<string, unknown> {
-  return bubblePayload({ clientTurnKey: item.clientTurnKey, comments: item.comments, displayText: item.displayText, source: item.source, routedInputId: item.routedInputId })
+  return bubblePayload({ clientTurnKey: item.clientTurnKey || item.id, comments: item.comments, displayText: item.displayText, source: item.source, routedInputId: item.routedInputId })
 }
 
 const MAX_SUBMITTED_USER_MESSAGES = 200
@@ -634,9 +635,11 @@ export class Orchestrator extends EventEmitter {
     sessionLogsRoot?: string,
     private readonly resolveProjectConfig?: (config: SessionConfig, validateDirectories?: boolean) => SessionConfig,
     private readonly assertAgentReady?: (agentId: string) => void,
-    private readonly getAgentPref?: (agentId: string) => import('../shared/types').AgentPref | undefined
+    private readonly getAgentPref?: (agentId: string) => import('../shared/types').AgentPref | undefined,
+    private readonly projectNativeModels?: (agentId: string, models: ModelDef[]) => ModelDef[]
   ) {
     super()
+    configureAssistantContextRuntime(id => this.sessions.get(id), () => this.persistOrThrow())
     this.store = store || new SessionStore()
     const storeDirectory = typeof (this.store as SessionStore).directory === 'function'
       ? this.store.directory()
@@ -1091,15 +1094,17 @@ export class Orchestrator extends EventEmitter {
     }
   }
 
-  hasActiveAgentSessions(agentId?: string): boolean {
-    return [...this.sessions.values()].some((session) => {
+  hasActiveAgentSessions(agentId?: string, matches?: (config: SessionConfig) => boolean): boolean {
+    const mainActive = [...this.sessions.values()].some((session) => {
       if (agentId && session.config.agentId !== agentId) return false
+      if (matches && !matches(session.config)) return false
       return this.isBusy(session.status) || (!!session.worktreeTask && !session.worktreeTaskError) ||
         this.teamDeliveryBlocked(session.id) || !!this.protocolPendingStarts.get(session.id) ||
         !!this.deferredDispatches.get(session.id) ||
-        this.getSideStatus(session.id) !== 'idle' || !!this.sideQueues.get(session.id)?.length ||
+        ((!matches || matches(this.sideConfigs.get(session.id) ?? session.config)) && (this.getSideStatus(session.id) !== 'idle' || !!this.sideQueues.get(session.id)?.length)) ||
         this.getDetailStatus(session.id) !== 'idle'
     })
+    return mainActive || !!matches && [...this.sideConfigs].some(([id, config]) => (!agentId || config.agentId === agentId) && matches(config) && (this.getSideStatus(id) !== 'idle' || !!this.sideQueues.get(id)?.length))
   }
 
   hasActiveSessionWork(sessionId: string): boolean {
@@ -1128,6 +1133,13 @@ export class Orchestrator extends EventEmitter {
   /** 需求5 — the single session object (no dedup collapse) by its UniAgent id. */
   getSessionById(sessionId: string): Session | undefined {
     return this.sessions.get(sessionId)
+  }
+  setInitialRequirementContext(sessionId: string, content: string): boolean {
+    const session = this.sessions.get(sessionId)
+    if (!session || session.promptContext || session.nativeSessionId || session.initialRequirementContext) return false
+    session.initialRequirementContext = content
+    try { this.persistOrThrow() } catch (error) { if (!sessionStoreWriteCommitted(error)) delete session.initialRequirementContext; throw error }
+    return true
   }
 
   async getSessionInfo(sessionId: string): Promise<SessionInfo> {
@@ -1233,7 +1245,7 @@ export class Orchestrator extends EventEmitter {
         await this.sessionLogs.flush()
         const checkpoints = this.sessionLogs.loadReplayCheckpoints(sessionId)
         const agent = this.getAgent(owner.config.agentId)
-        const { events } =
+        const loadedHistory =
           owner.pendingClaudeFork
             ? await loadClaudeForkHistory(owner.pendingClaudeFork)
             :  agent?.adapter === 'kimi'
@@ -1243,6 +1255,7 @@ export class Orchestrator extends EventEmitter {
               : agent?.adapter === 'mcode'
               ? await loadMCodeSessionEvents(nativeSessionId!, agent.bin, owner.config.workdir, mcodeSessionRuntimeEnv())
               : await loadSessionEvents(owner.config.agentId, nativeSessionId!, agent?.bin, owner.config.workdir)
+        const { events } = loadedHistory
         const handoffEnds = await handoffTaskStore.loadCallerEvents(sessionId, events)
         if (
           this.sessions.get(sessionId) !== owner ||
@@ -1266,6 +1279,7 @@ export class Orchestrator extends EventEmitter {
         this.seqRefs.set(sessionId, ref)
         this.pendingHistoryRestores.delete(owner)
         this.bumpSessionActivity(sessionId)
+        
       })()
       load = { owner, promise }
       this.historyLoads.set(sessionId, load)
@@ -2269,14 +2283,14 @@ export class Orchestrator extends EventEmitter {
     teamRuntime(sessionId)?.beforeUserTurn?.()
     const claudeRunner = this.runners.get(sessionId)
     if (claudeRunner && this.isBusy(session.status)) {
-      await claudeRunner.steer(prompt, acceptedInput.attachments)
+      await withAssistantMessageSource(sessionId, bubble?.source, () => claudeRunner.steer(prompt, acceptedInput.attachments))
       this.record(sessionId, { type: 'user_message', payload: { text: prompt, ...acceptedInput, ...bubblePayload(bubble), appendedToTurn: true } })
       this.emit('taskInputAccepted', sessionId)
       return
     }
     const protocol = this.protocolRunners.get(sessionId)
     if (protocol && this.isBusy(session.status)) {
-      const receipt = await protocol.steer(prompt, acceptedInput.attachments)
+      const receipt = await withAssistantMessageSource(sessionId, bubble?.source, () => protocol.steer(prompt, acceptedInput.attachments))
       this.record(sessionId, { type: 'user_message', payload: { text: prompt, ...acceptedInput, ...bubblePayload(bubble),
         appendedToTurn: receipt?.appendedToTurn ?? true, ...(receipt?.nativePromptId ? { nativePromptId: receipt.nativePromptId } : {}) } })
       this.emit('taskInputAccepted', sessionId)
@@ -2290,15 +2304,15 @@ export class Orchestrator extends EventEmitter {
         preparedRun.input.nativeContext
       )
       if (!queueIfBusy) {
-        await (preparedRun.streamer || streamer).steerStrict(prompt, preparedRun.input.attachments, preparedRun.input.nativeContext)
+        await withAssistantMessageSource(sessionId, bubble?.source, () => (preparedRun.streamer || streamer).steerStrict(prompt, preparedRun.input.attachments, preparedRun.input.nativeContext))
       }
       this.record(sessionId, { type: 'user_message', payload: { text: prompt, ...auditInput, ...bubblePayload(bubble), appendedToTurn: true } })
       if (!queueIfBusy) { this.emit('taskInputAccepted', sessionId); return }
-      await (preparedRun.streamer || streamer).steer(
+      await withAssistantMessageSource(sessionId, bubble?.source, () => (preparedRun.streamer || streamer).steer(
         prompt,
         preparedRun.input.attachments,
         preparedRun.input.nativeContext
-      )
+      ))
       this.emit('taskInputAccepted', sessionId)
       return
     }
@@ -2498,7 +2512,7 @@ export class Orchestrator extends EventEmitter {
         ? { ...entry, state: 'steering' as const, attempts: entry.attempts + 1 } : entry))
       this.emitQueue(sessionId)
       let acknowledged = false
-      void protocol.steer(item.prompt, deliveryInput.attachments).then(receipt => {
+      void withAssistantMessageSource(sessionId, item.source, () => protocol.steer(item.prompt, deliveryInput.attachments)).then(receipt => {
         if (this.sessions.get(sessionId) !== session || this.protocolRunners.get(sessionId) !== protocol) return
         acknowledged = true
         this.record(sessionId, { type: 'user_message', payload: { text: item.prompt, ...deliveryInput, ...queueItemBubblePayload(item),
@@ -2529,11 +2543,11 @@ export class Orchestrator extends EventEmitter {
       deliveryInput.nativeContext
     )
     this.record(sessionId, { type: 'user_message', payload: { text: item.prompt, ...auditInput, ...queueItemBubblePayload(item), appendedToTurn: true } })
-    void streamer.steer(
+    void withAssistantMessageSource(sessionId, item.source, () => streamer.steer(
       item.prompt,
       deliveryInput.attachments,
       deliveryInput.nativeContext
-    ).then(() => {
+    )).then(() => {
       // turn/steer success is an authoritative delivery acknowledgement.
       try {
         this.removeDeliveredQueueItem(session, item.id)
@@ -2692,7 +2706,7 @@ export class Orchestrator extends EventEmitter {
         const model = contract.models.find(model => model.id === contract.currentModelId)
         session.config = { ...target, model: contract.currentModelId, zcodeModelSelection: model?.zcodeSelection,
           effort: model?.efforts.find(level => level === model.zcodeSelection?.options?.reasoningLevel) }
-        session.agentContract = contract
+        session.agentContract = { ...contract, models: this.projectNativeModels?.(session.config.agentId, contract.models) ?? contract.models }
         this.persistOrThrow(); this.emitAgentUpdate(session)
         return session
       })
@@ -2767,7 +2781,7 @@ export class Orchestrator extends EventEmitter {
         if (this.sessions.get(sessionId) !== current) return undefined
         this.replaceSessionConfig(current, applied?.config || target)
         if (applied?.contract) {
-          current.agentContract = copySessionContract(applied.contract)
+          current.agentContract = copySessionContract({ ...applied.contract, models: this.projectNativeModels?.(current.config.agentId, applied.contract.models) ?? applied.contract.models })
           this.bumpSessionActivity(current.id)
         }
         replaced = true
@@ -5940,6 +5954,7 @@ export class Orchestrator extends EventEmitter {
     const byId = new Map(list.map((a) => [a.agentThreadId, a]))
     for (const incoming of agents) {
       if (!incoming.agentThreadId) continue
+      if (session.config.agentId === 'nika') { upsertSubAgentRoster(byId, incoming, Date.now()); continue }
       const prev = byId.get(incoming.agentThreadId)
       const merged = mergeSubAgentSnapshot(prev, incoming, Date.now())
       byId.set(incoming.agentThreadId, merged)
@@ -6848,7 +6863,7 @@ export class Orchestrator extends EventEmitter {
   }
 
   private logEvent(event: UAEvent, channel: 'main' | 'side' | 'detail' = 'main'): void {
-    if (channel === 'main' && (event.type === 'context_compaction' || event.type === 'error')) forgetRequirementContext(event.sessionId)
+    if (channel === 'main' && event.type === 'context_compaction' && event.state === 'success' && typeof event.payload?.id === 'string') assistantContextCompacted(event.sessionId, event.payload.id)
     const turnId = event.type === 'agent_message'
       ? event.payload?.turnId || this.turnCapture.get(event.sessionId)?.nativeTurnId
       : undefined
@@ -7238,14 +7253,14 @@ export class Orchestrator extends EventEmitter {
     if ((hasRequirementContext(session.config) || hasProjectMemoryContext(session.config)) && !preparedRun?.requirementPrepared) {
       const prepared = preparedRun || this.prepareCurrentAgentRun(session, input)
       const preparation = prepareRequirementTurn(session, prompt)
-      void preparation.ready.then(text => {
+      void preparation.ready.then(async text => {
+        await prepareAssistantInitialization(session, prepared.config, preparation.current)
         if (!preparation.current() || this.sessions.get(session.id) !== session) return
         this.run(session, text, input.attachments, input.nativeContext, { ...prepared, requirementPrepared: true })
         preparation.complete()
       }).catch(error => {
         if (!preparation.current() || this.sessions.get(session.id) !== session) return
         preparation.complete()
-        forgetRequirementContext(session.id)
         this.discardPreparedRun(session, prepared)
         this.record(session.id, { type: 'error', state: 'failed', payload: { message: '需求上下文读取失败，本轮未启动：' + String(error) } })
         this.finishFailedTurn(session)
@@ -7261,6 +7276,7 @@ export class Orchestrator extends EventEmitter {
     this.setStatus(session, queuedBehindActive ? 'queued' : 'running')
 
     const route = preparedRun?.route || agentRunRoute(agent, session.config)
+    withAssistantMessageSource(session.id, this.currentTurnInput(session)?.payload.source, () => {
     if (route === 'zcode') {
       this.runZCode(session, prompt, input.attachments, input.nativeContext)
     } else if (route === 'protocol') {
@@ -7277,6 +7293,7 @@ export class Orchestrator extends EventEmitter {
     } else {
       this.runOneShot(session, agent, (agent.adapter === 'claude' || agent.adapter === 'qoder') ? claudeTurnPrompt(prompt, input.nativeContext) : prompt, input.attachments, preparedRun?.config)
     }
+    })
     return true
   }
 
@@ -7607,7 +7624,9 @@ export class Orchestrator extends EventEmitter {
    * Child-session images stay unsupported until sub-agent transcripts land. */
   async readNativeImage(sessionId: string, selector: { eventSeq:number; blockIndex:number; toolResult?:boolean; childSessionId?:string }): Promise<string | null> {
     const session = this.sessions.get(sessionId)
-    if (!session?.nativeSessionId || this.rewinding.has(sessionId) || selector.childSessionId) return null
+    if (!session?.nativeSessionId || this.rewinding.has(sessionId)) return null
+    
+    if (selector.childSessionId) return null
     const live = this.protocolRunners.get(sessionId)
     if (live) {
       // Kimi/Grok runners reject the selector; that is a miss, not a broken turn.
@@ -7709,7 +7728,7 @@ export class Orchestrator extends EventEmitter {
     })
     runner.on('contract', (contract: SessionAgentContract) => {
       if (!owns()) return
-      session.agentContract = contract
+      session.agentContract = { ...contract, models: this.projectNativeModels?.(session.config.agentId, contract.models) ?? contract.models }
       session.config.model = contract.currentModelId
       const model = contract.models.find(model => model.id === contract.currentModelId)
       session.config.zcodeModelSelection = model?.zcodeSelection
@@ -7853,7 +7872,8 @@ export class Orchestrator extends EventEmitter {
       this.protocolRunners.get(session.id) === runner && this.sessions.get(session.id) === session
     runner.on('configChanged', (config: SessionConfig) => {
       if (!ownsRunner() || this.deepseekConfigTransactions.has(session.id)) return
-      session.config = { ...session.config, model:config.model, effort:config.effort, kimiThinking:config.kimiThinking, collaborationMode:config.collaborationMode }
+      session.config = { ...session.config, model:config.model, effort:config.effort, kimiThinking:config.kimiThinking, collaborationMode:config.collaborationMode,
+        ...(session.config.agentId === 'nika' ? { nikaPinnedModel: config.nikaPinnedModel } : {}) }
       this.persist(); this.emitAgentUpdate(session)
     })
     runner.on('goalChanged', (goal: GoalState | undefined) => {
@@ -7898,7 +7918,7 @@ export class Orchestrator extends EventEmitter {
     runner.on('contract', (contract: SessionAgentContract) => {
       if (!ownsRunner()) return
       if (this.deepseekConfigTransactions.has(session.id)) return
-      session.agentContract = copySessionContract(contract)
+      session.agentContract = copySessionContract({ ...contract, models: this.projectNativeModels?.(session.config.agentId, contract.models) ?? contract.models })
       session.config.model = contract.currentModelId
       if (contract.currentPermissionMode) {
         session.config.permissionMode = contract.currentPermissionMode

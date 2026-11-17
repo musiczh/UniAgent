@@ -269,6 +269,7 @@ export class AgentLifecycleService extends EventEmitter {
   }
 
   snapshot(): AgentDef[] { return this.cache }
+  projectModels(project: (agent: AgentDef) => AgentDef): AgentDef[] { this.cache = this.cache.map(project); return this.cache }
 
   detectOne(agentId: string): Promise<AgentDef> {
     const existing = this.singleDetectFlights.get(agentId)

@@ -72,7 +72,7 @@ try {
   assert.ok(launch, 'app-server 必须产生启动事件')
   assert.ok(injected, 'app-server 必须注入 developerInstructions')
   assert.equal(launch?.payload.appendedPrompt, injected, '启动事件必须携带实际注入 app-server 的完整 Prompt')
-  assert.ok(String(injected).endsWith('只报告真实问题。'), JSON.stringify(injected))
+  assert.equal(String(injected).split('只报告真实问题。').length, 2, 'role instructions are included once alongside the initialization snapshot')
   const started = transport.requests.find((request) => request.method === 'thread/start')?.params
   assert.equal(started?.config.openai_base_url, 'http://127.0.0.1:11436/api/codex/v1')
   assert.equal(started?.config['features.enable_request_compression'], false)
@@ -94,14 +94,14 @@ const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
 require('node:readline').createInterface({input: process.stdin}).on('line', line => {
   const value = JSON.parse(line);
   if (value.type === 'control_request') send({type: 'control_response', response: {subtype: 'success', request_id: value.request_id, response: {commands: [], models: []}}});
-  if (value.type === 'user') send({type: 'result', subtype: 'success', is_error: false, result: 'ok', user_message_uuid: value.uuid});
+  if (value.type === 'user') { send({...value, isReplay: true}); send({type: 'result', subtype: 'success', is_error: false, result: 'ok', user_message_uuid: value.uuid}); }
 });
 `, { mode: 0o700 })
   const done = once(oneShot, 'done')
   oneShot.start({ ...agent('claude'), bin: fixtureBin }, { ...config('claude'), workdir: fixtureRoot }, '检查代码')
   await done
   const oneShotLaunch = oneShotEvents.find((event) => event.payload?.kind === 'launch')
-  assert.ok(String(oneShotLaunch?.payload.appendedPrompt).endsWith('只报告真实问题。'))
+  assert.equal(String(oneShotLaunch?.payload.appendedPrompt).split('只报告真实问题。').length, 2)
 } finally {
   await oneShot.disposeClaudeSdk()
   await rm(fixtureRoot, { recursive: true, force: true })

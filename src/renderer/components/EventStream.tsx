@@ -42,6 +42,7 @@ import {
   isSubAgentGenerationAdvance,
   isSubAgentTerminal,
   mergeSubAgentSnapshot,
+  upsertSubAgentRoster,
   subAgentDisplayName,
   subAgentTaskSummary,
 } from '@shared/subAgentLifecycle'
@@ -268,7 +269,7 @@ export const MessageAvatarContext = createContext<{ agentId: string; adapter?: s
 // A parent sendInput/interacted event is rendered as one standalone 追加提问 row;
 // it does not advance or interrupt the child's lifecycle generation.
 type SubPhase = 'spawn' | 'append' | 'done' | 'interrupted' | 'error'
-type SubLineAgent = { threadId: string; name?: string; prompt?: string; dispatchId?: string }
+type SubLineAgent = { threadId: string; name?: string; prompt?: string; dispatchId?: string; requestedModel?: string; servedModel?: string; nativeTaskId?: string }
 
 /** Fix#4 — set on the CALLER session while its turn blocks (wait=true) on an
  * outbound handoff; also used by the inline 交接任务 row to resolve a jump target. */
@@ -543,7 +544,10 @@ function groupTurns(events: UAEvent[], activeWaitingHandoffId = '', teamProject?
     })
   }
 
+  const nativeTasksWithChildren = new Set(events.filter(event => event.type === 'subagent').flatMap(event =>
+    (event.payload.agents || []).map((agent: UASubAgent) => agent.nativeTaskId).filter(Boolean)))
   for (const ev of events) {
+    if (ev.payload?.deleted || ev.type === 'background_task' && nativeTasksWithChildren.has(ev.payload.taskId)) continue
     if (ev.type === 'goal_message') {
       const t = startCur(ev)
       t.user = ev
@@ -688,7 +692,7 @@ function groupTurns(events: UAEvent[], activeWaitingHandoffId = '', teamProject?
         const previous = subAgentState.get(a.agentThreadId)
         const merged = mergeSubAgentSnapshot(previous, a, ev.ts)
         if (merged === previous) continue
-        subAgentState.set(a.agentThreadId, merged)
+        upsertSubAgentRoster(subAgentState, merged, ev.ts)
         const seen = lastPhase.get(a.agentThreadId)
         const newerGeneration = isSubAgentGenerationAdvance(
           !!seen,
@@ -704,7 +708,7 @@ function groupTurns(events: UAEvent[], activeWaitingHandoffId = '', teamProject?
           const key = `${a.agentThreadId}\0${interactionId}`
           if (!seenSubAgentInteractions.has(key)) {
             seenSubAgentInteractions.add(key)
-            pushSub(t, 'append', { threadId: a.agentThreadId, name: merged.name, prompt: merged.prompt, dispatchId: merged.dispatchId }, ev)
+            pushSub(t, 'append', { threadId: a.agentThreadId, name: merged.name, prompt: merged.prompt, dispatchId: merged.dispatchId, nativeTaskId: merged.nativeTaskId }, ev)
           }
           continue
         }
@@ -716,7 +720,7 @@ function groupTurns(events: UAEvent[], activeWaitingHandoffId = '', teamProject?
           : 'spawn'
         if (prevPhase === nextPhase) continue // no real transition → no new row
         lastPhase.set(a.agentThreadId, { phase: nextPhase, generation: merged.generation })
-        pushSub(t, nextPhase, { threadId: a.agentThreadId, name: merged.name, prompt: merged.prompt, dispatchId: merged.dispatchId }, ev)
+        pushSub(t, nextPhase, { threadId: a.agentThreadId, name: merged.name, prompt: merged.prompt, dispatchId: merged.dispatchId, nativeTaskId: merged.nativeTaskId }, ev)
       }
       continue
     }
@@ -848,12 +852,17 @@ function groupTurns(events: UAEvent[], activeWaitingHandoffId = '', teamProject?
   for (const turn of turns) {
     for (const segment of turn.segments) {
       if (segment.kind !== 'subagent') continue
-      segment.agents = segment.agents.map((agent) => ({
-        ...agent,
-        name: subAgentState.get(agent.threadId)?.name || agent.name,
-        prompt: agent.prompt || (subAgentState.get(agent.threadId)?.dispatchId === agent.dispatchId
-          ? subAgentState.get(agent.threadId)?.prompt : undefined),
-      }))
+      segment.agents = segment.agents.map((agent) => {
+        const latest = agent.nativeTaskId ? [...subAgentState.values()].find(child => child.nativeTaskId === agent.nativeTaskId) : subAgentState.get(agent.threadId)
+        return {
+          ...agent,
+          threadId: latest?.agentThreadId || agent.threadId,
+          name: latest?.name || agent.name,
+          prompt: agent.prompt || (latest?.dispatchId === agent.dispatchId ? latest?.prompt : undefined),
+          requestedModel: latest?.requestedModel,
+          servedModel: latest?.servedModel,
+        }
+      })
     }
     turn.queueViews = computeQueueViews(turn.events, priorQueueWaitById)
     turn.queueView = foldQueueViews(turn.queueViews)
@@ -1003,18 +1012,25 @@ export function EventStream({
     if (!focusRouterRequestId) { focusedRouterRequest.current = undefined; return }
     const key = `${sessionId}:${focusRouterRequestId}:${focusedRouterVersion ?? ''}`
     if (focusedRouterRequest.current === key) return
-    const frame = requestAnimationFrame(() => {
-      const stream = streamRef.current
+    const stream = streamRef.current
+    let frame = 0, focused = false
+    const stop = () => { cancelAnimationFrame(frame); focusedRouterRequest.current = key }
+    const locate = () => {
       const row = stream?.querySelector<HTMLElement>(`.router-assignment[data-router-request="${CSS.escape(focusRouterRequestId)}"]:not([data-router-clarification])`)
       if (!stream || !row) return
-      followRef.current = false
       const input = row.querySelector<HTMLElement>('input:not(:disabled)') || row.querySelector<HTMLElement>('button:not(:disabled)')
+      if (focused && input && document.activeElement !== input) { stop(); return }
+      followRef.current = false
       const top = Math.max(row.getBoundingClientRect().top - 24, (input || row).getBoundingClientRect().bottom - stream.clientHeight + 24)
       stream.scrollTo({ top: stream.scrollTop + top - stream.getBoundingClientRect().top, behavior: 'auto' })
-      input?.focus({ preventScroll: true })
-      focusedRouterRequest.current = key
-    })
-    return () => cancelAnimationFrame(frame)
+      if (!focused) input?.focus({ preventScroll: true })
+      focused = true
+      if (row.style.height || row.getAnimations().some(animation => animation.playState === 'running')) frame = requestAnimationFrame(locate)
+      else focusedRouterRequest.current = key
+    }
+    stream?.addEventListener('wheel', stop, { once: true, passive: true })
+    frame = requestAnimationFrame(locate)
+    return () => { cancelAnimationFrame(frame); stream?.removeEventListener('wheel', stop) }
   }, [focusRouterRequestId, focusedRouterVersion, sessionId, events, beforeConversation, afterConversation, routerFallbackRequests])
   const commentScrollRef = useRef<{
     root: HTMLElement
@@ -1104,7 +1120,7 @@ export function EventStream({
     return positions
   }, [turns, routerFallbackRequests, routerContext, sessionId])
   const renderRouterFallbacks = (position: number) => routerContext && routerFallbacks.get(position)?.map(view =>
-    <RouterAssignmentCard key={view.key} request={view.request} clarification={view.clarification} agents={routerContext.agents} resolve={routerContext.resolve} openTask={routerContext.openTask} openFeedback={routerContext.openFeedback}/>)
+    <RouterAssignmentCard key={view.key} request={view.request} clarification={view.clarification} agents={routerContext.agents} resolve={routerContext.resolve} openTask={routerContext.openTask}/>)
   const rewindableTurns = useMemo(() => rewindableVisualTurnIndexes(turns), [turns])
   const changeCardTurns = useMemo(() => changeCardVisualTurnIndexes(turns), [turns])
   const planDecisionTurnIndex = turns.length - 1
@@ -3122,8 +3138,7 @@ function mergeSubAgents(events: UAEvent[], saved: UASubAgent[]): UASubAgent[] {
     const agents = (ev.payload?.agents || []) as UASubAgent[]
     for (const a of agents) {
       if (!a.agentThreadId) continue
-      const prev = byId.get(a.agentThreadId)
-      byId.set(a.agentThreadId, mergeSubAgentSnapshot(prev, a, ev.ts))
+      upsertSubAgentRoster(byId, a, ev.ts)
     }
   }
   return [...byId.values()]
@@ -3185,6 +3200,7 @@ function SubAgentLine({
             <span className="nm">
               {subAgentDisplayName({ agentThreadId: a.threadId, name: a.name })}
               {subAgentTaskSummary(a.prompt) && <span className="sa-task"> · {subAgentTaskSummary(a.prompt)}</span>}
+              {(a.servedModel || a.requestedModel) && <span className="sa-task"> · {a.servedModel || a.requestedModel}</span>}
             </span>
           </Fragment>
         ))}

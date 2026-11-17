@@ -103,7 +103,9 @@ export function mergeCodexCatalogModels(providerModels: CatalogModel[]): Catalog
 }
 
 export function mergeCodexSourceModels(nativeModels: ModelDef[], supplementalModels: ModelDef[]): ModelDef[] {
-  return [...nativeModels, ...supplementalModels]
+  const models = [...nativeModels, ...supplementalModels]
+  const ferry = (model: ModelDef) => model.modelSource?.sourceId === 'ferry' || model.id.startsWith('ferry-')
+  return [...models.filter(model => !ferry(model)), ...models.filter(ferry)]
 }
 
 export function codexSourceRuntimeArgs(endpoint: string, catalogFile: string, sourceId: CodexSourceId, model: string): string[] {

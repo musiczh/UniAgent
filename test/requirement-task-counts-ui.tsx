@@ -44,7 +44,7 @@ const result = await renderEventStream([], 'idle', 'requirement-task-counts-ui',
     const standby={phase:'standby',version:1,awaitingAcceptance:false,updatedAt:1};
     window.updateCounts({sessions:f.sessions.map(s=>({...s,status:'completed',taskState:standby})),status:{},unread:{}});await tick();const deferred=values();
     window.updateCounts({sessions:f.sessions.map(s=>({...s,archived:true})),status:{}});await tick();const archived=values();
-    window.updateCounts({sessions:f.sessions,status:{run:'awaiting-approval'},pending:{run:true},unread:{done:'main'}});await tick();
+    window.updateCounts({sessions:f.sessions,status:{run:'awaiting-approval'},pending:{run:true},unread:{done:'main',run:'main'}});await tick();
     const blocked={icons:values(),waiting:row().querySelector('.scope-badge.waiting')?.textContent,graphic:!!row().querySelector('.scope-badge.waiting svg'),color:getComputedStyle(row().querySelector('.scope-badge.waiting')).color};
     window.updateCounts({status:{run:'running'},pending:{}});await tick();const resumed=values();
     window.updateCounts({unread:{done:'main',run:'side'}});await tick();

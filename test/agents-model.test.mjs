@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import * as agentModels from '../src/main/agents.ts'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
+import { TextDecoder, TextEncoder } from 'node:util'
 
 const { BUILTIN_AGENTS, resolveClaudeModels } = agentModels
 
@@ -29,7 +30,7 @@ test('a Kimi cleanup failure settles only after cleanup and lets other agents fi
       builder.onLoad({ filter: /.*/, namespace: 'fixture' }, args => ({ contents: stubs[args.path], loader: 'js' }))
     } }]
   })
-  const context = vm.createContext({ module: { exports: {} }, require, process, console, Buffer, setTimeout, clearTimeout, URL, AbortController })
+  const context = vm.createContext({ module: { exports: {} }, require, process, console, Buffer, setTimeout, clearTimeout, URL, AbortController, TextEncoder, TextDecoder })
   context.exports = context.module.exports
   vm.runInContext(result.outputFiles[0].text, context)
   let releases = 0

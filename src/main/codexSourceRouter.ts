@@ -53,7 +53,7 @@ function inlineToolSchema(schema: any): any {
   } catch { return schema }
 }
 
-function kimiTools(tools: any[]): any[] {
+export function kimiTools(tools: any[]): any[] {
   return tools.map(tool => !tool || typeof tool !== 'object' ? tool : tool.type === 'namespace' && Array.isArray(tool.tools)
     ? { ...tool, tools: kimiTools(tool.tools) }
     : tool.type === 'function' && tool.parameters ? { ...tool, parameters: inlineToolSchema(tool.parameters) } : tool)
@@ -94,7 +94,7 @@ function httpErrorMessage(status: number, body: string): string {
   return `请求失败（HTTP ${status}）${hint}`
 }
 
-function contextErrorEvent(body: Buffer): string | undefined {
+export function contextErrorEvent(body: Buffer): string | undefined {
   try {
     const value = JSON.parse(body.toString('utf8'))
     if (providerContextLimit(value?.error?.message)) {

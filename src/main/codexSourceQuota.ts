@@ -1,8 +1,10 @@
 import { request } from 'node:https'
 import { CODEX_SOURCE_PRESETS, type CodexSourcePreset, type CodexSourceQuota } from '../shared/codexSources'
+import type { QuotaProviderId, ModelSourceQuota, ModelSourceQuotaQuery } from '../shared/modelSourceQuota'
+import { normalizeAdditionalQuota } from './model-sources/quotaAdapters'
 
 const MAX_RESPONSE = 1024 * 1024
-export interface QuotaRequest { url: string; authorization: string }
+export interface QuotaRequest { url: string; authorization: string; method?: 'GET' | 'POST'; headers?: Record<string, string> }
 
 function officialBase(preset: CodexSourcePreset, baseUrl: string): boolean {
   return baseUrl.replace(/\/+$/, '') === CODEX_SOURCE_PRESETS[preset].baseUrl
@@ -10,8 +12,6 @@ function officialBase(preset: CodexSourcePreset, baseUrl: string): boolean {
 
 export function quotaUnavailableReason(preset: CodexSourcePreset, baseUrl: string): string | undefined {
   if (!officialBase(preset, baseUrl)) return '自定义地址不查询额度'
-  // MiMo 的余额/套餐额度接口依赖控制台登录态，API Key 无法查询。
-  if (preset.startsWith('mimo')) return '小米 MiMo 暂不支持额度查询'
   return undefined
 }
 
@@ -21,6 +21,8 @@ export function quotaRequestFor(preset: CodexSourcePreset, baseUrl: string, apiK
   if (preset === 'kimi-api') return { url: 'https://api.moonshot.cn/v1/users/me/balance', authorization: `Bearer ${apiKey}` }
   if (preset === 'deepseek') return { url: 'https://api.deepseek.com/user/balance', authorization: `Bearer ${apiKey}` }
   if (preset === 'glm') return { url: 'https://open.bigmodel.cn/api/monitor/usage/quota/limit', authorization: apiKey }
+  if (preset === 'mimo') return { url: 'https://api.xiaomimimo.com/v1/platform/balance', authorization: `Bearer ${apiKey}` }
+  if (preset === 'mimo-token-plan') return { url: 'https://token-plan-cn.xiaomimimo.com/v1/platform/token_plan', authorization: `Bearer ${apiKey}` }
   return null
 }
 
@@ -32,14 +34,31 @@ function finite(value: unknown, name: string): number {
 
 function money(value: unknown, name: string): string {
   if (typeof value !== 'string' && typeof value !== 'number') throw new Error(`额度接口缺少 ${name}`)
-  if (!Number.isFinite(Number(value))) throw new Error(`额度接口返回无效 ${name}`)
+  if (String(value).trim() === '' || !Number.isFinite(Number(value))) throw new Error(`额度接口返回无效 ${name}`)
   return String(value)
 }
 
-export function normalizeQuotaResponse(preset: CodexSourcePreset, raw: any, capturedAt = Date.now()): CodexSourceQuota {
-  if (preset === 'kimi-code') {
-    const windows = ([
-      ['limit_5h', '5 小时额度'], ['limit_7d', '每周额度'], ['limit_month_total', '每月额度']
+export function normalizeQuotaResponse(preset: QuotaProviderId, raw: any, capturedAt = Date.now(), query?: ModelSourceQuotaQuery): ModelSourceQuota {
+  if (preset === 'mimo') {
+    if (raw?.object !== 'balance' || !Array.isArray(raw.balance_infos) || !raw.balance_infos.length) throw new Error('MiMo 余额响应无效')
+    return { status: 'ready', kind: 'balance', capturedAt, balances: raw.balance_infos.map((balance: any) => ({
+      currency: typeof balance.currency === 'string' && balance.currency ? balance.currency : (() => { throw new Error('额度接口缺少币种') })(),
+      total: (finite(balance.total_available, '可用余额') - finite(balance.frozen_balance, '冻结金额')).toFixed(2),
+      toppedUp: money(balance.cash_balance, '现金余额'), granted: money(balance.gift_balance, '赠金余额'),
+      frozen: money(balance.frozen_balance, '冻结金额'), creditAvailable: money(balance.credit_available, '可用授信')
+    })) }
+  }
+  if (preset === 'mimo-token-plan') {
+    if (raw?.object !== 'token_plan' || !raw.quota) throw new Error('MiMo 套餐额度响应无效')
+    const remaining = finite(raw.quota.remaining_credits, '剩余积分'), total = finite(raw.quota.total_credits, '总积分')
+    if (remaining < 0 || total < 0 || remaining > total) throw new Error('MiMo 套餐积分无效')
+    const date = raw.period?.end_at
+    const reset = typeof date === 'string' ? Date.parse(/^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/.test(date) ? date.replace(' ', 'T') + 'Z' : date) : NaN
+    return { status: 'ready', kind: 'credits', capturedAt, credits: { remaining, total, unit: '积分', ...(Number.isFinite(reset) ? { resetsAt: reset } : {}) } }
+  }
+  if (preset === 'kimi-code' || preset === 'kimi-code-global') {
+    const windows: NonNullable<CodexSourceQuota['windows']> = ([
+      ['limit_5h', '5 小时额度'], ['limit_7d', '每周额度'], ['limit_month_total', '每月额度'], ['limit_month_code', '每月编程额度']
     ] as const).flatMap(([key, label]) => {
       const entry = raw?.usages?.[key]
       if (!entry) return []
@@ -50,7 +69,28 @@ export function normalizeQuotaResponse(preset: CodexSourcePreset, raw: any, capt
         ...(Number.isFinite(reset) ? { resetsAt: reset } : {})
       }]
     })
-    if (!windows.length) throw new Error('Kimi Code 未返回套餐额度')
+    if (!windows.length) {
+      const labelFor = (window: any, fallback: string): string => {
+        const duration = Number(window?.duration)
+        if (!Number.isFinite(duration) || duration <= 0) return fallback
+        const unit = String(window?.timeUnit || '').replace('TIME_UNIT_', '').toLowerCase()
+        const minutes = duration * (({ second: 1 / 60, minute: 1, hour: 60, day: 1440, week: 10080 } as Record<string, number>)[unit] ?? NaN)
+        if (minutes === 300) return '5 小时额度'
+        if (minutes === 10080) return '每周额度'
+        if (unit === 'month' && duration === 1) return '每月额度'
+        const name = ({ second: '秒', minute: '分钟', hour: '小时', day: '天', week: '周', month: '月' } as Record<string, string>)[unit]
+        return name ? `${duration} ${name}额度` : fallback
+      }
+      const append = (detail: any, label: string) => {
+        const limit = finite(detail?.limit, '总额度'), remaining = finite(detail?.remaining, '剩余额度')
+        if (limit <= 0 || remaining < 0 || remaining > limit) throw new Error('Kimi Code 返回无效额度')
+        const reset = typeof detail.resetTime === 'string' ? Date.parse(detail.resetTime) : NaN
+        windows.push({ label, usedPercent: (limit - remaining) / limit * 100, ...(Number.isFinite(reset) ? { resetsAt: reset } : {}) })
+      }
+      if (Array.isArray(raw?.limits)) for (const item of raw.limits) if (item?.detail) append(item.detail, labelFor(item.window, '套餐窗口'))
+      if (raw?.usage) append(raw.usage, labelFor(raw.usage.window, '每周额度'))
+    }
+    if (!windows.length) throw new Error('Kimi Code 未返回套餐额度，请在控制台查看')
     return { status: 'ready', kind: 'windows', capturedAt, windows }
   }
   if (preset === 'kimi-api') {
@@ -100,7 +140,7 @@ export function normalizeQuotaResponse(preset: CodexSourcePreset, raw: any, capt
     return { status: 'ready', kind: 'windows', capturedAt, windows,
       ...(level ? { planType: `GLM Coding ${level.charAt(0).toUpperCase()}${level.slice(1).toLowerCase()}` } : {}) }
   }
-  throw new Error('该接入方式不支持额度查询')
+  return normalizeAdditionalQuota(preset, raw, capturedAt, query)
 }
 
 export function quotaErrorMessage(status?: number): string {
@@ -113,8 +153,9 @@ class QuotaHttpError extends Error { constructor(readonly status: number) { supe
 
 async function requestJson(input: QuotaRequest): Promise<unknown> {
   return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => req.destroy(new Error('额度查询超时')), 8000)
     const req = request(input.url, {
-      method: 'GET', headers: { Authorization: input.authorization, Accept: 'application/json', 'User-Agent': 'UniAgent' }
+      method: input.method ?? 'GET', headers: { Authorization: input.authorization, Accept: 'application/json', 'User-Agent': 'UniAgent', ...input.headers }
     }, response => {
       if (response.statusCode !== 200) { response.resume(); reject(new QuotaHttpError(response.statusCode || 0)); return }
       let size = 0
@@ -131,6 +172,7 @@ async function requestJson(input: QuotaRequest): Promise<unknown> {
       })
     })
     req.setTimeout(8000, () => req.destroy(new Error('额度查询超时')))
+    req.once('close', () => clearTimeout(timer))
     req.once('error', reject)
     req.end()
   })
@@ -142,8 +184,8 @@ export async function fetchSourceQuota(preset: CodexSourcePreset, baseUrl: strin
   return fetchQuotaRequest(preset, input)
 }
 
-export async function fetchQuotaRequest(preset: CodexSourcePreset, input: QuotaRequest): Promise<CodexSourceQuota> {
-  try { return normalizeQuotaResponse(preset, await requestJson(input)) }
+export async function fetchQuotaRequest(preset: QuotaProviderId, input: QuotaRequest, query?: ModelSourceQuotaQuery): Promise<ModelSourceQuota> {
+  try { return normalizeQuotaResponse(preset, await requestJson(input), Date.now(), query) }
   catch (error) {
     if (error instanceof QuotaHttpError) throw new Error(quotaErrorMessage(error.status))
     throw error

@@ -59,7 +59,7 @@ export class KimiWebTransport {
     this.timeoutMs = options.timeoutMs ?? 15_000
   }
 
-  async request<T = unknown>(method: 'GET' | 'POST', path: string, body?: unknown, acceptedCodes: readonly number[] = [0]): Promise<T> {
+  async request<T = unknown>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, acceptedCodes: readonly number[] = [0]): Promise<T> {
     const session = method === 'GET' && this.transcriptProtocol && path.match(/^\/api\/v1\/sessions\/([^/]+)\/(status|snapshot)$/)
     if (session) {
       try {

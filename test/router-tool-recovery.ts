@@ -28,7 +28,6 @@ test('a successful query clears recovered tool errors while retaining native tur
   const f = await routerFixture(objects)
   try {
     const requestId = await f.submit({ prompt: '继续原任务' })
-    await f.call('router_query', { requestId, mode: 'bootstrap' })
     await repeatedFailure(f, requestId)
     const recovered = await f.call('router_query', { requestId, mode: 'catalog', kind: 'space' })
     assert.equal(recovered.ok, true)
@@ -36,8 +35,9 @@ test('a successful query clears recovered tool errors while retaining native tur
     assert.equal(f.db.request(requestId)!.failure, undefined)
     await f.controller.event({ sessionId: f.db.sessionId(), seq: 1, ts: Date.now(), type: 'error', state: 'failed',
       payload: { code: 'ECONNRESET', message: 'native connection reset', routedInputId: requestId } })
-    await f.call('router_query', { requestId, mode: 'bootstrap' })
-    assert.equal(f.db.request(requestId)!.error, 'native connection reset', 'a read cannot resolve an unrelated native failure')
+    const readAfterNativeFailure = await f.call('router_query', { requestId, mode: 'catalog', kind: 'space' })
+    assert.equal(readAfterNativeFailure.ok, true)
+    assert.equal(f.db.request(requestId)!.error, 'native connection reset', 'a successful read cannot resolve an unrelated native failure')
     await f.end()
   } finally { await f.close() }
 })
@@ -47,11 +47,10 @@ for (const action of ['reuse_task', 'create_task_in_requirement', 'create_task_i
     const f = await routerFixture(objects)
     try {
       const requestId = await f.submit({ prompt: '继续原任务' })
-      await f.call('router_query', { requestId, mode: 'bootstrap' })
       await repeatedFailure(f, requestId)
       const args = { requestId, version: f.db.request(requestId)!.version, action, reason: '本轮信息足以确定结果',
         ...(action === 'reuse_task' ? { taskId: 'task' } : action === 'create_task_in_requirement' ? { requirementId: 'requirement' } :
-          action === 'clarify' ? { clarification: '要继续哪个目标？', clarificationOptions: [] } : { projectId: 'space' }),
+          action === 'clarify' ? { clarification: '要继续哪个目标？', clarificationOptions: [{ label: '继续原任务' }, { label: '新建独立任务' }] } : { projectId: 'space' }),
         ...(action === 'create_requirement_and_task' ? { requirementName: '新需求' } : {}) }
       const result = await f.call('router_assign_task', args)
       assert.equal(result.ok, true)
@@ -76,7 +75,6 @@ test('a known task can be read directly without prerequisite recovery queries', 
   const f = await routerFixture(objects)
   try {
     const requestId = await f.submit({ prompt: '继续原任务' })
-    await f.call('router_query', { requestId, mode: 'bootstrap' })
     const detail = await f.call('router_query', { requestId, mode: 'task_detail', taskId: 'task', sourceRef: 'input' })
     assert.equal(detail.ok, true)
     assert.equal(detail.value.sources[0].text, '继续原任务的路由方案。')
@@ -89,7 +87,6 @@ test('a requirement catalog accepts a known project without first reading its sp
   const f = await routerFixture(objects)
   try {
     const requestId = await f.submit({ prompt: '查询需求' })
-    await f.call('router_query', { requestId, mode: 'bootstrap' })
     const args = { requestId, mode: 'catalog', kind: 'requirement', projectId: 'space' }
     const catalog = await f.call('router_query', args)
     assert.equal(catalog.ok, true)

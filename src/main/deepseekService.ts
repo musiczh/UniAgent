@@ -29,6 +29,8 @@ let accountService: DeepSeekAccountService | undefined
 let managedHost: DeepSeekHostService | undefined
 let managedHostIdentity = ''
 let managedHostFlight: Promise<DeepSeekHostClient> | undefined
+let modelSourcesEnabled = false
+export function enableDeepSeekModelSources(): void { modelSourcesEnabled = true }
 let installPhase: DeepSeekInstallPhase = 'idle'
 let installAbort: AbortController | undefined
 const cancellableInstall = () => !!installAbort && ['preparing', 'downloading', 'verifying'].includes(installPhase)
@@ -53,10 +55,10 @@ async function startManagedHost(activating = false): Promise<DeepSeekHostClient>
   if (!existsSync(bin)) throw new Error('请先安装 DeepSeek Harness')
   if (installFlight && !activating) throw new Error('DeepSeek 正在安装或更新，请稍后重试')
   const current = connection()
-  const identity = bin + ':' + connectionFingerprint(current)
+  const identity = bin + ':' + connectionFingerprint(current) + ':' + modelSourcesEnabled
   if (managedHost && identity !== managedHostIdentity) { await managedHost.stop(); managedHost = undefined }
   if (!managedHost) {
-    const patchFile = await prepareDeepSeekHostContext(home)
+    const patchFile = await prepareDeepSeekHostContext(home, { modelSources: modelSourcesEnabled, multiProvider: existsSync(join(paths().runtime, 'node_modules/@deepseek-ai/dsh-llm-pi-ai/package.json')) })
     managedHost = new DeepSeekHostService({ bin, home, cwd: root, patchFile, nodeBin: privateNodeBin(root), modelEnvironment: { DEEPSEEK_API_KEY: current.apiKey, DEEPSEEK_BASE_URL: current.baseUrl } })
     managedHostIdentity = identity
   }

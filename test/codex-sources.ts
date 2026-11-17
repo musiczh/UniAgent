@@ -88,11 +88,11 @@ assert.deepEqual(quotaRequestFor('deepseek', 'https://api.deepseek.com', 'deepse
 assert.deepEqual(quotaRequestFor('glm', 'https://open.bigmodel.cn/api/v1', 'glm-key'), { url: 'https://open.bigmodel.cn/api/monitor/usage/quota/limit', authorization: 'glm-key' })
 assert.deepEqual(quotaRequestFor('kimi-code', 'https://api.kimi.com/coding/v1', 'kimi-key'), { url: 'https://api.kimi.com/coding/v1/usages', authorization: 'Bearer kimi-key' })
 assert.equal(quotaRequestFor('kimi-api', 'https://proxy.example/v1', 'kimi-key'), null)
-assert.equal(quotaUnavailableReason('mimo', 'https://api.xiaomimimo.com/v1'), '小米 MiMo 暂不支持额度查询')
-assert.equal(quotaUnavailableReason('mimo-token-plan', 'https://token-plan-cn.xiaomimimo.com/v1'), '小米 MiMo 暂不支持额度查询')
-assert.equal(quotaRequestFor('mimo', 'https://api.xiaomimimo.com/v1', 'mimo-key'), null)
+assert.equal(quotaUnavailableReason('mimo', 'https://api.xiaomimimo.com/v1'), undefined)
+assert.equal(quotaUnavailableReason('mimo-token-plan', 'https://token-plan-cn.xiaomimimo.com/v1'), undefined)
+assert.deepEqual(quotaRequestFor('mimo', 'https://api.xiaomimimo.com/v1', 'mimo-key'), { url: 'https://api.xiaomimimo.com/v1/platform/balance', authorization: 'Bearer mimo-key' })
 assert.equal(quotaUnavailableReason('mimo', 'https://custom.example/v1'), '自定义地址不查询额度', '自定义地址的提示优先于厂商额度能力')
-assert.throws(() => normalizeQuotaResponse('mimo', {}), /不支持额度查询/)
+assert.throws(() => normalizeQuotaResponse('mimo', {}), /余额响应无效/)
 
 assert.deepEqual(normalizeQuotaResponse('kimi-code', {
   usages: {

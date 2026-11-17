@@ -84,7 +84,7 @@ test('switching Agent creates fresh Sessions and persists ordered conversation s
     assert.equal(changed.conversationSessions?.length, 2)
     assert.deepEqual(changed.conversationSessions?.map(row => [row.sessionId, row.agentId]), [[f.initial.id, 'deepseek'], [second.id, 'other-deepseek']])
     assert.ok(changed.conversationSessions?.[1].switchedAt)
-    assert.equal((await f.callWith(before, 'router_query', { requestId: input.requestId, mode: 'bootstrap' })).status, 403)
+    assert.equal((await f.callWith(before, 'router_query', { requestId: input.requestId, mode: 'catalog', kind: 'space' })).status, 403)
     assert.equal(f.db.request(input.requestId)!.targetId, 'target')
     const back = await f.controller.saveConfig({ ...f.config, agentId: 'deepseek' }, f.config.version)
     assert.notEqual(back.sessionId, f.initial.id, 'switching back must not resume the earlier native Session')
@@ -130,7 +130,7 @@ test('saving during a routing turn returns immediately and applies the latest sa
     assert.deepEqual(f.db.request(current.requestId), receipt, 'saving must not alter the active request or its config')
     assert.deepEqual(f.initial.config, native)
     assert.equal((await f.controller.open())!.id, f.initial.id, 'opening the Router during a turn must not apply the pending switch')
-    assert.equal((await f.callWith(credentials, 'router_query', { requestId: current.requestId, mode: 'bootstrap' })).ok, true)
+    assert.equal((await f.callWith(credentials, 'router_query', { requestId: current.requestId, mode: 'catalog', kind: 'space' })).ok, true)
     await assert.rejects(f.controller.saveConfig(saved.config, saved.config.version - 1), /已变化/)
     await f.controller.saveConfig({ ...f.config, effort: 'high' }, f.config.version)
     assert.equal(f.sent.length, 1)
@@ -144,7 +144,7 @@ test('saving during a routing turn returns immediately and applies the latest sa
     assert.deepEqual(f.db.request(queued.requestId)!.config, f.config)
     assert.deepEqual(f.db.request(current.requestId)!.config, receipt.config)
     assert.equal(f.db.conversationSessions().length, 2, 'multiple saves before the turn ends create only the actual Agent boundary')
-    assert.equal((await f.callWith(credentials, 'router_query', { requestId: current.requestId, mode: 'bootstrap' })).status, 403)
+    assert.equal((await f.callWith(credentials, 'router_query', { requestId: current.requestId, mode: 'catalog', kind: 'space' })).status, 403)
   } finally { await f.controller.close() }
 })
 

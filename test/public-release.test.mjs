@@ -52,7 +52,7 @@ try {
   const file=join(baselineRoot,'agentCompatibility.json'),original={deepseek:['0.2.2-rc.1'],grok:['1.0.62','1.0.77']}
   await writeFile(file,JSON.stringify(original))
   const current=structuredClone(report)
-  for(const agent of current.agents)agent.afterVersion=agent.latestVersion=agent.id==='deepseek'?'0.3.0':agent.id==='grok'?'1.0.78':'2.0.0'
+  for(const agent of current.agents)agent.afterVersion=agent.latestVersion=agent.id==='deepseek'?'0.2.2-rc.4':agent.id==='grok'?'1.0.88':'2.0.0'
   assert.throws(()=>validateCompatibilityBaseline(current,original),/baseline.*deepseek/)
   for(const change of [r=>r.sourceFingerprint='other',r=>r.checkedAt=new Date(now-86400001).toISOString(),r=>r.agents.pop(),r=>r.agents[0].checks[0].exitCode=1,r=>r.agents[4].afterVersion='old',r=>r.agents[1].protocolSource='']) {
     const invalid=structuredClone(current);change(invalid)
@@ -64,7 +64,7 @@ try {
   assert.deepEqual(JSON.parse(await readFile(file,'utf8')),original,'all updates are validated before any write')
   assert.deepEqual(await promoteCompatibility(current,'fixture',file,{now}),['deepseek','grok'])
   const updated=JSON.parse(await readFile(file,'utf8'))
-  assert.deepEqual(updated,{deepseek:['0.2.2-rc.1','0.3.0'],grok:['1.0.62','1.0.77','1.0.78']})
+  assert.deepEqual(updated,{deepseek:['0.2.2-rc.1','0.2.2-rc.4'],grok:['1.0.62','1.0.77','1.0.88']})
   validateCompatibilityBaseline(current,updated)
   const saved=await readFile(file,'utf8')
   assert.deepEqual(await promoteCompatibility(current,'fixture',file,{now}),[])

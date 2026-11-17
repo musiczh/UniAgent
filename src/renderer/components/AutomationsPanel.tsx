@@ -157,6 +157,7 @@ export function AutomationsPanel({ onOpenSession, embedded = false, requirements
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [detailDirty, setDetailDirty] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [retryingTask, setRetryingTask] = useState<AutomationDetail | null>(null)
   const mutation = useRef(new AutomationMutationController())
   const detailRequest = useRef(new AutomationDetailRequestController())
   const listRequest = useRef(new AutomationDetailRequestController())
@@ -321,6 +322,27 @@ export function AutomationsPanel({ onOpenSession, embedded = false, requirements
     })) ?? false
   }
 
+  async function retry(): Promise<void> {
+    const task = detail ?? selected
+    if (detailDirty || task?.source !== 'uniagent' || task.lastRunStatus !== 'error') return
+    await mutation.current.run(async () => {
+      setBusy(true)
+      setRetryingTask(task)
+      setError(null)
+      try {
+        const updated = await window.uniagent.retryAutomation(task)
+        setSelected(updated)
+        setDetail(updated)
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : '重试失败')
+      } finally {
+        setRetryingTask(null)
+        setBusy(false)
+        reload()
+      }
+    })
+  }
+
   async function createTask(input: NativeAutomationInput): Promise<boolean> {
     return (await mutation.current.run(async () => {
       setBusy(true)
@@ -398,6 +420,8 @@ export function AutomationsPanel({ onOpenSession, embedded = false, requirements
               task={t}
               detail={detail}
               busy={busy}
+              retryingTask={retryingTask}
+              onRetry={retry}
               editable={creating || canEdit(t)}
               deletable={!creating && canDelete(t)}
               toggleable={!creating && canToggle(t)}
@@ -544,13 +568,15 @@ export function automationCanDelete(task: AutomationTask): boolean {
 }
 
 function AutomationEditor({
-  task, detail, busy, editable, deletable, toggleable, onSave, onDelete, onToggle,
+  task, detail, busy, retryingTask, onRetry, editable, deletable, toggleable, onSave, onDelete, onToggle,
   onDirtyChange, agents, projects, onProjectsChange, requirements, requirementsLoading, requirementsError, onRequirementsRetry, requirementsEnabled,
   creating, onCreate, onCancel, onOpenSession
 }: {
   task: AutomationTask
   detail: AutomationDetail | null
   busy: boolean
+  retryingTask: AutomationDetail | null
+  onRetry: () => Promise<void>
   editable: boolean
   deletable: boolean
   toggleable: boolean
@@ -573,6 +599,7 @@ function AutomationEditor({
 }): JSX.Element {
   const prefs = useAgentPreferences()
   const native = task.source === 'uniagent'
+  const lastRun = retryingTask ?? detail ?? task
   const first: EditorValues = {
     dayMode: detail?.dayMode ?? task.dayMode ?? 'all',
     name: task.name, prompt: task.prompt ?? '', schedule: task.schedule ?? '', model: task.model ?? '',
@@ -731,8 +758,13 @@ function AutomationEditor({
         </section>
       </div><aside className="auto-editor-aside">
         <AutomationPlanPreview schedule={schedule} runs={nextRuns} dayMode={values.dayMode} error={scheduleError} task={task} changedPlan={changedPlan} />
-        {!creating && <section className="auto-card auto-last-run"><h3>上次执行情况</h3>
-          <AutomationRunSummary task={detail ?? task} showError disabled={busy || dirty} onOpenSession={onOpenSession} />
+        {!creating && <section className="auto-card auto-last-run"><h3 className="auto-last-run-head">上次执行情况
+          {native && lastRun.lastRunStatus === 'error' && <button className="settings-btn ghost auto-retry" disabled={busy || dirty}
+            title={dirty ? '请先保存或放弃修改，再重试' : '使用已保存的配置重试一次，不改变下次执行时间'} onClick={() => void onRetry()}>
+            {!retryingTask && <UiIcon name="refresh" size={13} />}{retryingTask ? '重试中…' : '重试'}
+          </button>}
+        </h3>
+          <AutomationRunSummary task={lastRun} showError disabled={busy || dirty} onOpenSession={onOpenSession} />
         </section>}
       </aside></div>
     </div>
@@ -746,7 +778,7 @@ function AutomationEditor({
           if (creating) onCancel()
           else { setValues(saved); setSchedule(scheduleForTask(saved.schedule)) }
         }}>{creating ? '取消' : '放弃修改'}</button>
-        {editable && <button className="settings-btn primary auto-save" disabled={busy || !valid || (!creating && !dirty)} onClick={submit}>{busy ? '保存中…' : creating ? '创建并启用' : '保存修改'}</button>}
+        {editable && <button className="settings-btn primary auto-save" disabled={busy || !valid || (!creating && !dirty)} onClick={submit}>{busy && !retryingTask ? '保存中…' : creating ? '创建并启用' : '保存修改'}</button>}
       </div>
     </div>
   </div>

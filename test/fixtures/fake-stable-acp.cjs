@@ -33,12 +33,15 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
  if (scenario.rejectMode && method === 'session/set_mode') return error(id,'mode removed')
  if (method === 'session/set_mode' && !scenario.noModes && ['default','plan'].includes(params.modeId)) { mode = params.modeId; return reply(id, {}) }
  if (method === 'session/prompt') {
-   if (params.prompt.some(x => x.text === 'report-mode')) {
+   // Text ACP carries host context in leading XML blocks. Match the user's
+   // exact request after those blocks, as the other native ACP fixtures do.
+   const input = params.prompt.filter(x => x.type === 'text').map(x => x.text.replace(/^(?:<uniagent_(?:initial|channel)_context>[\s\S]*?<\/uniagent_(?:initial|channel)_context>\n\n)+/, ''))
+   if (input.includes('report-mode')) {
      update(params.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'MODE_' + mode } })
      return reply(id, { stopReason: 'end_turn' })
    }
-   if (params.prompt.some(x => x.text === 'approval')) { pendingPrompt = id; return send({ id: 'approval', method: 'session/request_permission', params: { sessionId: 'stable-id', toolCall: { toolCallId: 'tool', title: 'Run', kind: 'execute', rawInput: { command: 'pwd' } }, options: [{ optionId: 'yes', kind: 'allow_once', name: 'Allow' }] } }) }
-   if (params.prompt.some(x => x.text === 'cancel')) { pendingPrompt = id; return }
+   if (input.includes('approval')) { pendingPrompt = id; return send({ id: 'approval', method: 'session/request_permission', params: { sessionId: 'stable-id', toolCall: { toolCallId: 'tool', title: 'Run', kind: 'execute', rawInput: { command: 'pwd' } }, options: [{ optionId: 'yes', kind: 'allow_once', name: 'Allow' }] } }) }
+   if (input.includes('cancel')) { pendingPrompt = id; return }
    update(params.sessionId, { sessionUpdate: 'future_update', newField: true })
    update(params.sessionId, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'THINK_OK' } })
    update(params.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'STABLE_OK' } })

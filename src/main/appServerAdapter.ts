@@ -1,9 +1,8 @@
-import { assistantIdentity } from '../shared/assistant'
 import { appServerForkCapacity, type ForkJob } from '../shared/sessionFork'
 import { forkContextWork } from './forkContextClient'
 import { homedir } from 'node:os'
-import { assistantPrompt } from './assistant/context'
-import { requirementInstructions } from './requirementRuntime'
+import { prepareAssistantMessage, prepareAssistantInitializationForSession, serializeAssistantInput } from './assistant/context'
+import { sessionInstructions } from './sessionInstructions'
 import { worktreeInstructions } from './worktreeService'
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
@@ -17,9 +16,7 @@ import {
 import { readThreadTurnItems } from './appServerHistory'
 import { repairTransplantedSessionHistory } from './history'
 import { sessionStoreWriteCommitted } from './sessionStore'
-import { handoffMcpArgs, uniAgentSessionInstructions } from './handoff'
-import { teamRuntime } from './teamRuntime'
-import { ROUTER_SYSTEM_PROMPT } from '../shared/router'
+import { handoffMcpArgs } from './handoff'
 import { computeCost } from './pricing'
 import { normalizeCodexRateLimits } from './codexRateLimits'
 import {
@@ -189,15 +186,7 @@ const THREAD_TITLE_PROMPT_MAX_BYTES = 960
 const THREAD_TITLE_MODEL = 'gpt-5.6-luna'
 
 function developerInstructions(config: SessionConfig, sessionId?: string, syncRequirement = true): string {
-  if (config.managedPurpose === 'router') return ROUTER_SYSTEM_PROMPT
-  return [
-    uniAgentSessionInstructions(),
-    assistantIdentity(config.assistantSnapshot),
-    worktreeInstructions(config),
-    syncRequirement ? requirementInstructions(config) : '',
-    config.roleSnapshot?.instructions?.trim(),
-    syncRequirement ? teamRuntime(sessionId)?.instructions : ''
-  ].filter(Boolean).join('\n\n')
+  return sessionInstructions(config, sessionId, syncRequirement)
 }
 
 function roleSnapshotChanged(current: SessionConfig, next: SessionConfig): boolean {
@@ -317,6 +306,7 @@ export class AppServerRunner extends EventEmitter {
   /** Suppress repeated routing/compaction notices emitted for the same turn. */
   private turnNoticeKeys = new Set<string>()
   private runtimeArgsSnapshot?: string[]
+  private runtimeInstructionsSnapshot?: string
   private nativeModelProvider?: string
   private negotiatedModelProvider?: string
   private portableCompactionProvider?: string
@@ -544,6 +534,7 @@ export class AppServerRunner extends EventEmitter {
     this.compactionActivity.turnStarted(turnToken)
     await this.compactionQueue.idle()
     try {
+      if (!this.forkFromThreadId && !this.forkPreparation && !this.resumeEphemeral) await prepareAssistantInitializationForSession(this.sessionId, this.config, this.threadId)
       await this.ensureReady()
       if (this.goalState?.status === 'active') this.activeGoalTurnToken = turnToken
       this.emitDiagnostic('app_server_ready', {
@@ -579,17 +570,19 @@ export class AppServerRunner extends EventEmitter {
         nativeSessionId: this.threadId,
         connectionGeneration: this.connectionGeneration
       })
-      const effectivePrompt = afterContextRecovery ? '' : await assistantPrompt(this.sessionId, this.config, prompt, '', false)
+      const delivery = afterContextRecovery ? undefined : await prepareAssistantMessage(this.sessionId, this.config, prompt, '', true, !this.forkFromThreadId && !this.forkPreparation && !this.resumeEphemeral)
+      const effectivePrompt = delivery?.text || ''
       if (this.startingTurnToken !== turnToken) return
       const turnConfig = this.config
       this.turnPricing = { modelId: turnConfig.model, fastMode: !!turnConfig.fastMode }
       const res = await this.rpc(
         'turn/start',
-        { ...buildTurnStartParams(this.agent, this.wireConfig(turnConfig), this.threadId, effectivePrompt, attachments, nativeContext),
+        { ...buildTurnStartParams(this.agent, this.wireConfig(turnConfig), this.threadId, effectivePrompt, attachments, nativeContext, delivery?.context),
           ...(this.exportOutputSchema ? { outputSchema: this.exportOutputSchema } : {}) }
       )
       const nativeTurnId = res?.turn?.id
       if (typeof nativeTurnId !== 'string' || !nativeTurnId) throw new Error('turn/start 未返回 turn id')
+      delivery?.accepted()
       if (this.startingTurnToken !== turnToken) return
       this.startingTurnToken = undefined
       this.activeTurnToken = turnToken
@@ -638,6 +631,16 @@ export class AppServerRunner extends EventEmitter {
     attachments?: Attachment[],
     nativeContext?: ResolvedNativeTurnContext
   ): Promise<void> {
+    return serializeAssistantInput(this.messageDeliveryKey(), () => this.steerInput(prompt, attachments, nativeContext))
+  }
+  private messageDeliveryKey(): string {
+    return !this.forkFromThreadId && !this.forkPreparation && !this.resumeEphemeral ? this.sessionId : `${this.sessionId}:branch:${this.threadId || this.forkFromThreadId}`
+  }
+  private async steerInput(
+    prompt: string,
+    attachments?: Attachment[],
+    nativeContext?: ResolvedNativeTurnContext
+  ): Promise<void> {
     if (this.startingTurnToken) {
       this.emitEvent({
         type: 'system_notice',
@@ -651,9 +654,11 @@ export class AppServerRunner extends EventEmitter {
     }
     try {
       const threadId = this.threadId, turnId = this.curTurnId
-      const effectivePrompt = await assistantPrompt(this.sessionId, this.config, prompt, '', false)
-      if (threadId !== this.threadId || turnId !== this.curTurnId) { this.emit('steerFailed', { prompt, attachments, nativeContext }); return }
-      await this.rpc('turn/steer', { threadId, expectedTurnId: turnId, input: buildInput(effectivePrompt, attachments, nativeContext) })
+      const delivery = await prepareAssistantMessage(this.sessionId, this.config, prompt, '', true, !this.forkFromThreadId && !this.forkPreparation && !this.resumeEphemeral)
+      const effectivePrompt = delivery.text
+      if (threadId !== this.threadId || turnId !== this.curTurnId) { delivery.failed(true); this.emit('steerFailed', { prompt, attachments, nativeContext }); return }
+      await this.rpc('turn/steer', { threadId, expectedTurnId: turnId, input: buildInput(effectivePrompt, attachments, nativeContext, delivery.context) })
+      delivery.accepted()
     } catch (err: any) {
       this.emitEvent({
         type: 'system_notice',
@@ -675,6 +680,14 @@ export class AppServerRunner extends EventEmitter {
     nativeContext?: ResolvedNativeTurnContext,
     expectedTurnId?: string
   ): Promise<void> {
+    return serializeAssistantInput(this.messageDeliveryKey(), () => this.steerStrictInput(prompt, attachments, nativeContext, expectedTurnId))
+  }
+  private async steerStrictInput(
+    prompt: string,
+    attachments?: Attachment[],
+    nativeContext?: ResolvedNativeTurnContext,
+    expectedTurnId?: string
+  ): Promise<void> {
     if (this.startingTurnToken || !this.threadId || !this.curTurnId) {
       throw Object.assign(new Error('force_send_requires_active_turn'), { deliveryState: 'failed' })
     }
@@ -682,9 +695,11 @@ export class AppServerRunner extends EventEmitter {
     if (expectedTurnId && expectedTurnId !== this.curTurnId) throw Object.assign(new Error('team_stale_turn'), { deliveryState: 'failed' })
     try {
       const threadId = this.threadId, turnId = this.curTurnId
-      const effectivePrompt = await assistantPrompt(this.sessionId, this.config, prompt, '', false)
+      const delivery = await prepareAssistantMessage(this.sessionId, this.config, prompt, '', true, !this.forkFromThreadId && !this.forkPreparation && !this.resumeEphemeral)
+      const effectivePrompt = delivery.text
       if (threadId !== this.threadId || turnId !== this.curTurnId) throw Object.assign(new Error('force_send_requires_active_turn'), { deliveryState: 'failed' })
-      await this.rpc('turn/steer', { threadId, expectedTurnId: turnId, input: buildInput(effectivePrompt, attachments, nativeContext) })
+      await this.rpc('turn/steer', { threadId, expectedTurnId: turnId, input: buildInput(effectivePrompt, attachments, nativeContext, delivery.context) })
+      delivery.accepted()
     } catch (err: any) {
       this.emitEvent({
         type: 'system_notice',
@@ -1566,7 +1581,7 @@ export class AppServerRunner extends EventEmitter {
   private ensureReady(): Promise<void> {
     if (this.disposed || this.disposeRequested) return Promise.reject(new Error('app-server 已关闭'))
     const args = codexAppServerArgs(this.agent, this.config)
-    if (this.transport && this.runtimeArgsSnapshot && JSON.stringify(this.runtimeArgsSnapshot) !== JSON.stringify(args)) {
+    if (this.transport && this.runtimeArgsSnapshot && (JSON.stringify(this.runtimeArgsSnapshot) !== JSON.stringify(args) || this.runtimeInstructionsSnapshot !== this.sessionDeveloperInstructions())) {
       this.invalidateReadyConnection(true)
     }
     if (this.transport && this.threadId && !this.readyPromise) return Promise.resolve()
@@ -1957,6 +1972,7 @@ export class AppServerRunner extends EventEmitter {
   }
 
   private createTransport(generation: number, appendedPrompt: string): AppServerRpc {
+    this.runtimeInstructionsSnapshot = appendedPrompt
     const permissionMode = this.requirePermissionMode()
     const cmd = this.agent.bin
     this.runtimeArgsSnapshot = codexAppServerArgs(this.agent, this.config)

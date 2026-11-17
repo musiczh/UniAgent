@@ -7,7 +7,8 @@ import { Orchestrator } from '../src/main/orchestrator'
 import { ProjectStore } from '../src/main/projectStore'
 import { RequirementStore } from '../src/main/requirementStore'
 import { SessionStore } from '../src/main/sessionStore'
-import { configureRequirementRuntime, prepareRequirementTurn, setRequirementsEnabled } from '../src/main/requirementRuntime'
+import { configureRequirementRuntime, prepareRequirementTurn, requirementContextForCaller, setRequirementsEnabled } from '../src/main/requirementRuntime'
+import { assistantInitialization, configureAssistantContextRuntime, prepareAssistantInitialization } from '../src/main/assistant/context'
 import type { AgentDef, Session, SessionConfig } from '../src/shared/types'
 
 const root = await mkdtemp(join(tmpdir(), 'uniagent-workspace-config-'))
@@ -38,10 +39,27 @@ try {
       const workspace = (host as any).resolveSessionWorkspace(forked, session.config)
       assert.equal((host as any).resolveSessionWorkspace(forked, workspace), workspace, 'repeated workspace checks do not trigger redundant config writes for forks')
     }
-    configureRequirementRuntime(id => id === session.id ? session : undefined, async () => ({ revision: 'fixture', overview: { goal: 'Context remains available' }, readingStatus: 'ready', navigation: [] }))
+    let contextReads = 0
+    configureRequirementRuntime(id => id === session.id ? session : undefined, async (id, request) => {
+      assert.equal(id, session.id)
+      assert.equal(request.action, 'bootstrap')
+      contextReads++
+      return { requirement: { name: 'Workspace requirement' }, revision: 'fixture', overview: { goal: 'Context remains available' }, readingStatus: 'ready', navigation: [] }
+    })
+    configureAssistantContextRuntime(id => id === session.id ? session : undefined, () => {})
+    await prepareAssistantInitialization(session)
+    assert.deepEqual(JSON.parse(assistantInitialization(session.id)), {
+      requirement: { id: requirement.id, name: 'Workspace requirement', overview: { goal: 'Context remains available' }, readingStatus: 'ready' }
+    }, agent.id + ' retains the requirement identity and short goal in initialization')
     const prepared = prepareRequirementTurn(session, 'continue')
-    assert.match(await prepared.ready, /Context remains available/)
+    assert.equal(await prepared.ready, 'continue', agent.id + ' preserves the followup input')
+    assert.equal(contextReads, 1, 'ordinary input does not refresh requirement facts')
+    assert.equal(prepared.current(), true)
     prepared.complete()
+    assert.equal(prepared.current(), false)
+    const onDemand = await requirementContextForCaller(session.id, { action: 'bootstrap' }) as { overview: { goal: string } }
+    assert.equal(onDemand.overview.goal, 'Context remains available', agent.id + ' can still read requirement context through its bound tool')
+    assert.equal(contextReads, 2)
   }
   assert.equal(await readFile(join(root, 'projects.json'), 'utf8'), originalProjects, 'Agent capabilities never change the space configuration')
 
@@ -64,6 +82,7 @@ try {
 } finally {
   for (const host of hosts) { host.disposeAll(); await host.closeSessionLogs() }
   configureRequirementRuntime(() => undefined)
+  configureAssistantContextRuntime(() => undefined, () => {})
   setRequirementsEnabled(false)
   if (previousUserData === undefined) delete process.env.UNIAGENT_USER_DATA
   else process.env.UNIAGENT_USER_DATA = previousUserData

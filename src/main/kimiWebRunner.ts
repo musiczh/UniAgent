@@ -2,9 +2,8 @@ import { EventEmitter } from 'node:events'
 import { randomUUID } from 'node:crypto'
 import type { AgentDef, Attachment, SessionAgentContract, SessionConfig, TurnUsage, UAEvent } from '../shared/types.ts'
 import type { GoalState, NativeGoalUpdate } from '../shared/nativeCapabilities.ts'
-import { assistantPrompt } from './assistant/context'
-import { requirementInstructions } from './requirementRuntime'
-import { worktreeInstructions } from './worktreeService'
+import { prepareAssistantMessage, prepareAssistantInitializationForSession, reconcileAssistantText, type AssistantMessage } from './assistant/context'
+import { sessionInstructions } from './sessionInstructions'
 import { projectACPTool } from './acp/acpEventProjection.ts'
 import { assertKimiWebConfig } from './kimiRoleConfig.ts'
 import { kimiWebContract } from './kimiWebContract.ts'
@@ -58,6 +57,7 @@ export class KimiWebRunner extends EventEmitter {
     const ready = (async () => {
       await this.closing
       assertKimiWebConfig(this.config)
+      if (!this.nativeSessionId) await prepareAssistantInitializationForSession(this.sessionId, this.config)
       const runtime = await KimiWebRuntime.start({ bin: this.agent.bin, sessionId: this.sessionId, config: this.config, nativeSessionId: this.nativeSessionId,
         env: typeof this.extraEnv === 'function' ? this.extraEnv() : this.extraEnv, acquireWritableRuntime: async () => () => {} })
       if (this.disposed) { await runtime.closeAndWait(); throw new KimiWebError('runner_closed') }
@@ -91,6 +91,7 @@ export class KimiWebRunner extends EventEmitter {
     if (this.disposed || this.running) throw new KimiWebError('runner_busy')
     this.running = true; this.cancelling = false; this.turnId = undefined; this.step = 0; this.segments = []; this.tools.clear(); this.stepUsage.clear()
     const done = new Promise<void>(resolve => { this.completeTurn = resolve })
+    let delivery: AssistantMessage | undefined, submitted = false
     try {
       await this.ensureReady()
       if (this.disposed) return
@@ -100,24 +101,31 @@ export class KimiWebRunner extends EventEmitter {
         } else this.finish('cancelled')
         return
       }
-      if (prompt.trimStart().startsWith('/')) {
+      delivery = await prepareAssistantMessage(this.sessionId, this.config, prompt, sessionInstructions(this.config, this.sessionId), false)
+      if (delivery.userText.trimStart().startsWith('/')) {
         if (attachments?.length) throw new KimiWebError('slash_attachments_unsupported')
-        if (/^\/compact(?:\s|$)/.test(prompt)) {
-          await this.runtime!.compact(prompt.replace(/^\/compact\s*/, '')); this.finish('success'); return
+        if (/^\/compact(?:\s|$)/.test(delivery.userText)) {
+          submitted = true
+          await this.runtime!.compact(delivery.userText.replace(/^\/compact\s*/, '')); delivery.accepted(); this.finish('success'); return
         }
-        const result = await this.runtime!.submitSlash(prompt, this.contract?.commands)
+        submitted = true
+        const result = await this.runtime!.submitSlash(delivery.userText, this.contract?.commands)
+        delivery.accepted()
         if (result.kind === 'notice') { this.event({ type: 'system_notice', payload: { message: result.text } }); this.finish('success'); return }
       } else {
-        const text = await assistantPrompt(this.sessionId, this.config, prompt, [worktreeInstructions(this.config), requirementInstructions(this.config)].filter(Boolean).join('\n\n'))
+        const text = delivery.text
         const content = await buildKimiWebContent(text, attachments)
         if (this.disposed) return
         if (this.cancelling) { this.finish('cancelled'); return }
         if (content.some(part => part.type === 'image') && !this.contract?.imageAttachments) throw new KimiWebError('image_input_unsupported')
+        submitted = true
         await this.runtime!.submitContent(content, randomUUID())
+        delivery.accepted()
       }
       this.scheduleRecovery()
       await done
     } catch (error) {
+      delivery?.failed(!submitted)
       this.event({ type: 'error', state: 'failed', payload: { message: error instanceof KimiWebError && error.recovered ? 'Kimi 本地服务已恢复；本次请求结果待确认，未自动重发。' : error instanceof Error ? error.message : 'Kimi Web 请求失败；未自动重发。' } })
       this.finish('failed')
     }
@@ -331,6 +339,7 @@ export class KimiWebRunner extends EventEmitter {
       }
       const aliases = [...this.segments]
       for (const event of kimiWebTranscriptEvents([turn])) {
+        if (event.type === 'user_message') reconcileAssistantText(this.sessionId, String(event.payload.text || ''), this.nativeSessionId)
         if (['user_message', 'turn_started', 'turn_completed'].includes(event.type)) continue
         if (event.type === 'agent_message' || event.type === 'reasoning') {
           const index = aliases.findIndex(segment => segment.kind === event.type)

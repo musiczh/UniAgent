@@ -151,7 +151,7 @@ port.on('message', async ({ id, method, args }) => {
       const write = inputWrites.then(async () => {
         let content = args.content
         if (args.attachments?.length) {
-          const blocks: any[] = [{ type: 'text', text: content }]
+          const blocks: any[] = Array.isArray(content) ? [...content] : [{ type: 'text', text: content }]
           for (const attachment of args.attachments) {
             if (attachment.kind === 'image') {
               const mime = /\.jpe?g$/i.test(attachment.path) ? 'image/jpeg' : /\.webp$/i.test(attachment.path) ? 'image/webp' : /\.gif$/i.test(attachment.path) ? 'image/gif' : 'image/png'
@@ -203,8 +203,13 @@ void (async () => {
         if (pending) { commands.delete(uuid); pending.resolve(message); continue }
       }
       if (message.type === 'user' && message.uuid && commands.has(message.uuid)) continue
-      if (message.type === 'user' && 'isReplay' in message && message.isReplay && message.uuid) {
-        replays.get(message.uuid)?.resolve(); replays.delete(message.uuid)
+      const reply = message as { parent_tool_use_id?: string | null; user_message_uuid?: string; user_message_uuids?: string[] }
+      const received = message.type === 'user' ? [message.uuid]
+        : ['assistant', 'stream_event', 'thinking_tokens', 'result'].includes(message.type)
+          ? [reply.user_message_uuid, ...(Array.isArray(reply.user_message_uuids) ? reply.user_message_uuids : [])] : []
+      if (reply.parent_tool_use_id == null) for (const uuid of received) {
+        if (typeof uuid !== 'string') continue
+        replays.get(uuid)?.resolve(); replays.delete(uuid)
       }
       post('message', message)
     }

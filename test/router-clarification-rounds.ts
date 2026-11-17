@@ -15,8 +15,8 @@ const sent: string[] = []
 const quickOptions=[{label:'把「开发者选项」移到 superAgent 配置页'},{label:'把黄框里的「按项目和需求组织侧栏」移到 superAgent 配置页',description:'仅移动黄框里的设置'}]
 const f = await routerFixture(objects, { send: async (_id, prompt) => { sent.push(prompt) } })
 async function wait(check: () => boolean) { for (let i=0;i<150;i++) { if(check())return; await new Promise(resolve=>setTimeout(resolve,10)) } throw Error('clarification round timeout') }
+async function promptFor(id: string) { for (let i=0;i<150;i++) { const text=sent.at(-1); if(text?.includes('"requestId":"'+id+'"'))return JSON.parse(text.slice(text.indexOf('{'))); await new Promise(resolve=>setTimeout(resolve,10)) } throw Error('router prompt timeout') }
 async function clarify(id: string) {
-  await f.call('router_query',{requestId:id,mode:'bootstrap'})
   return f.call('router_assign_task',{requestId:id,version:f.db.request(id)!.version,action:'clarify',reason:'截图中的两处标注有歧义',clarification:'这次希望移动哪个设置？',clarificationOptions:quickOptions})
 }
 try {
@@ -53,8 +53,8 @@ try {
   await clarify(busy); await f.end()
   await wait(()=>f.db.request(id)?.state==='routing')
   const next=f.db.request(id)! as any
-  const bootstrap=await f.call('router_query',{requestId:id,mode:'bootstrap'})
-  assert.equal(bootstrap.value.clarificationHistory.at(-1).text,quickOptions[1].label,'the next Router turn receives the selected text as a supplement')
+  const routing=await promptFor(id)
+  assert.equal(routing.clarificationHistory.at(-1).text,quickOptions[1].label,'the next Router turn receives the selected text as a supplement')
   assert.equal(typeof next.timing.runningSince,'number','the next sent round starts its own timer')
   assert.notEqual(next.roundId,first.roundId,'dequeue starts a new display round under the same request')
   assert.deepEqual(next.clarifications,[frozen])
@@ -72,7 +72,6 @@ try {
   await clarify(busyAgain); await f.end()
   await wait(()=>f.db.request(id)?.state==='routing')
   assert.equal(routerCardViews(f.db.request(id)!).length,3,'newly sent round is appended after both frozen cards')
-  await f.call('router_query',{requestId:id,mode:'bootstrap'})
   const assigned=await f.call('router_assign_task',{requestId:id,version:f.db.request(id)!.version,action:'create_task_in_requirement',requirementId:'daily',reason:'按用户明确归属处理'})
   assert.equal(assigned.value.state,'bound')
   assert.deepEqual(f.db.request(id)!.clarifications,histories,'later assignment does not alter either old question, candidates or answer')
@@ -80,7 +79,6 @@ try {
   await f.end()
 
   const stale=await f.submit({prompt:'另一次需要澄清的输入'})
-  await f.call('router_query',{requestId:stale,mode:'bootstrap'})
   const legacyOptions=[{objectId:'daily',label:'原候选文字'},{objectId:'missing',label:'没有绑定对象的候选文字'}]
   const legacy=await f.call('router_assign_task',{requestId:stale,version:f.db.request(stale)!.version,action:'clarify',reason:'兼容已有卡片',clarification:'请选择补充信息',clarificationOptions:legacyOptions})
   assert.equal(legacy.ok,true)
@@ -93,12 +91,14 @@ try {
   const resumed=await f.controller.resolve({requestId:stale,expectedVersion:pending.version,action:'answer',optionId:'daily'})
   assert.equal(resumed.clarifications![0].answer,'原候选文字','old card callbacks also only supplement text')
   await wait(()=>f.db.request(stale)?.state==='routing')
-  await f.call('router_query',{requestId:stale,mode:'bootstrap'})
   const journalBefore=f.journal.length
   const rejected=await f.call('router_assign_task',{requestId:stale,version:f.db.request(stale)!.version,action:'create_task_in_requirement',requirementId:'daily',reason:'尝试分配归档目标'})
-  assert.equal(rejected.ok,true)
-  assert.equal(rejected.value.state,'needs_input','actual assignment still requires clarification for an archived or read-only destination')
-  assert.match(rejected.value.question,/已归档或只读/)
+  assert.equal(rejected.ok,false)
+  assert.equal(rejected.errorDetails.code,'task_not_eligible')
+  assert.equal(f.db.request(stale)!.state,'routing','qualification failures leave Router able to offer choices instead of an empty host question')
+  const clarifyUnavailable=await f.call('router_assign_task',{requestId:stale,version:f.db.request(stale)!.version,action:'clarify',reason:'目标已归档且项目只读',clarification:'希望如何处理原目标？',clarificationOptions:[{label:'恢复目标后继续'},{label:'另选可写项目新建需求'}]})
+  assert.equal(clarifyUnavailable.value.state,'needs_input')
+  assert.equal(f.db.request(stale)!.decision!.clarificationOptions!.length,2)
   assert.equal(f.db.request(stale)!.targetId,undefined)
   assert.equal(f.db.request(stale)!.delivery,'pending')
   assert.equal(f.journal.length,journalBefore)
