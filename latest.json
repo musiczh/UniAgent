@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "version": "1.2.0",
+  "version": "1.2.1",
   "platform": "darwin",
   "arch": "arm64",
-  "path": "release/v1.2.0/UniAgent-Public-1.2.0-arm64.dmg",
-  "size": 276896830,
-  "sha256": "7f42262db506b92591155d3941aec9329177e2fb4d7c9ef0eb53e2f955975c6a"
+  "path": "release/v1.2.1/UniAgent-Public-1.2.1-arm64.dmg",
+  "size": 289362718,
+  "sha256": "955aedee19cb46130acda8ae42f770ee37eecc04c1e0d4d79124d2cf4ea72795"
 }
